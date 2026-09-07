@@ -12,10 +12,12 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from drawbridge_schemas.jurisdiction import Currency, Jurisdiction
 from drawbridge_schemas.provenance import (
     Confidence,
     DocumentKind,
     DocumentRef,
+    Language,
     Provenance,
     Span,
 )
@@ -36,6 +38,18 @@ def document_ref() -> DocumentRef:
 
 
 @pytest.fixture
+def bayan_ref() -> DocumentRef:
+    return DocumentRef(
+        document_id=uuid4(),
+        kind=DocumentKind.ZATCA_BAYAN,
+        sha256="b" * 64,
+        object_key="tenants/a1/zatca_bayan/sample.pdf",
+        page_count=1,
+        language=Language.MIXED,
+    )
+
+
+@pytest.fixture
 def provenance(document_ref: DocumentRef) -> Provenance:
     return Provenance(
         spans=(Span(document=document_ref, page=1, bbox=(72.0, 120.0, 240.0, 134.0)),),
@@ -44,14 +58,32 @@ def provenance(document_ref: DocumentRef) -> Provenance:
 
 
 @pytest.fixture
+def bayan_provenance(bayan_ref: DocumentRef) -> Provenance:
+    return Provenance(
+        spans=(
+            Span(
+                document=bayan_ref,
+                page=1,
+                bbox=(300.0, 140.0, 470.0, 154.0),
+                language=Language.ARABIC,
+            ),
+        ),
+        confidence=Confidence(score=0.95, method="pymupdf-native"),
+    )
+
+
+@pytest.fixture
 def entry_line(provenance: Provenance) -> EntryLine:
+    """US import line. Section 301 duty, no ad valorem — the post-2024 shape."""
     return EntryLine(
         line_id=uuid4(),
         tenant_id=TENANT,
-        entry_number="ABC-1234567-8",
+        jurisdiction=Jurisdiction.US,
+        currency=Currency.USD,
+        declaration_number="ABC-1234567-8",
         line_number=1,
         import_date=date(2023, 3, 14),
-        entry_summary_date=date(2023, 3, 20),
+        declaration_date=date(2023, 3, 20),
         port_of_entry="2704",
         country_of_origin="CN",
         hts=HTSCode(code="8471300100"),
@@ -67,10 +99,42 @@ def entry_line(provenance: Provenance) -> EntryLine:
 
 
 @pytest.fixture
+def ksa_entry_line(bayan_provenance: Provenance) -> EntryLine:
+    """KSA import line from a ZATCA Bayan.
+
+    Declaration and duty-payment dates differ by 24 days, which is the case that makes
+    the GCC clock anchor matter: ZATCA permits payment postponement up to 30 days, and
+    the Art. 16 §3(a) re-export window runs from payment, not from the declaration.
+    """
+    return EntryLine(
+        line_id=uuid4(),
+        tenant_id=TENANT,
+        jurisdiction=Jurisdiction.KSA,
+        currency=Currency.SAR,
+        declaration_number="20240115447821",
+        line_number=1,
+        import_date=date(2024, 1, 15),
+        declaration_date=date(2024, 1, 15),
+        duty_payment_date=date(2024, 2, 8),
+        port_of_entry="Jeddah Islamic Port",
+        country_of_origin="CN",
+        hts=HTSCode(code="84713000"),
+        description="Portable data processing machines",
+        quantity=Decimal("1200"),
+        unit_of_measure="PCE",
+        entered_value=Decimal("937500.00"),
+        duty_paid=Decimal("46875.00"),
+        vat_paid=Decimal("147656.25"),
+        provenance=bayan_provenance,
+    )
+
+
+@pytest.fixture
 def export_line(provenance: Provenance) -> ExportLine:
     return ExportLine(
         line_id=uuid4(),
         tenant_id=TENANT,
+        jurisdiction=Jurisdiction.US,
         reference="MAEU123456789",
         line_number=1,
         export_date=date(2024, 1, 9),
@@ -79,5 +143,29 @@ def export_line(provenance: Provenance) -> ExportLine:
         description="Portable ADP machines, re-exported unused",
         quantity=Decimal("400"),
         unit_of_measure="NO",
+        declared_value=Decimal("100000.00"),
         provenance=provenance,
+    )
+
+
+@pytest.fixture
+def ksa_export_line(bayan_provenance: Provenance) -> ExportLine:
+    """KSA re-export carrying its linked import declaration (Art. 15(c))."""
+    return ExportLine(
+        line_id=uuid4(),
+        tenant_id=TENANT,
+        jurisdiction=Jurisdiction.KSA,
+        reference="RE-20240912-0031",
+        line_number=1,
+        export_date=date(2024, 9, 12),
+        destination_country="AE",
+        hts=HTSCode(code="84713000"),
+        description="Portable data processing machines, re-exported unused",
+        quantity=Decimal("500"),
+        unit_of_measure="PCE",
+        declared_value=Decimal("390625.00"),
+        linked_import_declaration="20240115447821",
+        consignment_id="CNS-2024-0115-A",
+        unused_and_unaltered=True,
+        provenance=bayan_provenance,
     )

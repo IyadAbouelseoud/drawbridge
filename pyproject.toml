@@ -38,6 +38,10 @@ dev = [
     "types-boto3>=1.36",
     "pre-commit>=4.0",
 ]
+ocr = [
+    "pillow>=11.0",
+    "pytesseract>=0.3.13",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -62,10 +66,25 @@ src = ["services", "mcp_servers", "packages/schemas/src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "ARG", "PTH", "RUF"]
-ignore = ["A003"]
+ignore = [
+    "A003",
+    # RUF001/2/3 flag "ambiguous" Unicode - Arabic-Indic digits mistaken for Latin
+    # letters, the Arabic decimal separator mistaken for a comma. Processing exactly
+    # those characters is what services/extraction/src/arabic.py exists to do, and the
+    # test fixtures must contain real Bayan text. The rule is correct in general and
+    # wrong here; suppressing it project-wide beats per-line noqa on every Arabic string.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic autogenerates these; reformatting them makes the diff against a regenerated
+# migration unreadable. They are machine output, not hand-maintained source.
+"services/api/src/migrations/versions/*.py" = ["E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["drawbridge_schemas", "services", "mcp_servers"]
+known-first-party = ["drawbridge_schemas", "services", "mcp_servers", "tests"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -74,9 +93,23 @@ warn_unreachable = true
 plugins = ["pydantic.mypy"]
 mypy_path = "packages/schemas/src"
 
+# PyMuPDF, the OCR engines and OR-Tools ship no usable type information: PyMuPDF's
+# constructors are untyped, and pytesseract/paddleocr have no stubs at all. Their call
+# sites are still checked for our own types; only the library boundary is relaxed.
 [[tool.mypy.overrides]]
-module = ["pdfplumber.*", "fitz.*", "ortools.*"]
+module = ["pdfplumber.*", "fitz.*", "pymupdf.*", "ortools.*", "pytesseract.*", "paddleocr.*", "PIL.*"]
 ignore_missing_imports = true
+disallow_untyped_calls = false
+
+# Call sites of those libraries. Without this, every pymupdf.open() is a no-untyped-call
+# error even though our side of the call is fully annotated.
+[[tool.mypy.overrides]]
+module = [
+    "services.extraction.src.native",
+    "services.extraction.src.ocr",
+    "mcp_servers.mcp_docs.store",
+]
+disallow_untyped_calls = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

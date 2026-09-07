@@ -17,8 +17,25 @@ from pydantic import BaseModel, ConfigDict, Field
 class DocumentKind(StrEnum):
     """Source document classes Drawbridge ingests."""
 
+    # United States
     CBP_7501 = "cbp_7501"
     ACE_ENTRY_SUMMARY = "ace_entry_summary"
+
+    # Saudi Arabia / GCC
+    ZATCA_BAYAN = "zatca_bayan"
+    """KSA customs declaration. The GCC-lane analogue of the CBP 7501."""
+
+    ZATCA_REEXPORT_DECLARATION = "zatca_reexport_declaration"
+    """Carries the linked import declaration number per GCC Rules of Impl. Art. 15(c)."""
+
+    GCC_CERTIFICATE_OF_ORIGIN = "gcc_certificate_of_origin"
+    GCC_NATIONAL_CERTIFICATE = "gcc_national_certificate"
+    """Issued by the competent authority in the GCC country of origin (MD 3852)."""
+
+    VALUE_ADDED_CERTIFICATE = "value_added_certificate"
+    """Local value-added percentage, certified by a licensed public accountant in KSA."""
+
+    BANK_GUARANTEE = "bank_guarantee"
     COMMERCIAL_INVOICE = "commercial_invoice"
     PACKING_LIST = "packing_list"
     BILL_OF_LADING = "bill_of_lading"
@@ -31,6 +48,18 @@ class DocumentKind(StrEnum):
     EDI_309 = "edi_309"
 
 
+class Language(StrEnum):
+    """Script/language of an extracted region.
+
+    MIXED is the common case for a ZATCA Bayan: Arabic labels, Latin HS codes, and
+    numerals that may be Arabic-Indic or ASCII within the same document.
+    """
+
+    ENGLISH = "en"
+    ARABIC = "ar"
+    MIXED = "mixed"
+
+
 class DocumentRef(BaseModel):
     """Pointer to an immutable object in the document store."""
 
@@ -41,6 +70,7 @@ class DocumentRef(BaseModel):
     sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
     object_key: str = Field(description="MinIO/S3 key; the object is never mutated in place")
     page_count: int | None = None
+    language: Language = Language.ENGLISH
 
 
 class Span(BaseModel):
@@ -60,6 +90,11 @@ class Span(BaseModel):
         default=None, description="Dotted path for structured sources, e.g. 'lines[3].hts'"
     )
     raw_text: str | None = Field(default=None, description="Verbatim text as it appears")
+    language: Language | None = Field(
+        default=None,
+        description="Script of this span. Set on the GCC lane so an Arabic-sourced figure "
+        "is distinguishable from a Latin-sourced one during review.",
+    )
 
 
 class Confidence(BaseModel):

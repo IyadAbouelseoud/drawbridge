@@ -2,6 +2,9 @@
 
 Postgres owns this state machine. n8n observes transitions and fires side effects; it
 never holds claim state. See docs/ARCHITECTURE.md §4 and §8.
+
+Dual-jurisdiction as of week 2: refund rate, deadlines and eligibility gates come from
+the jurisdiction profile, never from a module constant. See docs/COMPLIANCE-GCC.md.
 """
 
 from __future__ import annotations
@@ -14,34 +17,65 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from drawbridge_schemas.jurisdiction import (
+    Currency,
+    Jurisdiction,
+    JurisdictionProfile,
+    profile_for,
+)
 from drawbridge_schemas.trade import LineMatch, Money
-
-# CBP refunds 99% of duties, taxes and fees on qualifying drawback claims.
-DRAWBACK_REFUND_RATE = Decimal("0.99")
-
-# 19 U.S.C. §1313(j): export must occur within 5 years of import.
-MAX_IMPORT_TO_EXPORT_DAYS = 1826
-
-# Claim must be filed within 3 years of the export date.
-MAX_EXPORT_TO_FILING_DAYS = 1095
 
 
 class RecoveryLane(StrEnum):
     """Which statutory refund path a claim travels."""
 
+    # United States
     DRAWBACK = "drawback"
     POST_SUMMARY_CORRECTION = "post_summary_correction"
     FTA_RETROACTIVE = "fta_retroactive"
 
+    # Saudi Arabia / GCC
+    GCC_REEXPORT_DRAWBACK = "gcc_reexport_drawback"
+    """GCC Common Customs Law Art. 97 + Rules of Implementation Art. 16."""
+
+    KSA_ORIGIN_REFUND = "ksa_origin_refund"
+    """Ministerial Decision 3852 — duty refunded once GCC origin is established."""
+
+
+LANES_BY_JURISDICTION: dict[Jurisdiction, frozenset[RecoveryLane]] = {
+    Jurisdiction.US: frozenset(
+        {
+            RecoveryLane.DRAWBACK,
+            RecoveryLane.POST_SUMMARY_CORRECTION,
+            RecoveryLane.FTA_RETROACTIVE,
+        }
+    ),
+    Jurisdiction.KSA: frozenset(
+        {RecoveryLane.GCC_REEXPORT_DRAWBACK, RecoveryLane.KSA_ORIGIN_REFUND}
+    ),
+}
+
 
 class DrawbackType(StrEnum):
-    """Sub-theory within the drawback lane."""
+    """Sub-theory within a drawback lane.
+
+    The substitution variants are US-only; the GCC recognises no substitution
+    (docs/COMPLIANCE-GCC.md §2.2).
+    """
 
     UNUSED_DIRECT_IDENTITY = "unused_direct_identity"
     UNUSED_SUBSTITUTION = "unused_substitution"
     MANUFACTURING_DIRECT_IDENTITY = "manufacturing_direct_identity"
     MANUFACTURING_SUBSTITUTION = "manufacturing_substitution"
     REJECTED_MERCHANDISE = "rejected_merchandise"
+
+    GCC_UNUSED_REEXPORT = "gcc_unused_reexport"
+    """Art. 16 §5 — not locally used, same condition as imported."""
+
+
+_SUBSTITUTION_TYPES = frozenset(
+    {DrawbackType.UNUSED_SUBSTITUTION, DrawbackType.MANUFACTURING_SUBSTITUTION}
+)
 
 
 class ClaimState(StrEnum):
@@ -104,7 +138,11 @@ _TRANSITIONS: dict[ClaimState, frozenset[ClaimState]] = {
 
 
 class RefundLine(BaseModel):
-    """One quantified refund component, traceable to the match that produced it."""
+    """One quantified refund component, traceable to the match that produced it.
+
+    The refund rate is a jurisdiction property (US 99%, GCC 100% of duty actually paid),
+    so it is passed in rather than read from a constant.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -113,17 +151,19 @@ class RefundLine(BaseModel):
     mpf_component: Money = Decimal("0.00")
     hmf_component: Money = Decimal("0.00")
 
-    @property
-    def refund(self) -> Decimal:
-        base = self.duty_component + self.mpf_component + self.hmf_component
-        return (base * DRAWBACK_REFUND_RATE).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    def refund(self, profile: JurisdictionProfile) -> Decimal:
+        base = self.duty_component
+        if profile.includes_fees_in_base:
+            base += self.mpf_component + self.hmf_component
+        return (base * profile.refund_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 class Claim(BaseModel):
     """The aggregate handed to a licensed filer.
 
-    Drawbridge never files with CBP. This object is the filing-ready packet's data core;
-    `services/packager` renders it to CBP 7551/7552, PSC, or §1520(d) forms.
+    Drawbridge never files with a customs authority in any jurisdiction. This object is
+    the filing-ready packet's data core; `services/packager` renders it to CBP
+    7551/7552/PSC/1520(d) or to a ZATCA e-Services refund request.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -132,6 +172,8 @@ class Claim(BaseModel):
     tenant_id: UUID
     state: ClaimState = ClaimState.INTAKE
 
+    jurisdiction: Jurisdiction = Jurisdiction.US
+    currency: Currency = Currency.USD
     lane: RecoveryLane
     drawback_type: DrawbackType | None = None
 
@@ -145,24 +187,58 @@ class Claim(BaseModel):
     updated_at: datetime
 
     @property
-    def total_refund(self) -> Decimal:
-        return sum((line.refund for line in self.refund_lines), Decimal("0.00"))
+    def profile(self) -> JurisdictionProfile:
+        return profile_for(self.jurisdiction)
 
     @property
-    def has_full_provenance(self) -> bool:
-        """A claim missing any provenance span must not reach PACKAGED."""
-        return all(
-            m.match.import_line_id is not None and m.match.export_line_id is not None
-            for m in self.refund_lines
-        )
+    def total_refund(self) -> Decimal:
+        profile = self.profile
+        return sum((line.refund(profile) for line in self.refund_lines), Decimal("0.00"))
+
+    @property
+    def theories_permitted(self) -> bool:
+        """Whether every match rests on a theory this jurisdiction actually allows.
+
+        Guards the failure that would otherwise be silent and expensive: a substitution
+        match reaching a GCC claim, where no substitution theory exists.
+        """
+        profile = self.profile
+        return all(profile.permits(line.match.theory) for line in self.refund_lines)
+
+    @model_validator(mode="after")
+    def _lane_belongs_to_jurisdiction(self) -> Self:
+        permitted = LANES_BY_JURISDICTION[self.jurisdiction]
+        if self.lane not in permitted:
+            msg = f"lane {self.lane} is not available in jurisdiction {self.jurisdiction}"
+            raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def _drawback_type_matches_lane(self) -> Self:
-        if self.lane is RecoveryLane.DRAWBACK and self.drawback_type is None:
-            msg = "drawback lane requires a drawback_type"
+        drawback_lanes = {RecoveryLane.DRAWBACK, RecoveryLane.GCC_REEXPORT_DRAWBACK}
+        if self.lane in drawback_lanes and self.drawback_type is None:
+            msg = f"lane {self.lane} requires a drawback_type"
             raise ValueError(msg)
-        if self.lane is not RecoveryLane.DRAWBACK and self.drawback_type is not None:
+        if self.lane not in drawback_lanes and self.drawback_type is not None:
             msg = f"drawback_type is meaningless on lane {self.lane}"
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _no_substitution_outside_us(self) -> Self:
+        if self.jurisdiction is not Jurisdiction.US and self.drawback_type in _SUBSTITUTION_TYPES:
+            msg = (
+                f"{self.drawback_type} is a US-only theory; {self.jurisdiction} "
+                "recognises no substitution drawback"
+            )
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _currency_matches_jurisdiction(self) -> Self:
+        expected = profile_for(self.jurisdiction).currency
+        if self.currency is not expected:
+            msg = f"jurisdiction {self.jurisdiction} files in {expected}, not {self.currency}"
             raise ValueError(msg)
         return self
 

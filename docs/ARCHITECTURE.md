@@ -1,24 +1,31 @@
 # DRAWBRIDGE — Architecture
 
-> Persistent context. Read this file and `ROADMAP.md` at the start of any session
-> before making structural decisions.
+> Persistent context. Read this file, `ROADMAP.md`, and `COMPLIANCE-GCC.md` at the
+> start of any session before making structural decisions.
+>
+> **Scope: dual-jurisdiction.** United States (CBP) and GCC/Saudi Arabia (ZATCA).
+> The GCC lane is not a US clone with different constants — see §3.5.
 
 ---
 
 ## 1. What this is
 
 **Autonomous duty drawback + tariff misclassification recovery for mid-market
-importers/exporters.**
+importers/exporters, across the US and GCC customs unions.**
 
 US Customs refunds **99% of duties, taxes and fees** on imported goods that are
 subsequently exported or destroyed (19 U.S.C. §1313). Claims reach back **5 years**.
 Parallel recovery lanes:
 
-| Lane | Statute | Window | Cycle time |
-|---|---|---|---|
-| Drawback (unused / manufacturing) | 19 U.S.C. §1313(j)(1), §1313(j)(2), §1313(a)/(b) | 5-yr import lookback, 3-yr filing deadline | 6–18 months |
-| Post Summary Correction (misclassification, valuation) | 19 CFR §141.11 | 300 days from entry | 60–90 days |
-| Retroactive FTA claim | 19 U.S.C. §1520(d) | 1 year from import | 60–90 days |
+| Jx | Lane | Statute | Window | Refund |
+|---|---|---|---|---|
+| US | Drawback (unused / manufacturing) | 19 U.S.C. §1313(j)(1), §1313(j)(2), §1313(a)/(b) | 5-yr import lookback, 3-yr filing deadline | 99% |
+| US | Post Summary Correction | 19 CFR §141.11 | 300 days from entry | 100% of overpayment |
+| US | Retroactive FTA claim | 19 U.S.C. §1520(d) | 1 year from import | 100% of overpayment |
+| GCC | Drawback on re-export | GCC Common Customs Law Art. 97 + Rules of Impl. Art. 16 | Re-export within 1 Gregorian yr of **duty payment**; claim within 6 Gregorian months of re-export; 3-yr absolute bar (Art. 174) | 100% of duty paid |
+| KSA | National Rules of Origin refund | Ministerial Decision 3852 | Documents within 90 days of clearance | 100% of guaranteed duty |
+
+Full primary-source rules, thresholds, and citations: **`docs/COMPLIANCE-GCC.md`**.
 
 Industry estimates put **$2–3B/year of eligible drawback unclaimed** — not from lack of
 appetite, but because claiming requires line-item reconciliation of import entries to
@@ -29,9 +36,16 @@ Roughly 200 forensic hours per claim cycle.
 Mid-market importers ($5M–$50M annual duty spend) are too small for Charter Brokerage or
 Alliance Drawback to court, too large to do it by hand. They leave the money.
 
-**Why now:** Section 301, IEEPA and reciprocal tariff layers inflated effective duty rates
-3–5x since 2024. The same trade flow that yielded a $200k claim in 2023 yields ~$900k
-today. The unclaimed pile exploded; the labor cost of claiming did not move.
+**Why now — US:** Section 301, IEEPA and reciprocal tariff layers inflated effective duty
+rates 3–5x since 2024. The same trade flow that yielded a $200k claim in 2023 yields
+~$900k today. The unclaimed pile exploded; the labor cost of claiming did not move.
+
+**Why now — GCC:** Vision 2030 turned KSA into a re-export hub. Fasah put every *Bayan*
+into one electronic single window, so the data needed for an Article 97 claim now exists
+in structured form for the first time. Meanwhile Ministerial Decision 3852 (2021) made
+GCC preferential origin conditional on 40% local value added and 25% workforce
+localization, creating a second recovery lane — duty paid or guaranteed at import,
+refundable once origin is proven. No incumbent is working either lane at mid-market scale.
 
 ---
 
@@ -67,24 +81,64 @@ Treasury disbursement.
 
 Eight stages. Not a chatbot.
 
-1. **Ingest** — ACE entry-summary line detail (client-exported, never scraped), CBP 7501s,
-   commercial invoices, packing lists, BOLs/AWBs, proofs of export, ERP SKU master, BOMs.
+1. **Ingest** — **US**: ACE entry-summary line detail (client-exported, never scraped) and
+   CBP 7501s. **GCC**: ZATCA customs declarations (*Bayan*) exported from Fasah, and broker
+   host-to-host feeds. Both: commercial invoices, packing lists, BOLs/AWBs, proofs of
+   export, certificates of origin, ERP SKU master, BOMs.
 2. **Extract** — structured line records from mixed scanned/native PDFs and EDI 350/309,
    with per-field confidence and **provenance spans** back to source coordinates.
+   **Bilingual Arabic/English** throughout the GCC lane — see §6.
 3. **Classify and audit** — reconcile declared HTS against the USITC schedule and CBP CROSS
    rulings. Flag misclassification, valuation and country-of-origin exposure in **both**
    directions (refund *and* liability — never hide the liability).
-4. **Match** — the core engine. Pair import lines to export lines under direct-identity or
-   substitution (8-digit HTS) rules, respecting 5-year import windows, 3-year filing
-   deadlines, unused vs. manufacturing drawback, and per-entry duty apportionment.
-   Combinatorial optimization, not lookup.
+4. **Match** — the core engine, and the place the two jurisdictions genuinely diverge.
+   **US**: combinatorial allocation over a substitution-eligible pool (8-digit HTS),
+   respecting 5-year windows, 3-year deadlines, and per-entry duty apportionment.
+   **GCC**: declaration-linkage — each re-export declaration resolves to exactly one
+   import declaration. No substitution exists. See §3.5.
 5. **Prove** — assemble the evidentiary packet: interchangeability narrative, chain of
    custody, destruction certificates, ruling citations.
 6. **Quantify** — refund per claim, per entry line, with an audit-defensible derivation trail.
-7. **Package** — filing-ready CBP 7551/7552 set plus PSC and §1520(d) submissions, handed to
+7. **Package** — **US**: CBP 7551/7552 plus PSC and §1520(d) submissions. **GCC**: ZATCA
+   e-Services *Customs Duty Refund Request* payload plus evidence bundle. Both handed to
    the licensed filer.
-8. **Defend** — maintain the §163 recordkeeping posture so a CBP audit four years later is
-   answerable in minutes.
+8. **Defend** — maintain recordkeeping posture so an audit years later is answerable in
+   minutes: 19 CFR §163 (US) and GCC Art. 175 / ZATCA five-year original retention (GCC).
+
+### 3.5 The jurisdictions are not a config flag
+
+The tempting design is one pipeline with a `jurisdiction` column. It is wrong, and the
+reason is the matcher.
+
+US drawback permits **substitution**: an imported article may be matched against a
+*different* exported article sharing the first 8 HTS digits (TFTEA). That turns matching
+into a combinatorial allocation problem over a pool — which is why CP-SAT is in the stack.
+
+GCC drawback permits **no substitution at all**. Rules of Implementation Art. 16 §4–5 and
+Art. 15(c) require a single identified consignment, unaltered, with the import declaration
+number affixed to the re-export declaration. Matching is a linkage walk: one re-export
+declaration to exactly one import declaration.
+
+These are different algorithms, not different parameters. The design is therefore a
+**strategy interface** — `MatchStrategy` — with `UsSubstitutionMatcher` and
+`GccLinkageMatcher` behind it, selected by jurisdiction at claim creation. Shared: the
+schemas, provenance, extraction, ledger, packaging skeleton, and state machine. Divergent:
+matching, eligibility windows, refund rate, minimum thresholds, and output format.
+
+Corollaries that fall out and must not be papered over:
+
+| Concern | US | GCC |
+|---|---|---|
+| Refund rate | 99% of duty + fees | 100% of duty actually paid |
+| Substitution | 8-digit HTS | **None** |
+| Clock anchor | Import date | **Duty-payment date** (ZATCA permits 30-day postponement, so these differ) |
+| Filing deadline | 3 years from export | 6 Gregorian **months** from re-export; 3-year absolute bar |
+| Minimum claim | None | **USD 5,000** re-export value |
+| Currency | USD | SAR, with a USD-threshold conversion |
+| Consumption tax | MPF/HMF recoverable | **VAT and excise are not drawback** — recovered via VAT return |
+
+`DRAWBACK_REFUND_RATE` as a module-level constant was a Week 1 simplification valid only
+while the US was the sole jurisdiction. It is now a property of the jurisdiction profile.
 
 ---
 
@@ -149,16 +203,30 @@ tenant-scoped Postgres schemas and RLS; isolated stacks reserved for on-prem/ent
    and hands it to the client's existing broker or a partner filer. Roughly 90% of the
    labor, 100% of the value, none of the regulatory surface. This constraint is
    load-bearing — do not design around filing.
-2. **ACE access.** Scraping the ACE portal violates its terms. **Resolution:** ingest
-   client-exported ACE reports (ES-001 / entry summary line detail) and broker feeds.
-   Adds an onboarding step; removes legal risk.
+2. **Portal access — ACE and Fasah.** Scraping the ACE portal violates its terms; the same
+   posture applies to Fasah. **Resolution:** ingest client-exported reports (ACE ES-001 /
+   entry summary line detail; Fasah *Bayan* exports) and broker host-to-host feeds. We do
+   not hold client portal credentials in either jurisdiction. Adds an onboarding step;
+   removes legal risk.
 3. **The hard part is extraction, not reasoning.** Scanned 7501s from 2021 forwarders are
-   the real engineering risk — not the LLM. The extraction and confidence layer is the
-   longest single milestone. Budget accordingly.
+   the real engineering risk — not the LLM. Bilingual Arabic/English *Bayan* and invoice
+   processing raises that risk rather than lowering it (§6). The extraction and confidence
+   layer is the longest single milestone. Budget accordingly.
 4. **Hallucination is unacceptable here.** A fabricated entry number is a false claim to a
    federal agency. **Resolution:** every number in a claim traces to a source-document
    span. The LLM writes narratives and judgment calls; it never originates a figure.
    Enforced by schema, not by prompt.
+5. **GCC rules are partly unverified in English.** ZATCA Resolution 28624's article numbers
+   could not be confirmed from English sources; only the Arabic Umm Al-Qura text is
+   authoritative. The GCC Common Customs Law and its Rules of Implementation — which carry
+   every operative drawback constant — *were* obtained from the GCC Secretariat's own
+   publication and are reliable. **Resolution:** `COMPLIANCE-GCC.md` marks verification
+   status per section and lists open questions; each unresolved question routes to
+   `ANALYST_REVIEW` rather than being guessed. Confirm against Arabic source before the
+   first live KSA filing.
+6. **Licensure applies in KSA too.** Saudi customs clearance is a licensed activity.
+   The §5.1 posture is unchanged and jurisdiction-independent: Drawbridge produces the
+   filing-ready packet; a licensed broker files it.
 
 ---
 
@@ -170,8 +238,9 @@ Agent          Anthropic SDK — claude-opus-5 (reasoning) / claude-haiku-4-5 (e
 MCP            Python MCP SDK — 5 servers, stdio + streamable-HTTP transports
 Orchestration  n8n (self-hosted, queue mode) · Redis
 Data           Postgres 16 + pgvector (CROSS rulings, prior-claim precedent) · MinIO (documents)
-Extraction     pdfplumber · PyMuPDF · Tesseract/PaddleOCR fallback · Claude vision for scans
-Matching       Typed rule engine + OR-Tools CP-SAT for line-level allocation
+Extraction     pdfplumber · PyMuPDF · Tesseract (eng+ara) / PaddleOCR fallback · Claude vision
+               Arabic-Indic digit normalisation · RTL/bidi handling · bilingual field aliases
+Matching       MatchStrategy interface: OR-Tools CP-SAT (US substitution) | linkage walk (GCC)
 Infra          Docker Compose (dev/on-prem) -> Kubernetes (multi-tenant SaaS) · Traefik · Authentik
 Quality        pytest + hypothesis · ruff · mypy --strict · pre-commit
 Observability  OpenTelemetry -> Grafana/Tempo · immutable append-only claim ledger
@@ -186,17 +255,17 @@ drawbridge/
 ├── docker-compose.yml            # + .prod.yml, .onprem.yml
 ├── services/
 │   ├── api/                      # FastAPI: tenants, claims, review queue, webhooks
-│   ├── ingest/                   # ACE/7501/invoice/BOL parsers, EDI 350/309
-│   ├── extraction/               # OCR + vision + confidence + provenance spans
+│   ├── ingest/                   # ACE/7501, Fasah Bayan, invoice/BOL, EDI 350/309
+│   ├── extraction/               # native PDF -> OCR fallback, bilingual ar/en, provenance
 │   ├── classifier/               # HTS audit, CROSS retrieval, origin/valuation checks
-│   ├── matcher/                  # CP-SAT import<->export allocation under §1313
-│   ├── rules/                    # eligibility windows, deadlines, drawback-type routing
-│   ├── packager/                 # 7551/7552, PSC, 1520(d) generation
+│   ├── matcher/                  # us_substitution.py (CP-SAT) | gcc_linkage.py
+│   ├── rules/                    # per-jurisdiction windows, thresholds, lane routing
+│   ├── packager/                 # 7551/7552, PSC, 1520(d) | ZATCA refund request
 │   └── agent/                    # Claude loop: narratives, exceptions, judgment calls
 ├── mcp_servers/            # named to avoid shadowing the `mcp` SDK package
 │   └── mcp_ace/ mcp_hts/ mcp_docs/ mcp_claims/ mcp_ledger/
 ├── n8n/workflows/                # exported JSON, version-controlled
-├── packages/schemas/             # shared Pydantic contracts (single source of truth)
+├── packages/schemas/             # shared contracts incl. jurisdiction.py profiles
 ├── tests/                        # unit · golden-claim fixtures · property-based rules
 └── infra/
 ```
@@ -227,3 +296,41 @@ not own these transitions.
 | mcp-docs | 8103 | streamable-HTTP |
 | mcp-claims | 8104 | streamable-HTTP |
 | mcp-ledger | 8105 | streamable-HTTP |
+
+
+---
+
+## 10. Bilingual extraction (GCC lane)
+
+The *Bayan* and Saudi domestic commercial invoices are bilingual Arabic/English, and GCC
+certificates of origin are frequently Arabic-only. Five concrete failure modes drive the
+design — none are solved by "turn on Arabic OCR".
+
+| Failure mode | Handling |
+|---|---|
+| **Arabic-Indic digits** (٠١٢٣٤٥٦٧٨٩) and Eastern variants (۰۱۲۳۴۵۶۷۸۹) in amounts | Normalise to ASCII digits at token level, before any parse. A duty figure read as `٥٠٠٠` must become `5000`, never `0` or a mojibake string |
+| **Bidi reordering** — RTL Arabic interleaved with LTR numbers and Latin HS codes | Extract with bidi-aware ordering; store the logical-order string, not the visual-order one. Visual order silently reverses multi-part numbers |
+| **Arabic presentation forms and diacritics** — the same word in several Unicode encodings | NFKC-normalise, strip tashkeel, unify alef/ya/ta-marbuta variants before matching a field label |
+| **Bilingual field labels** — the same field labelled `رقم البيان` or "Declaration No." depending on issuer | Field resolution goes through a bilingual alias table, not a regex per layout |
+| **Arabic-language scans** where the native text layer is absent or wrong | Tesseract `ara+eng` (or PaddleOCR `arabic`) fallback, gated on the native-path confidence score, with Claude vision as the last resort |
+
+**Ordering invariant, unchanged from the US lane:** the native PDF text layer is always
+tried first and OCR is a *fallback*, never the default. OCR is slower, less accurate, and
+produces weaker provenance spans. A document that yields clean native text must never be
+sent through OCR.
+
+**Provenance under OCR.** OCR spans carry bounding boxes but no reliable character offsets,
+so `Span.raw_text` holds the recognised token and `Confidence.method` records the engine.
+Any figure whose only provenance is OCR below the confidence floor sets
+`Confidence.needs_review`, which routes the claim to `ANALYST_REVIEW` regardless of score.
+
+## 11. Output targets
+
+| Jurisdiction | Target | Form |
+|---|---|---|
+| US | CBP 7551 / 7552, PSC, §1520(d) | Rendered forms + derivation trail, to the licensed filer |
+| GCC / KSA | ZATCA e-Services → Customs Services → **Customs Duty Refund Request** | Typed payload (importer identity, IBAN, original import declaration no., linked re-export declaration no., duty paid, amount claimed, SAR) + evidence bundle + derivation trail |
+
+ZATCA publishes no field-level machine schema for the refund request, so the GCC payload is
+modelled as a typed Pydantic object rendered to both a human-completable form and JSON.
+When ZATCA publishes an API, only the renderer changes — the claim data core does not.
