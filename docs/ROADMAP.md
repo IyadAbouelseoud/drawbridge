@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 2 |
+| Current week | 3 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | `mcp-docs` + bilingual extraction service |
+| Current milestone | Core matching engine — CP-SAT (US) and linkage (GCC) |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -21,7 +21,7 @@
 | 1 | Scaffold, compose stack, CI, schemas package | `docker compose up` — all services green |
 | 2–3 | `mcp-docs` + bilingual extraction service | 7501 **and ZATCA Bayan** to typed lines, >=95% field accuracy with provenance spans; Arabic/English |
 | 3–4 | `mcp-hts`: USITC schedule ingest, CROSS corpus + pgvector | Classification query returns cited rulings |
-| 4–6 | **Matcher** — `MatchStrategy`: US CP-SAT substitution + GCC declaration linkage | Golden fixture set per jurisdiction: known-answer claims reproduce to the cent |
+| 3–6 | **Matcher** — `MatchStrategy`: US CP-SAT substitution + GCC declaration linkage | Golden fixture set per jurisdiction: known-answer claims reproduce to the cent |
 | 6–7 | `mcp-claims` + per-jurisdiction rules: windows, thresholds, lane routing | Refund quantification with full derivation trail; GCC USD 5k gate and 6-month clock enforced |
 | 7–8 | Agent layer: exception handling, interchangeability narratives | Analyst in Claude Code can close an exception via MCP tools |
 | 8–9 | n8n orchestration + HITL approval gates | End-to-end run with no manual intervention outside gates |
@@ -55,17 +55,37 @@
 - [x] Extraction: native PDF path + bilingual ar/en OCR fallback
 - [x] Golden fixtures: hand-verified CBP 7501 and ZATCA Bayan answer keys
 
-## Week 3 entry checklist
+## Week 3 task breakdown
 
-1. Real OCR execution path — week 2 ships the native path plus the bilingual
-   normalisation layer; Tesseract `ara+eng` invocation is wired but needs a scanned
-   corpus to tune the confidence floor against.
-2. `mcp-hts`: USITC schedule ingest and CROSS corpus into pgvector. GCC tariff schedule is
-   HS-based and needs its own loader.
-3. Bilingual field alias table populated from real *Bayan* layouts (currently seeded with
-   the common labels only).
+- [x] Path A: US substitution allocation via OR-Tools CP-SAT (`us_substitution.py`)
+- [x] Path B: GCC direct-identification linkage with statutory gates (`gcc_linkage.py`)
+- [x] `MatchStrategy` interface and jurisdiction-driven routing in the API
+- [x] Property-based tests: CP-SAT optimality, GCC day-185 rejection
+
+### Explicitly deferred — glyph x-coordinate RTL table parsing
+
+Robust RTL **table** parsing needs glyph x-coordinates: deciding whether an Arabic run is
+stored in visual or logical order is undecidable from the character stream (week 2
+`arabic.looks_visually_ordered` uses a label heuristic that works for `label: value` lines
+and cannot work for table cells, which carry no separator).
+
+That work is **isolated to `services/extraction/src/geometry.py`** and stubbed, so it does
+not block the matching engine. The matcher consumes `EntryLine` / `ExportLine`, which are
+already typed and already populated by the week 2 native path — nothing in weeks 3-6
+depends on table extraction landing. Revisit once a real scanned *Bayan* corpus exists.
+
+## Week 4 entry checklist
+
+1. Real OCR execution path — the native path and bilingual normalisation ship; Tesseract
+   `ara+eng` invocation is wired but needs a scanned corpus to tune the confidence floor.
+2. `mcp-hts`: USITC schedule ingest and CROSS corpus into pgvector. The GCC tariff schedule
+   is HS-based and needs its own loader.
+3. Bilingual field alias table populated from real *Bayan* layouts (seeded with common
+   labels only).
 4. Confirm ZATCA Resolution 28624 article numbers against the Arabic Umm Al-Qura text —
-   see `COMPLIANCE-GCC.md` §7 open questions.
+   `COMPLIANCE-GCC.md` §7 open questions.
+5. Manufacturing drawback (§1313(a)/(b)) — week 3 covers unused merchandise only. BOM
+   explosion changes the CP-SAT model shape.
 
 ---
 

@@ -140,6 +140,97 @@ Corollaries that fall out and must not be papered over:
 `DRAWBACK_REFUND_RATE` as a module-level constant was a Week 1 simplification valid only
 while the US was the sole jurisdiction. It is now a property of the jurisdiction profile.
 
+### 3.6 Path A — US substitution allocation (CP-SAT)
+
+`services/matcher/src/us_substitution.py`
+
+**Shape.** Many-to-many. Any import line may feed several export lines; any export line
+may draw from several import lines. With substitution the eligible pairs are every
+(import, export) sharing an 8-digit HTS key inside the window, so the search space is the
+product of two pools, not a list of pairs. Choosing *which* pairings to make, and how much
+quantity to route through each, is an optimisation problem — greedy pairing leaves money
+on the table whenever a high-duty import is consumed early by a low-value export.
+
+**Model.**
+
+| Element | Definition |
+|---|---|
+| Decision var | `x[i,e] ∈ [0, min(avail_i, avail_e)]` — integer quantity allocated from import *i* to export *e*, in minor units |
+| Candidate set | pairs where `hts_i[:8] == hts_e[:8]` (or identical article for direct identity) **and** the pair is inside the window |
+| Import capacity | `Σ_e x[i,e] ≤ quantity_available(i)` — an import line cannot be over-allocated across all exports |
+| Export capacity | `Σ_i x[i,e] ≤ quantity_available(e)` — an export line cannot be claimed twice |
+| Window | pairs outside 5 years import→export, or past the 3-year filing deadline, are never generated |
+| Objective | `maximise Σ x[i,e] × duty_per_unit(i)` — total refundable duty, not total quantity |
+
+**Why the objective is duty-weighted and not quantity-weighted.** Maximising units matched
+maximises paperwork, not money. Two imports of the same HTS may carry very different
+per-unit duty — a Section 301 line and a pre-301 line of the same article differ by 25
+points. The solver must prefer to consume the expensive one.
+
+**Integrality.** Quantities are scaled to integer minor units before entering the model.
+CP-SAT is an integer solver, and duty apportionment must reproduce to the cent; floats in
+the model would surface as cent-level drift in a filed figure.
+
+**Determinism.** The solver is seeded and single-worker by default, and candidate pairs are
+generated in a stable sort order. Two runs over the same input must produce the same
+allocation, or a claim reviewed on Monday differs from the same claim refiled on Tuesday
+with no explanation an auditor would accept.
+
+**Fallback.** Where the model is infeasible or hits its time limit, the matcher returns the
+best incumbent solution *with its status recorded*, and the claim routes to
+`ANALYST_REVIEW`. It never silently returns a partial allocation as if it were optimal.
+
+### 3.7 Path B — GCC direct-identification linkage
+
+`services/matcher/src/gcc_linkage.py`
+
+**Shape.** One-to-many from a single import declaration, never many-to-one. Rules of
+Implementation Art. 16 §4 permits a consignment to be re-exported in part shipments, so
+one import declaration may serve several re-export declarations. It does **not** permit a
+re-export to draw on two import declarations — that would defeat the identification the
+article requires.
+
+**This is not an optimisation.** There is nothing to choose. Art. 15(c) puts the import
+declaration number on the re-export declaration; the link is a fact recorded on the
+document, not a pairing we select. The algorithm is a deterministic trace plus a gate.
+
+**Gate order — cheapest and most disqualifying first:**
+
+1. `linked_import_declaration` present and resolving to a known import line (Art. 15(c)).
+2. Re-export declared value ≥ **USD 5,000**, or local equivalent (Art. 16 §2).
+3. Re-export within **one Gregorian year of the duty-payment date** (Art. 16 §3(a)).
+4. Claim filed within **six Gregorian months of re-export** (Art. 16 §3(b)).
+5. Not past the **three-year absolute bar** from duty payment (Common Customs Law Art. 174).
+6. Goods unused and unaltered (Art. 16 §5).
+7. Single consignment, or part shipments sharing a proven `consignment_id` (Art. 16 §4).
+8. Claimant is the importer of record, or proves purchase (Art. 16 §1).
+
+Value screening precedes date arithmetic because it is the one gate that disqualifies a
+claim before any extraction spend is worth making.
+
+**Rejections are explicit.** Every gate failure returns the article it failed and the
+figures involved. A GCC claim that dies must be able to say *why* in the words of the
+statute — "re-exported 2025-03-14, 400 days after duty payment 2024-02-08, exceeding the
+one Gregorian year permitted by Rules of Implementation Art. 16 §3(a)". Silent filtering
+would make an unclaimable position indistinguishable from an unexamined one.
+
+**Substitution is unreachable.** `GccLinkageMatcher` never emits `HTS_SUBSTITUTION`, the
+jurisdiction profile does not permit it, the `Claim` validator rejects it, and a database
+CHECK constraint refuses it. Four independent layers, because this is the failure that
+would look plausible all the way to a filing.
+
+### 3.8 Shared contract
+
+Both paths implement `MatchStrategy`:
+
+```
+match(imports, exports, profile, as_of) -> MatchResult
+```
+
+`MatchResult` carries the accepted `LineMatch` tuple, a typed rejection list, and solver
+metadata (status, wall time, candidate count). The API selects the strategy from the
+claim's jurisdiction; nothing downstream branches on jurisdiction again.
+
 ---
 
 ## 4. Architectural spine — and the critique

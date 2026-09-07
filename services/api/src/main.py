@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.sql import text
 
 from services.api.src.config import Settings, get_settings
+from services.api.src.routes import matching
 
 log = structlog.get_logger()
 
@@ -43,6 +44,9 @@ app = FastAPI(
     summary="Autonomous customs duty recovery",
     lifespan=lifespan,
 )
+
+
+app.include_router(matching.router)
 
 
 @app.get("/health")
