@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from ortools.sat.python import cp_model
 
+from drawbridge_schemas.bom import BillOfMaterials, BomComponent, ManufacturingBasis
 from drawbridge_schemas.jurisdiction import Jurisdiction, MatchTheory
 from drawbridge_schemas.trade import EntryLine, ExportLine, LineMatch
 from services.matcher.src.base import (
@@ -49,7 +50,13 @@ DUTY_SCALE = 1_000_000
 
 @dataclass(frozen=True, slots=True)
 class _Candidate:
-    """One eligible (import, export) pairing, pre-screened and pre-costed."""
+    """One eligible (import, export) pairing, pre-screened and pre-costed.
+
+    Under §1313(j) the pairing is import article to exported article, one to one. Under
+    §1313(a)/(b) it is raw material to a *component slot* of a finished good, and
+    `component_key` names which slot — one finished good draws from several import pools
+    at once, so the pairing is per component rather than per export line.
+    """
 
     import_index: int
     export_index: int
@@ -58,6 +65,17 @@ class _Candidate:
     duty_per_unit_micros: int
     max_quantity_scaled: int
     days_clock_start_to_export: int
+
+    component_key: str | None = None
+    """8-digit component subheading for manufacturing pairings; None for §1313(j)."""
+
+    component_required_scaled: int = 0
+    """Component quantity actually used to produce the exported finished goods —
+    the TFTEA ceiling on what may be designated. Zero for §1313(j)."""
+
+    @property
+    def is_manufacturing(self) -> bool:
+        return self.component_key is not None
 
 
 class UsSubstitutionMatcher(MatchStrategy):
@@ -144,11 +162,13 @@ class UsSubstitutionMatcher(MatchStrategy):
             window_failures = 0
             key_failures = 0
 
+            bom = request.bom_for(export)
+
             for import_index, entry in enumerate(request.imports):
                 if entry.quantity_available <= 0:
                     continue
 
-                theory = _theory_for(entry, export)
+                theory, component = _theory_for(entry, export, bom)
                 if theory is None:
                     key_failures += 1
                     continue
@@ -191,7 +211,22 @@ class UsSubstitutionMatcher(MatchStrategy):
                     # and could displace a paying allocation.
                     continue
 
-                max_quantity = min(entry.quantity_available, export.quantity_available)
+                if component is not None:
+                    # Manufacturing: the import satisfies a component slot, and the
+                    # ceiling is the quantity actually used to produce the exported
+                    # finished goods rather than the exported quantity itself.
+                    required = component.required_for(export.quantity_available)
+                    max_quantity = min(entry.quantity_available, required)
+                    component_key = component.component_hts.substitution_key
+                    required_scaled = _scale_quantity(required)
+                else:
+                    max_quantity = min(entry.quantity_available, export.quantity_available)
+                    component_key = None
+                    required_scaled = 0
+
+                if max_quantity <= 0:
+                    continue
+
                 candidates.append(
                     _Candidate(
                         import_index=import_index,
@@ -199,12 +234,18 @@ class UsSubstitutionMatcher(MatchStrategy):
                         theory=theory,
                         substitution_key=(
                             entry.hts.substitution_key
-                            if theory is MatchTheory.HTS_SUBSTITUTION
+                            if theory
+                            in {
+                                MatchTheory.HTS_SUBSTITUTION,
+                                MatchTheory.MANUFACTURING_SUBSTITUTION,
+                            }
                             else None
                         ),
                         duty_per_unit_micros=duty_micros,
                         max_quantity_scaled=_scale_quantity(max_quantity),
                         days_clock_start_to_export=(export.export_date - clock_start).days,
+                        component_key=component_key,
+                        component_required_scaled=required_scaled,
                     )
                 )
                 eligible_for_export += 1
@@ -261,9 +302,28 @@ class UsSubstitutionMatcher(MatchStrategy):
             model.add(sum(allocations[i] for i in indices) <= capacity)
 
         # An export line cannot be claimed twice.
+        #
+        # For §1313(j) the ceiling is the exported quantity itself. For manufacturing the
+        # units do not cancel — one finished unit consumes `quantity_per_unit / yield` of
+        # each component — so the ceiling is per (export, component) and is the quantity
+        # *actually used*, which is what TFTEA ties the designation to.
         for export_index, indices in by_export.items():
-            capacity = _scale_quantity(request.exports[export_index].quantity_available)
-            model.add(sum(allocations[i] for i in indices) <= capacity)
+            manufacturing = [i for i in indices if candidates[i].is_manufacturing]
+            unused = [i for i in indices if not candidates[i].is_manufacturing]
+
+            if unused:
+                capacity = _scale_quantity(request.exports[export_index].quantity_available)
+                model.add(sum(allocations[i] for i in unused) <= capacity)
+
+            by_component: dict[str, list[int]] = {}
+            for index in manufacturing:
+                key = candidates[index].component_key
+                assert key is not None
+                by_component.setdefault(key, []).append(index)
+
+            for component_indices in by_component.values():
+                required = candidates[component_indices[0]].component_required_scaled
+                model.add(sum(allocations[i] for i in component_indices) <= required)
 
         # Maximise refundable duty, not matched quantity. Matching units maximises
         # paperwork; matching duty maximises the refund.
@@ -319,17 +379,36 @@ class UsSubstitutionMatcher(MatchStrategy):
 # -------------------------------------------------------------------------- helpers
 
 
-def _theory_for(entry: EntryLine, export: ExportLine) -> MatchTheory | None:
-    """Which §1313(j) theory, if any, could pair these two lines.
+def _theory_for(
+    entry: EntryLine, export: ExportLine, bom: BillOfMaterials | None
+) -> tuple[MatchTheory | None, BomComponent | None]:
+    """Which §1313 theory, if any, could pair these two lines, and under which component.
 
-    Direct identity is preferred where the full tariff code matches: it needs no
-    commercial-interchangeability narrative and survives a desk audit more easily.
+    Unused merchandise is tried first: where the imported article *is* the exported
+    article, §1313(j) applies and no bill of materials is needed. Only when the codes do
+    not line up does a BOM make the pairing possible, and then the claim is a
+    manufacturing one under §1313(a)/(b).
+
+    Direct identity is preferred over substitution in both families: the full tariff code
+    matching needs no commercial-interchangeability narrative and survives a desk audit
+    more easily.
     """
     if entry.hts.code == export.hts.code:
-        return MatchTheory.DIRECT_IDENTITY
+        return MatchTheory.DIRECT_IDENTITY, None
     if entry.hts.substitutable_with(export.hts):
-        return MatchTheory.HTS_SUBSTITUTION
-    return None
+        return MatchTheory.HTS_SUBSTITUTION, None
+
+    if bom is not None:
+        component = bom.component_for(entry.hts)
+        if component is not None:
+            theory = (
+                MatchTheory.MANUFACTURING_DIRECT_IDENTITY
+                if component.basis is ManufacturingBasis.DIRECT_IDENTITY
+                else MatchTheory.MANUFACTURING_SUBSTITUTION
+            )
+            return theory, component
+
+    return None, None
 
 
 def _duty_per_unit_micros(entry: EntryLine, profile: object) -> int:

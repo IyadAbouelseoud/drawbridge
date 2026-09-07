@@ -30,8 +30,21 @@ class Jurisdiction(StrEnum):
 
 
 class Currency(StrEnum):
+    """Currencies the system converts between.
+
+    USD and SAR are the filing currencies. The rest appear as *invoice* currencies on a
+    Bayan, where a real conversion is needed to screen the Art. 16 §2 threshold — the peg
+    says nothing about them, so they resolve through a dated table or route to review.
+    """
+
     USD = "USD"
     SAR = "SAR"
+    EUR = "EUR"
+    GBP = "GBP"
+    CNY = "CNY"
+    JPY = "JPY"
+    AED = "AED"
+    INR = "INR"
 
 
 class MatchTheory(StrEnum):
@@ -46,6 +59,13 @@ class MatchTheory(StrEnum):
     DECLARATION_LINKAGE = "declaration_linkage"
     """Re-export declaration carrying the import declaration number.
     GCC Rules of Implementation Art. 15(c). The only GCC theory."""
+
+    MANUFACTURING_DIRECT_IDENTITY = "manufacturing_direct_identity"
+    """The same imported merchandise consumed in manufacture. 19 U.S.C. §1313(a)."""
+
+    MANUFACTURING_SUBSTITUTION = "manufacturing_substitution"
+    """Merchandise under the same 8-digit HTS subheading substituted into manufacture.
+    19 U.S.C. §1313(b). US only — the GCC has no substitution of any kind."""
 
 
 class ClockAnchor(StrEnum):
@@ -138,7 +158,14 @@ US_PROFILE = JurisdictionProfile(
     currency=Currency.USD,
     refund_rate=Decimal("0.99"),
     refund_rate_citation="19 U.S.C. §1313 — 99% of duties, taxes and fees",
-    permitted_theories=frozenset({MatchTheory.DIRECT_IDENTITY, MatchTheory.HTS_SUBSTITUTION}),
+    permitted_theories=frozenset(
+        {
+            MatchTheory.DIRECT_IDENTITY,
+            MatchTheory.HTS_SUBSTITUTION,
+            MatchTheory.MANUFACTURING_DIRECT_IDENTITY,
+            MatchTheory.MANUFACTURING_SUBSTITUTION,
+        }
+    ),
     clock_anchor=ClockAnchor.IMPORT_DATE,
     reexport_window=Deadline(
         amount=5, unit=DeadlineUnit.GREGORIAN_YEARS, citation="19 U.S.C. §1313(j)"

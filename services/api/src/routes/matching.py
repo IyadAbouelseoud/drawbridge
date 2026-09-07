@@ -14,6 +14,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from drawbridge_schemas.bom import BillOfMaterials
 from drawbridge_schemas.jurisdiction import Jurisdiction, profile_for
 from drawbridge_schemas.trade import EntryLine, ExportLine
 from services.matcher.src.base import MatchRequest, MatchResult
@@ -39,6 +40,16 @@ class MatchRequestBody(BaseModel):
     time_limit_seconds: Annotated[float, Field(gt=0, le=300)] = 30.0
     claimant_is_importer_of_record: bool = True
     proof_of_purchase: bool = False
+
+    boms: dict[str, BillOfMaterials] = Field(
+        default_factory=dict,
+        description=(
+            "Bills of materials keyed by finished-good HTS code. Supplying one turns "
+            "that finished good into manufacturing drawback under 19 U.S.C. 1313(a)/(b), "
+            "where the import/export exchange rate is the BOM multiplier rather than 1. "
+            "Omit for unused-merchandise claims under 1313(j)."
+        ),
+    )
 
 
 class RejectionOut(BaseModel):
@@ -125,6 +136,7 @@ async def run_matching(body: MatchRequestBody) -> MatchResponse:
         time_limit_seconds=body.time_limit_seconds,
         claimant_is_importer_of_record=body.claimant_is_importer_of_record,
         proof_of_purchase=body.proof_of_purchase,
+        boms=body.boms,
     )
     return _to_response(run_match(request))
 
@@ -137,9 +149,19 @@ async def list_strategies() -> dict[str, Any]:
             "strategy": "UsSubstitutionMatcher",
             "algorithm": "CP-SAT combinatorial allocation",
             "shape": "many-to-many",
-            "theories": ["direct_identity", "hts_substitution"],
+            "theories": [
+                "direct_identity",
+                "hts_substitution",
+                "manufacturing_direct_identity",
+                "manufacturing_substitution",
+            ],
             "objective": "maximise total refundable duty",
-            "statute": "19 U.S.C. §1313(j)",
+            "statute": "19 U.S.C. §1313(j) unused; §1313(a)/(b) manufacturing",
+            "manufacturing": (
+                "supply `boms` keyed by finished-good HTS. Component allocation is "
+                "capped at quantity_per_unit / yield x exported quantity — the quantity "
+                "actually used, which is what TFTEA ties designation to."
+            ),
         },
         "ksa": {
             "strategy": "GccLinkageMatcher",

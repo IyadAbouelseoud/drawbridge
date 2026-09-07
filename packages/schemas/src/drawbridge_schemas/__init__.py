@@ -4,6 +4,11 @@ Single source of truth. Every service and MCP server imports its types from here
 nothing redefines a claim, an entry line, or a provenance span locally.
 """
 
+from drawbridge_schemas.bom import (
+    BillOfMaterials,
+    BomComponent,
+    ManufacturingBasis,
+)
 from drawbridge_schemas.claim import (
     Claim,
     ClaimState,
@@ -44,6 +49,8 @@ __all__ = [
     "GCC_MIN_REEXPORT_VALUE_USD",
     "KSA_PROFILE",
     "US_PROFILE",
+    "BillOfMaterials",
+    "BomComponent",
     "Claim",
     "ClaimState",
     "ClockAnchor",
@@ -61,6 +68,7 @@ __all__ = [
     "JurisdictionProfile",
     "Language",
     "LineMatch",
+    "ManufacturingBasis",
     "MatchTheory",
     "Money",
     "Provenance",
@@ -70,4 +78,4 @@ __all__ = [
     "profile_for",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

@@ -219,6 +219,68 @@ jurisdiction profile does not permit it, the `Claim` validator rejects it, and a
 CHECK constraint refuses it. Four independent layers, because this is the failure that
 would look plausible all the way to a filing.
 
+### 3.6b Manufacturing drawback — BOM explosion (19 U.S.C. §1313(a)/(b))
+
+Week 3 covered **unused merchandise** (§1313(j)): the article exported is the article
+imported. Manufacturing drawback is the case where it is not — imported raw material is
+consumed to produce a different finished good, and the refund follows the material
+*through* the manufacture.
+
+**What changes in the model.** Under §1313(j) an allocation of *q* units of import
+satisfies *q* units of export: the exchange rate between the two sides is 1. Under
+§1313(a)/(b) it is the BOM multiplier. Exporting one finished good consumes
+`quantity_per_unit` of each component, so the units no longer cancel and the constraint
+matrix is no longer a plain transportation problem.
+
+| | §1313(j) unused | §1313(a)/(b) manufacturing |
+|---|---|---|
+| Sides | import article ↔ same/substitutable article | raw material ↔ finished good |
+| Exchange rate | 1:1 | BOM `quantity_per_unit`, plus yield |
+| Extra constraint | none | one per (finished good, component) pair |
+| Evidence | interchangeability narrative | bill of materials or formula |
+
+**Statutory anchors:**
+
+- §1313(a) — direct identity: the *same* imported merchandise is used in manufacture.
+- §1313(b) — substitution: merchandise classifiable under the **same 8-digit HTS
+  subheading** as the imported merchandise may be substituted.
+- A **bill of materials or formula** must accompany the claim, identifying merchandise and
+  article by 8-digit HTS subheading and the quantity of merchandise (TFTEA).
+- The designated quantity must be **the quantity actually used** to produce the exported
+  article — not the quantity purchased, and not the quantity on hand.
+- Merchandise must be used within **5 years** of import.
+- Where one manufacturing process yields **several products**, drawback is distributed
+  across them by their **relative values at the time of separation** (19 CFR 190 subpart B).
+
+**Model extension.** For each finished-good export line *e* and each component *c* in its
+BOM, with multiplier `m[e,c]` (component units per finished unit) and yield `y[e,c] ∈ (0,1]`:
+
+```
+required[e,c] = exported_quantity[e] × m[e,c] / y[e,c]
+Σ_i x[i,e,c] ≤ required[e,c]          # cannot designate more than was used
+Σ_e,c x[i,e,c] ≤ available[i]         # import capacity, unchanged
+```
+
+The decision variable gains a component index. Objective is unchanged — maximise
+refundable duty — but a finished good now draws from several import pools at once, and the
+solver must decide which lot of each component to designate.
+
+**Yield is not optional.** Scrap, waste and process loss mean the material consumed
+exceeds the material embodied in the finished article. Claiming only the embodied quantity
+under-claims; claiming input without evidencing yield over-claims. The multiplier is
+therefore stored as `quantity_per_unit / yield`, and both halves are kept so the derivation
+trail can show an auditor which is which.
+
+**Relative-value distribution.** Where a process yields joint products, the component cost
+attributable to each is apportioned by value share at separation, not by quantity. The BOM
+schema carries `relative_value_share` for exactly this; it defaults to `None` for
+single-output processes, where the question does not arise.
+
+**What is deliberately not modelled yet.** Multi-level BOMs (a component that is itself
+manufactured from other imports) are flattened to one level at ingest. Nested explosion is
+a week 6+ concern and needs the ERP integration to be real first — the model above holds
+either way, since a flattened BOM is a special case of a nested one.
+
 ### 3.8 Shared contract
 
 Both paths implement `MatchStrategy`:

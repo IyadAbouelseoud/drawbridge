@@ -20,10 +20,16 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
+from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from typing import TYPE_CHECKING
 
-from drawbridge_schemas.jurisdiction import Currency, Jurisdiction, MatchTheory
+from drawbridge_schemas.jurisdiction import (
+    Currency,
+    Jurisdiction,
+    JurisdictionProfile,
+    MatchTheory,
+)
 from drawbridge_schemas.trade import EntryLine, ExportLine, LineMatch
 from services.matcher.src.base import (
     MatchRequest,
@@ -34,28 +40,33 @@ from services.matcher.src.base import (
     SolverStatus,
 )
 from services.rules.src.deadlines import window_for
+from services.rules.src.fx import (
+    RateProvider,
+    RateUnavailableError,
+    check_minimum,
+    default_provider,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-# SAR is pegged to the USD at 3.75. The Art. 16 §2 threshold is written in US dollars
-# "or its equivalent in the local currency", and the peg has held since 1986, so this is
-# a fixed conversion rather than a rate lookup.
+# Currency conversion is delegated to services/rules/src/fx.py. The rate resolves as at
+# the duty-payment date per GCC Rules of Implementation of Valuation Art. 1(I)(6) — not
+# the invoice date and not the declaration date. See docs/COMPLIANCE-GCC.md §7.
 #
-# COMPLIANCE-GCC.md §7 records the open question this does not resolve: whether ZATCA
-# screens the threshold against customs value or invoice value. Claims within the review
-# band below are flagged rather than decided.
-SAR_PER_USD = Decimal("3.75")
-
-# Claims whose value lands within this fraction of the threshold route to analyst review
-# rather than being accepted or rejected on our own arithmetic.
-THRESHOLD_REVIEW_BAND = Decimal("0.10")
+# Week 3 carried a hardcoded 3.75 here and accepted claims within 10% of the threshold
+# while the valuation basis was open. Art. 1(I)(5) settles enough of it that the band is
+# no longer defensible: Art. 16 §2 says "shall not be less than", so the gate is strict.
+# Near misses are flagged on the rejection rather than quietly passed.
 
 
 class GccLinkageMatcher(MatchStrategy):
     """Deterministic declaration-linkage trace with statutory gates."""
 
     jurisdiction = Jurisdiction.KSA
+
+    def __init__(self, rate_provider: RateProvider | None = None) -> None:
+        self._rates = rate_provider or default_provider()
 
     def match(self, request: MatchRequest) -> MatchResult:
         self._guard_jurisdiction(request)
@@ -90,6 +101,74 @@ class GccLinkageMatcher(MatchStrategy):
             detail=(
                 f"{len(matches)} linked, {len(rejections)} rejected under "
                 "GCC Rules of Implementation Art. 16"
+            ),
+        )
+
+    # ------------------------------------------------------------- valuation gate
+
+    def _screen_minimum_value(
+        self, export: ExportLine, profile: JurisdictionProfile, payment_date: date
+    ) -> Rejection | None:
+        """Art. 16 §2 — the re-exported goods must be worth at least USD 5,000.
+
+        Strict. The article says "shall not be less than five thousand US dollars", so a
+        value under the minimum is rejected however close it came. Near misses carry a
+        marker in the detail so the review queue surfaces them, rather than the claim
+        disappearing quietly.
+
+        Conversion runs at the duty-payment date per Valuation Art. 1(I)(6).
+        """
+        minimum = profile.min_claim_value
+        if minimum is None:
+            return None
+
+        if export.declared_value is None:
+            return Rejection(
+                export_line_id=str(export.line_id),
+                code=RejectionCode.BELOW_MINIMUM_VALUE,
+                citation="GCC Rules of Implementation Art. 16 §2",
+                detail=(
+                    f"re-export {export.reference} carries no declared value, so the "
+                    f"{minimum} {profile.min_claim_value_currency} minimum cannot be "
+                    "evidenced"
+                ),
+            )
+
+        threshold_currency = profile.min_claim_value_currency or Currency.USD
+        try:
+            check = check_minimum(
+                declared_amount=export.declared_value,
+                declared_currency=profile.currency,
+                threshold=minimum,
+                threshold_currency=threshold_currency,
+                rate_date=payment_date,
+                provider=self._rates,
+            )
+        except RateUnavailableError as exc:
+            # No rate on file. Routing to review beats converting on a guess: the first
+            # is visibly unfinished, the second is silently wrong.
+            return Rejection(
+                export_line_id=str(export.line_id),
+                code=RejectionCode.RATE_UNAVAILABLE,
+                citation="GCC Rules of Implementation of Valuation Art. 1(I)(6)",
+                detail=(
+                    f"re-export {export.reference}: {exc}. The Art. 16 §2 threshold "
+                    "cannot be evaluated without a rate as at the duty-payment date"
+                ),
+            )
+
+        if check.passed:
+            return None
+
+        marker = " [near_miss]" if check.is_near_miss else ""
+        return Rejection(
+            export_line_id=str(export.line_id),
+            code=RejectionCode.BELOW_MINIMUM_VALUE,
+            citation="GCC Rules of Implementation Art. 16 §2",
+            detail=(
+                f"re-export {export.reference}: {check.explain()}; short by "
+                f"{check.shortfall.quantize(Decimal('0.01'))} "
+                f"{check.threshold_currency}{marker}"
             ),
         )
 
@@ -131,10 +210,12 @@ class GccLinkageMatcher(MatchStrategy):
                 ),
             )
 
-        # Gate 2 — Art. 16 §2: USD 5,000 minimum. Screened before any date arithmetic
-        # because it is the gate that disqualifies a claim before extraction spend is
-        # worth making.
-        value_check = _screen_minimum_value(export, profile)
+        # Gate 2 — Art. 16 §2: USD 5,000 minimum, converted at the duty-payment date
+        # (Valuation Art. 1(I)(6)). Screened before the date arithmetic because it is the
+        # gate that disqualifies a claim before extraction spend is worth making; it
+        # needs the payment date, so it sits just after the declaration resolves.
+        payment_date = min((e.eligibility_clock_start for e in entries), default=export.export_date)
+        value_check = self._screen_minimum_value(export, profile, payment_date)
         if value_check is not None:
             return value_check
 
@@ -296,55 +377,6 @@ def _index_imports(imports: Sequence[EntryLine]) -> dict[str, list[EntryLine]]:
     for entry in imports:
         index[entry.declaration_number].append(entry)
     return dict(index)
-
-
-def _screen_minimum_value(export: ExportLine, profile: object) -> Rejection | None:
-    """Art. 16 §2 — value of re-exported goods must be at least USD 5,000.
-
-    Returns a rejection, or None to continue. Claims within ten percent of the threshold
-    are *accepted here* and flagged upstream rather than decided on our arithmetic: the
-    valuation basis ZATCA applies is an open question (COMPLIANCE-GCC.md §7), and
-    rejecting a borderline claim on an assumption forfeits it silently.
-    """
-    minimum = getattr(profile, "min_claim_value", None)
-    if minimum is None:
-        return None
-
-    if export.declared_value is None:
-        return Rejection(
-            export_line_id=str(export.line_id),
-            code=RejectionCode.BELOW_MINIMUM_VALUE,
-            citation="GCC Rules of Implementation Art. 16 §2",
-            detail=(
-                f"re-export {export.reference} carries no declared value, so the "
-                f"USD {minimum} minimum cannot be evidenced"
-            ),
-        )
-
-    value_usd = _to_usd(export.declared_value, getattr(profile, "currency", Currency.SAR))
-    if value_usd >= minimum:
-        return None
-
-    # Inside the review band the shortfall may be an artefact of the valuation basis.
-    if value_usd >= minimum * (Decimal("1") - THRESHOLD_REVIEW_BAND):
-        return None
-
-    return Rejection(
-        export_line_id=str(export.line_id),
-        code=RejectionCode.BELOW_MINIMUM_VALUE,
-        citation="GCC Rules of Implementation Art. 16 §2",
-        detail=(
-            f"re-export {export.reference} declared value {export.declared_value} "
-            f"({value_usd.quantize(Decimal('0.01'))} USD) is below the "
-            f"USD {minimum} minimum"
-        ),
-    )
-
-
-def _to_usd(amount: Decimal, currency: Currency) -> Decimal:
-    if currency is Currency.USD:
-        return amount
-    return amount / SAR_PER_USD
 
 
 def _apportion_duty(entry: EntryLine, quantity: Decimal, profile: object) -> Decimal:

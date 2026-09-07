@@ -351,3 +351,74 @@ class ClaimTransition(Base):
     claim: Mapped[Claim] = relationship(back_populates="transitions")
 
     __table_args__ = (Index("ix_claim_transitions_claim", "claim_id", "occurred_at"),)
+
+
+class ReviewQueue(Base):
+    """Human-in-the-loop exception queue.
+
+    n8n suspends a claim here rather than guessing. Three triggers, each a case where
+    proceeding silently would produce a plausible-looking figure with no basis:
+
+    - the matcher returned a status that is not provably optimal;
+    - extraction confidence fell below the floor, so a figure may be misread;
+    - a GCC claim landed near the Art. 16 §2 threshold, or had no rate on file.
+
+    `payload` carries the matcher's rejections and the solver metadata verbatim, so an
+    analyst opening the queue sees the provisions that failed and the figures involved
+    without re-running anything.
+    """
+
+    __tablename__ = "review_queue"
+
+    review_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.tenant_id", ondelete="RESTRICT")
+    )
+    claim_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("claims.claim_id", ondelete="CASCADE")
+    )
+
+    reason: Mapped[str] = mapped_column(String(48))
+    severity: Mapped[str] = mapped_column(String(16), default="normal")
+    summary: Mapped[str] = mapped_column(Text)
+    citation: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    # n8n suspends on this row and resumes when it clears. The token is what the
+    # workflow waits on, so it is unique and never reused.
+    resume_token: Mapped[str] = mapped_column(String(64), unique=True)
+    workflow_run_id: Mapped[str | None] = mapped_column(String(128))
+
+    state: Mapped[str] = mapped_column(String(16), default="open")
+    assigned_to: Mapped[str | None] = mapped_column(String(128))
+    resolution: Mapped[str | None] = mapped_column(String(24))
+    resolution_note: Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "reason IN ('solver_not_optimal','solver_infeasible','low_extraction_confidence',"
+            "'threshold_near_miss','rate_unavailable','unknown_field_label',"
+            "'jurisdiction_ambiguous','deadline_imminent')",
+            name="ck_review_reason",
+        ),
+        CheckConstraint("state IN ('open','claimed','resolved')", name="ck_review_state"),
+        CheckConstraint(
+            "severity IN ('low','normal','high','blocking')",
+            name="ck_review_severity",
+        ),
+        CheckConstraint(
+            "resolution IS NULL OR resolution IN ('approved','rejected','corrected','deferred')",
+            name="ck_review_resolution",
+        ),
+        # A resolved row must say how it was resolved, and when. Otherwise the queue
+        # empties without a record of what an analyst actually decided.
+        CheckConstraint(
+            "state <> 'resolved' OR (resolution IS NOT NULL AND resolved_at IS NOT NULL)",
+            name="ck_resolved_rows_are_explained",
+        ),
+        Index("ix_review_queue_open", "tenant_id", "state", "created_at"),
+        Index("ix_review_queue_claim", "claim_id"),
+    )

@@ -244,12 +244,14 @@ class TestMinimumValueThreshold:
         )
         assert result.rejections[0].code is RejectionCode.BELOW_MINIMUM_VALUE
 
-    def test_borderline_value_routes_to_review_rather_than_rejection(self) -> None:
-        """The valuation basis ZATCA applies is an open question.
+    def test_borderline_value_is_rejected_and_flagged(self) -> None:
+        """Week 4 made this strict, reversing the week 3 behaviour.
 
-        18,000 SAR = 4,800 USD, four percent under the threshold. Rejecting on our own
-        arithmetic would forfeit a possibly-valid claim silently, so borderline values
-        are carried forward and flagged instead.
+        18,000 SAR = 4,800 USD, four percent under the threshold. Week 3 accepted it
+        while the valuation basis was open; Valuation Art. 1(I)(5) settled enough of it
+        that a soft edge is no longer defensible — Art. 16 §2 says "shall not be less
+        than". The claim is rejected, and marked so the review queue surfaces the near
+        miss rather than the claim vanishing quietly.
         """
         payment = date(2024, 2, 8)
         export_date = payment + timedelta(days=90)
@@ -258,7 +260,21 @@ class TestMinimumValueThreshold:
             [_export(export_date, value=Decimal("18000.00"))],
             export_date + timedelta(days=30),
         )
-        assert len(result.matches) == 1
+        assert result.matches == ()
+        rejection = result.rejections[0]
+        assert rejection.code is RejectionCode.BELOW_MINIMUM_VALUE
+        assert "near_miss" in rejection.detail
+
+    def test_value_exactly_at_the_threshold_is_accepted(self) -> None:
+        """18,750 SAR is exactly 5,000 USD at the peg. Equal is not less."""
+        payment = date(2024, 2, 8)
+        export_date = payment + timedelta(days=90)
+        result = _run(
+            [_entry(payment)],
+            [_export(export_date, value=Decimal("18750.00"))],
+            export_date + timedelta(days=30),
+        )
+        assert len(result.matches) == 1, [str(r) for r in result.rejections]
 
 
 class TestLinkageGates:

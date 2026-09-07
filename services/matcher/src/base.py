@@ -12,12 +12,14 @@ jurisdiction again.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from drawbridge_schemas.bom import BillOfMaterials
 from drawbridge_schemas.jurisdiction import Jurisdiction, JurisdictionProfile
 from drawbridge_schemas.trade import EntryLine, ExportLine, LineMatch
 
@@ -42,6 +44,11 @@ class RejectionCode(StrEnum):
 
     BELOW_MINIMUM_VALUE = "below_minimum_value"
     """Art. 16 §2 — re-export value under USD 5,000."""
+
+    RATE_UNAVAILABLE = "rate_unavailable"
+    """Valuation Art. 1(I)(6) — no exchange rate on file as at the duty-payment date,
+    so the Art. 16 §2 threshold cannot be evaluated. Routes to review rather than
+    being converted on a guess."""
 
     REEXPORT_WINDOW_EXPIRED = "reexport_window_expired"
     """Art. 16 §3(a) — re-export beyond one Gregorian year of duty payment."""
@@ -172,6 +179,23 @@ class MatchRequest:
     """Art. 16 §1. False requires documented proof of purchase, checked upstream."""
 
     proof_of_purchase: bool = False
+
+    boms: Mapping[str, BillOfMaterials] = field(default_factory=dict)
+    """Bills of materials keyed by finished-good HTS code.
+
+    Empty for unused-merchandise claims (§1313(j)), which need none. A key here turns
+    the matching of that finished good into manufacturing drawback under §1313(a)/(b),
+    where the exchange rate between import and export quantity is the BOM multiplier
+    rather than 1.
+    """
+
+    def bom_for(self, export: ExportLine) -> BillOfMaterials | None:
+        """The bill of materials for an exported finished good, if one is on file.
+
+        Looked up on the full tariff code first, then the 8-digit subheading, because a
+        BOM recorded against a subheading covers every statistical suffix beneath it.
+        """
+        return self.boms.get(export.hts.code) or self.boms.get(export.hts.substitution_key)
 
 
 class MatchStrategy(ABC):

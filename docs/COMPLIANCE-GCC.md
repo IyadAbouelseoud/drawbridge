@@ -194,13 +194,77 @@ renderer changes.
 
 ---
 
-## 7. Open questions
+## 7. Valuation and currency conversion — RESOLVED
+
+Week 2 left the FX reference date open. Primary source settles it.
+
+**GCC Common Customs Law, Rules of Implementation of Valuation, Article 1(I)(6):**
+
+> *"The time of payment of the customs taxes 'duties' shall be the time approved for
+> currency exchange rate."*
+
+The conversion rate is fixed at the **duty-payment date**. Not the invoice date, not the
+declaration date, not the date of re-export. This is the same anchor Art. 16 §3(a) uses
+for the re-export window, so one date drives both the eligibility clock and the currency
+conversion.
+
+Related provisions from the same article:
+
+| Provision | Effect |
+|---|---|
+| Art. 1(I)(5) | Freight, insurance and other charges are added to customs value **until arrival at the port of destination** — a CIF basis, not FOB |
+| Art. 1(I)(7) | Discounts agreed after the date of importation are ignored; so are credit balances from earlier consignments |
+| Art. 1(I)(8) | The WTO Valuation Agreement governs interpretation |
+| Art. 1(I)(1) | Where final valuation is prolonged, goods clear against a cash deposit |
+
+### 7.1 Why there is no SAMA rate fetch
+
+The obvious implementation — call SAMA for the rate on the relevant date — is the wrong
+one, for three reasons that compound:
+
+1. **SAR/USD is a policy peg, not a market rate.** SAMA has held 1 USD = 3.75 SAR since
+   1986. There is no daily rate to look up; a "live" fetch would return a constant while
+   adding a network dependency.
+2. **SAMA publishes no machine-readable feed.** It releases monthly period-average and
+   end-of-period tables for twelve currencies. Every API offering "SAMA rates" is a
+   third-party mirror, typically trailing the calendar by around two months. An
+   unofficial mirror is weaker evidence for a filing than the documented peg.
+3. **A filed figure must reproduce years later.** A network call at match time makes the
+   claim non-reproducible: re-running a 2024 claim in 2029 would hit a different endpoint,
+   a different mirror, or nothing at all. That breaks the §163 / Art. 175 recordkeeping
+   posture the whole system is built to satisfy.
+
+**What is implemented instead** (`services/rules/src/fx.py`): a date-aware
+`RateProvider` interface with the peg as one documented, cited entry, and a table
+provider for dated rates where a real conversion is needed. Rates resolve **as at the
+duty-payment date** per Art. 1(I)(6). Where a declared value is in a third currency with
+no rate on file, the claim routes to `ANALYST_REVIEW` rather than being converted on a
+guess.
+
+The hardcoded `SAR_PER_USD` constant in `gcc_linkage.py` is gone.
+
+### 7.2 The threshold is now enforced strictly
+
+Week 3 accepted claims within 10% of the USD 5,000 minimum on the theory that the
+valuation basis was unresolved. Art. 1(I)(5) resolves enough of it — customs value on a
+CIF basis, converted at the payment-date rate — that the band is no longer justified.
+Art. 16 §2 says "shall not be less than five thousand US dollars", and a threshold with a
+soft edge is not the threshold the article states.
+
+Borderline claims are **rejected**, not silently accepted, and the rejection carries the
+computed USD figure and the shortfall so an analyst reviewing the queue can see exactly
+how close it came. Strict enforcement plus visible near-misses beats a quiet acceptance
+that would surface as a ZATCA rejection months later.
+
+---
+
+## 8. Remaining open questions
 
 1. Exact article numbers in ZATCA Resolution 28624 (needs Arabic Umm Al-Qura text).
-2. Whether ZATCA applies the USD 5,000 threshold against customs value or invoice value,
-   and the FX reference date for the SAR equivalent. **The engine currently evaluates at
-   the duty-payment date and flags the claim for analyst review when within ±10% of the
-   threshold.**
+2. Whether ZATCA screens the threshold against the **customs value** of the re-exported
+   goods or the original import customs value where they differ. Art. 16 §2 says "the
+   value of the re-exported foreign goods", which reads as the former. **The engine uses
+   the re-export declared value** and records which basis was used on the claim.
 3. Whether partial-consignment re-exports are accepted through Fasah without a prior ruling.
 4. Whether the six-month claim clock runs from the re-export declaration date or from
    physical departure. **The engine uses the earlier of the two.**

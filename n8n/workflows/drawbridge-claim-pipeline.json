@@ -1,0 +1,459 @@
+{
+  "name": "drawbridge-claim-pipeline",
+  "meta": {
+    "description": "Ingest -> extract -> match -> triage -> persist. The Postgres claim state machine is authoritative; this workflow fires transitions and never holds business state (docs/ARCHITECTURE.md section 4)."
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "errorWorkflow": "drawbridge-pipeline-error"
+  },
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "drawbridge/ingest",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "ingest-webhook",
+      "name": "Ingest Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -760,
+        300
+      ],
+      "webhookId": "drawbridge-ingest"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fail fast on a malformed batch. A claim reaching the matcher without its jurisdiction\n// would be matched under whichever statute happens to be the default, which is exactly\n// the failure that looks plausible all the way to a filing.\nconst b = $input.first().json;\nfor (const f of ['tenant_id', 'jurisdiction', 'documents']) {\n  if (!b[f]) throw new Error('ingest payload missing required field: ' + f);\n}\nif (!['us', 'ksa'].includes(b.jurisdiction)) {\n  throw new Error('unknown jurisdiction: ' + b.jurisdiction);\n}\nreturn [{ json: Object.assign({}, b, {\n  as_of: b.as_of || new Date().toISOString().slice(0, 10),\n}) }];"
+      },
+      "id": "validate-payload",
+      "name": "Validate Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -560,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/documents/batch",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $json.tenant_id, documents: $json.documents }) }}"
+      },
+      "id": "store-documents",
+      "name": "Store Documents",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -360,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/extraction/run",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, documents: $json.stored }) }}"
+      },
+      "id": "extract",
+      "name": "Extract",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -160,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extraction confidence below the floor means a figure may be misread. Matching on a\n// misread figure yields an internally consistent claim for the wrong amount, which no\n// downstream check would catch.\nconst FLOOR = 0.95;\nconst x = $input.first().json;\nconst scores = (x.confidences || []).map(c => c.score);\nconst below = scores.filter(s => s < FLOOR);\nreturn [{ json: Object.assign({}, x, {\n  confidence_min: scores.length ? Math.min.apply(null, scores) : null,\n  confidence_below_floor: below.length,\n  confidence_ok: below.length === 0,\n}) }];"
+      },
+      "id": "confidence-gate",
+      "name": "Confidence Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        40,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/matching/run",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ jurisdiction: $('Validate Payload').item.json.jurisdiction, imports: $json.imports, exports: $json.exports, as_of: $('Validate Payload').item.json.as_of }) }}"
+      },
+      "id": "match",
+      "name": "Match",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/triage/evaluate",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ match_result: $json, confidences: $('Confidence Gate').item.json.confidences, as_of: $('Validate Payload').item.json.as_of }) }}"
+      },
+      "id": "triage",
+      "name": "Triage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "leftValue": "={{ $json.requires_review }}",
+              "rightValue": ""
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "needs-review",
+      "name": "Needs Review",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/review/suspend",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, claim_id: $('Match').item.json.claim_id, workflow_run_id: $execution.id, items: $json.items }) }}"
+      },
+      "id": "suspend-for-analyst",
+      "name": "Suspend For Analyst",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        860,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "options": {}
+      },
+      "id": "await-resolution",
+      "name": "Await Resolution",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1060,
+        160
+      ],
+      "webhookId": "drawbridge-review-resume"
+    },
+    {
+      "parameters": {
+        "jsCode": "// An analyst may approve, correct, reject or defer. Only the first two continue; a\n// rejected claim stops here with its reason recorded rather than proceeding quietly.\nconst r = $input.first().json;\nif (['approved', 'corrected'].indexOf(r.resolution) === -1) {\n  return [{ json: Object.assign({}, r, { halt: true, final_state: 'rejected' }) }];\n}\nreturn [{ json: Object.assign({}, r, { halt: false }) }];"
+      },
+      "id": "apply-resolution",
+      "name": "Apply Resolution",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1260,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/claims/persist",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, jurisdiction: $('Validate Payload').item.json.jurisdiction, match_result: $('Match').item.json, review: $('Triage').item.json }) }}"
+      },
+      "id": "persist-claim",
+      "name": "Persist Claim",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/claims/transition",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ claim_id: $json.claim_id, to_state: $json.next_state, actor: 'n8n', reason: 'pipeline run ' + $execution.id }) }}"
+      },
+      "id": "advance-state",
+      "name": "Advance State",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ claim_id: $json.claim_id, state: $json.state, refund: $json.total_refund }) }}",
+        "options": {}
+      },
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1880,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Ingest Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Payload": {
+      "main": [
+        [
+          {
+            "node": "Store Documents",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Documents": {
+      "main": [
+        [
+          {
+            "node": "Extract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract": {
+      "main": [
+        [
+          {
+            "node": "Confidence Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confidence Gate": {
+      "main": [
+        [
+          {
+            "node": "Match",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Match": {
+      "main": [
+        [
+          {
+            "node": "Triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Triage": {
+      "main": [
+        [
+          {
+            "node": "Needs Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Review": {
+      "main": [
+        [
+          {
+            "node": "Suspend For Analyst",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Persist Claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Suspend For Analyst": {
+      "main": [
+        [
+          {
+            "node": "Await Resolution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Await Resolution": {
+      "main": [
+        [
+          {
+            "node": "Apply Resolution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Resolution": {
+      "main": [
+        [
+          {
+            "node": "Persist Claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Claim": {
+      "main": [
+        [
+          {
+            "node": "Advance State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Advance State": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "drawbridge"
+    },
+    {
+      "name": "pipeline"
+    }
+  ]
+}

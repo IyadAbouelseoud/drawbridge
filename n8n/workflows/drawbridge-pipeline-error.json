@@ -1,0 +1,89 @@
+{
+  "name": "drawbridge-pipeline-error",
+  "meta": {
+    "description": "Error workflow for the pipeline. A crashed run leaves a blocking review row rather than a claim stranded mid-transition."
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// A crashed run must leave the claim in a state an analyst can act on, not stranded\n// mid-transition with no record of why it stopped.\nconst e = $input.first().json;\nconst ex = e.execution || {};\nreturn [{ json: {\n  tenant_id: e.tenant_id,\n  reason: 'solver_infeasible',\n  severity: 'blocking',\n  summary: 'pipeline run ' + ex.id + ' failed at node ' + ex.lastNodeExecuted\n         + ': ' + ((ex.error && ex.error.message) || 'unknown error'),\n  payload: { node: ex.lastNodeExecuted, workflow: (e.workflow || {}).name },\n} }];"
+      },
+      "id": "build-exception",
+      "name": "Build Exception",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/review/suspend",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $json.tenant_id, workflow_run_id: $json.payload.workflow, items: [$json] }) }}"
+      },
+      "id": "queue-exception",
+      "name": "Queue Exception",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        20,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build Exception",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Exception": {
+      "main": [
+        [
+          {
+            "node": "Queue Exception",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "drawbridge"
+    }
+  ]
+}
