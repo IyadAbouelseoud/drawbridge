@@ -25,6 +25,8 @@ dependencies = [
     "ortools>=9.11",
     "opentelemetry-sdk>=1.29",
     "opentelemetry-instrumentation-fastapi>=0.50b0",
+    "pgvector>=0.3.6",
+    "psycopg[binary]>=3.2",
 ]
 
 [project.optional-dependencies]

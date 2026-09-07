@@ -43,6 +43,7 @@ from drawbridge_schemas.trade import (
     HTSCode,
     LineMatch,
     Money,
+    ValuationBasis,
 )
 
 __all__ = [
@@ -75,7 +76,8 @@ __all__ = [
     "RecoveryLane",
     "RefundLine",
     "Span",
+    "ValuationBasis",
     "profile_for",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 3 |
+| Current week | 5 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | Core matching engine — CP-SAT (US) and linkage (GCC) |
+| Current milestone | Analyst MCP tools, HTS engine, queue resolution |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -74,20 +74,37 @@ not block the matching engine. The matcher consumes `EntryLine` / `ExportLine`, 
 already typed and already populated by the week 2 native path — nothing in weeks 3-6
 depends on table extraction landing. Revisit once a real scanned *Bayan* corpus exists.
 
-## Week 4 entry checklist
+## Week 4 task breakdown
 
-1. Real OCR execution path — the native path and bilingual normalisation ship; Tesseract
-   `ara+eng` invocation is wired but needs a scanned corpus to tune the confidence floor.
-2. `mcp-hts`: USITC schedule ingest and CROSS corpus into pgvector. The GCC tariff schedule
-   is HS-based and needs its own loader.
-3. Bilingual field alias table populated from real *Bayan* layouts (seeded with common
-   labels only).
-4. Confirm ZATCA Resolution 28624 article numbers against the Arabic Umm Al-Qura text —
-   `COMPLIANCE-GCC.md` §7 open questions.
-5. Manufacturing drawback (§1313(a)/(b)) — week 3 covers unused merchandise only. BOM
-   explosion changes the CP-SAT model shape.
+- [x] ZATCA valuation basis resolved — FX anchors to the duty-payment date
+      (Valuation Art. 1(I)(6)); hardcoded 3.75 peg removed from `gcc_linkage.py`
+- [x] `services/rules/src/fx.py` — dated `RateProvider`, rates held as exact ratios
+- [x] Art. 16 §2 threshold enforced strictly; near misses rejected and flagged
+- [x] Manufacturing drawback §1313(a)/(b): BOM explosion in the CP-SAT model
+- [x] `review_queue` table + `services/rules/src/triage.py` HITL gate
+- [x] Three declarative n8n workflows generated from `n8n/generate_workflows.py`
 
----
+## Week 5 task breakdown
+
+- [x] GCC open questions closed against primary source (`COMPLIANCE-GCC.md` §8)
+- [x] `mcp-claims`: analyst tools over the review queue and claim state machine
+- [x] `mcp-ledger`: append-only audit trail of analyst decisions
+- [x] `mcp-hts`: pgvector classification search over USITC/CROSS and ZATCA tariff
+- [x] Queue resolution notifies n8n to resume the suspended workflow
+- [x] Integration tests: exception -> MCP resolve -> claim reaches `approved`
+
+## Week 6 entry checklist
+
+1. **Live Fasah sandbox test** for partial-consignment linkage — `COMPLIANCE-GCC.md`
+   §8.2. Permitted in law (Art. 16 §4, Art. 44(b)); platform behaviour undocumented.
+2. Obtain the Arabic text of ZATCA Resolution 28624 and map its article numbers into
+   `services/packager/` citations — §8.4. Every public route 404s or 500s; needs a direct
+   request to ZATCA or the Umm Al-Qura print archive.
+3. Real tariff corpora: USITC schedule + CROSS rulings, ZATCA Integrated Customs Tariff.
+   Week 5 ships the ingest and search path against a seeded corpus.
+4. Real OCR execution path against a scanned *Bayan* corpus, to tune the confidence floor.
+5. Multi-level BOM nesting (currently flattened at ingest), pending ERP integration.
+6. `services/packager`: CBP 7551/7552 and the ZATCA refund-request payload.
 
 ## Sequencing rationale
 

@@ -258,16 +258,128 @@ that would surface as a ZATCA rejection months later.
 
 ---
 
-## 8. Remaining open questions
+## 8. Open questions — week 5 resolution
 
-1. Exact article numbers in ZATCA Resolution 28624 (needs Arabic Umm Al-Qura text).
-2. Whether ZATCA screens the threshold against the **customs value** of the re-exported
-   goods or the original import customs value where they differ. Art. 16 §2 says "the
-   value of the re-exported foreign goods", which reads as the former. **The engine uses
-   the re-export declared value** and records which basis was used on the claim.
-3. Whether partial-consignment re-exports are accepted through Fasah without a prior ruling.
-4. Whether the six-month claim clock runs from the re-export declaration date or from
-   physical departure. **The engine uses the earlier of the two.**
+Three of the four were closed against primary source. The fourth could not be, and the
+reason is recorded rather than papered over.
 
-Each is a claim-voiding risk if guessed wrong, so each routes to `ANALYST_REVIEW` rather
-than being resolved by the model.
+### 8.1 Threshold basis — RESOLVED
+
+**Question:** does the USD 5,000 minimum apply to the CIF import value or the re-export
+value?
+
+**Answer: the re-export value, computed on the Article 28 basis.** Two provisions settle
+it together.
+
+> **Rules of Implementation Art. 16 §2** — *"The value of the **re-exported foreign
+> goods** for which the customs taxes 'duties' are to be refunded shall not be less than
+> five thousand US dollars (or its equivalent in the local currency)."*
+
+> **GCC Common Customs Law Art. 28** — *"The value of the exported goods is that
+> indicated in the customs declaration **plus all the costs until arrival of the goods at
+> the customs office**."*
+
+So the threshold is screened against the re-export declaration value, and that value is
+declared value plus costs to the customs office.
+
+**This is not CIF, and it is not bare FOB.** The two valuation bases in the law point in
+different directions and must not be confused:
+
+| | Provision | Basis | Includes |
+|---|---|---|---|
+| **Import** valuation | Valuation Art. 1(I)(5) | CIF | freight, insurance and charges **to the port of destination in the GCC** |
+| **Export** valuation | Common Customs Law Art. 28 | FOB **plus inland costs** | costs only **as far as the customs office** — not onward international freight or insurance |
+
+Using the import CIF figure would overstate the re-export value by the inbound freight
+and insurance, passing claims that should fail. Using bare FOB would understate it by the
+inland leg, failing claims that should pass. Both errors are silent.
+
+**Implementation.** `ExportLine.declared_value` carries the Art. 28 figure and is
+documented as such. `valuation_basis` records which basis the figure was captured on, so
+a claim assembled from a source that only supplied an FOB or CIF number is visible rather
+than being screened on the wrong footing.
+
+Conversion to USD runs at the duty-payment date per Valuation Art. 1(I)(6) — §7 above.
+
+### 8.2 Partial consignments — RESOLVED IN LAW, OPEN ON THE PLATFORM
+
+**Question:** may a partial re-export be linked to a full-quantity import *Bayan*?
+
+**In law: yes, with proof.** Two provisions govern.
+
+> **Rules of Implementation Art. 16 §4** — *"The foreign goods to be re-exported shall be
+> of a single consignment for ease of identification and matching with the importation
+> documents; **however, a single consignment may be re-exported in part shipments once it
+> is definitely proven for the customs administration that such shipments constitute a
+> part of the same consignment**."*
+
+> **Common Customs Law Art. 44(b)** — *"A single consignment may not be split. However,
+> for acceptable reasons, **the director general may allow such splitting**, provided
+> that such splitting shall not result in a loss to the treasury."*
+
+Part shipments are therefore permitted but not automatic: they need evidence tying the
+shipment to the consignment, and Art. 44(b) reserves discretion to the director general.
+The engine's `consignment_id` requirement on partial shipments is the Art. 16 §4 proof
+obligation, and the same-consignment check across re-exports against one declaration is
+the Art. 44(b) no-loss-to-treasury guard.
+
+**On the platform: undetermined, and it will stay that way until tested.** Whether Fasah
+*technically* accepts a re-export declaration whose quantity is less than the linked
+import *Bayan* line is a platform behaviour, not a legal question. It is not documented
+in any public ZATCA or Tabadul material, and guessing at it from the statute would be
+inferring an implementation from a permission.
+
+> **Phase 6 action — live Fasah sandbox test.** Submit a re-export declaration for a
+> partial quantity against a full-quantity import *Bayan* and record: whether the link is
+> accepted at all; whether the residual quantity remains available for a second
+> re-export; whether ZATCA requires a prior ruling under Art. 44(b); and what the
+> platform returns when the cumulative re-exported quantity would exceed the import line.
+> Until that test runs, partial-shipment claims route to `ANALYST_REVIEW` rather than
+> being filed on an assumption.
+
+### 8.3 Six-month clock start — UNCHANGED
+
+Whether the Art. 16 §3(b) clock runs from the re-export declaration date or from physical
+departure is still unstated in the law. **The engine uses the earlier of the two**, which
+can only shorten the window and therefore cannot cause a late filing.
+
+### 8.4 ZATCA Resolution 28624 article numbers — NOT OBTAINABLE
+
+**Status: unresolved. Every published route to the text failed.**
+
+| Source | Result |
+|---|---|
+| `zatca.gov.sa/.../Rules_of_Customs_Procedures.pdf` | HTTP 404 |
+| Umm Al-Qura issue page (`uqn.gov.sa/details?p=24297`) | HTTP 500 |
+| Umm Al-Qura decisions page (`uqn.gov.sa/decisions-and-regulations/4001240`) | Announcement only; the operative text is an unlinked attachment |
+| `istitlaa.ncc.gov.sa` consultation copy | Connection reset |
+| Two Saudi legal aggregators | HTTP 503 / navigation shell only |
+
+What **is** established from ZATCA's own announcement and Big-4 advisories, without
+article numbers attached:
+
+- Administrative Decision **28624** dated **23/05/1445 AH**, published in Umm Al-Qura,
+  effective 30 days after publication (**29 December 2023**).
+- Amended by Administrative Decision **1446-99-485** dated **05/04/1446 AH**, and a
+  further decision **28918** appears in the same amendment series.
+- A re-export *Bayan* is created and **linked to the import *Bayan*** in order to move
+  goods to a free or duty-free zone, and the owner then submits a refund request for the
+  customs duties.
+- ZATCA may photograph incoming goods or require descriptive literature so they can be
+  **matched on re-export** — the practical counterpart of the Art. 16 §4 identification
+  requirement.
+
+**Why this does not block week 5.** The operative constants all come from the GCC Common
+Customs Law and its Rules of Implementation, which are transcribed from the GCC
+Secretariat's own publication and are authoritative (§§1–2). Resolution 28624 is the
+Saudi *procedural* implementation: it governs how a filing is made, not what makes a
+claim eligible. Nothing in `services/rules/` or `services/matcher/` depends on an article
+number from it.
+
+**What it does block.** The citation strings on the KSA filing packet, which currently
+name the GCC provisions rather than their Saudi procedural counterparts. Before the first
+live KSA filing, obtain the Arabic text — by request to ZATCA directly, or from the Umm
+Al-Qura print archive — and map the article numbers into `services/packager/`.
+
+Until then, §4 of this document remains marked as needing confirmation, and no claim
+citation asserts a Resolution 28624 article number it cannot support.

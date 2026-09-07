@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from enum import StrEnum
 from typing import Annotated, Self
 from uuid import UUID
 
@@ -165,6 +166,34 @@ class EntryLine(BaseModel):
         return self
 
 
+class ValuationBasis(StrEnum):
+    """Which valuation the declared figure was captured on.
+
+    The GCC law carries two bases pointing in different directions, and confusing them
+    is silent in both directions (docs/COMPLIANCE-GCC.md §8.1):
+
+    - imports are valued CIF, to the port of destination (Valuation Art. 1(I)(5));
+    - exports are valued per Art. 28 — declared value plus costs **to the customs
+      office**, which is FOB plus the inland leg and excludes onward freight.
+
+    The Art. 16 §2 threshold screens the *re-export* value, so it needs the Art. 28
+    figure. A CIF number overstates it and passes claims that should fail; a bare FOB
+    number understates it and fails claims that should pass.
+    """
+
+    ART_28_EXPORT = "art_28_export"
+    """Declared value plus costs to the customs office. The basis the threshold wants."""
+
+    FOB = "fob"
+    """Free on board, excluding the inland leg. Understates the Art. 28 figure."""
+
+    CIF = "cif"
+    """Cost, insurance and freight. The import basis; overstates a re-export value."""
+
+    UNKNOWN = "unknown"
+    """Source did not say. Routes to review rather than being screened on a guess."""
+
+
 class ExportLine(BaseModel):
     """One line of an export, re-export, or destruction event.
 
@@ -193,8 +222,15 @@ class ExportLine(BaseModel):
     unit_of_measure: str
     declared_value: Money | None = Field(
         default=None,
-        description="Value of the re-exported goods. Screened against the GCC USD 5,000 "
+        description="Value of the re-exported goods, on the Art. 28 basis: declared "
+        "value plus costs to the customs office. Screened against the GCC USD 5,000 "
         "minimum (Rules of Impl. Art. 16 §2) before any extraction spend.",
+    )
+    valuation_basis: ValuationBasis = Field(
+        default=ValuationBasis.ART_28_EXPORT,
+        description="Which basis declared_value was captured on. Anything other than "
+        "ART_28_EXPORT means the threshold would be screened on the wrong footing — see "
+        "docs/COMPLIANCE-GCC.md §8.1.",
     )
 
     quantity_claimed: Decimal = Field(

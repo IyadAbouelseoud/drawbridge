@@ -14,6 +14,7 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+from services.api.src import hts_models  # noqa: F401 - registers tariff tables
 from services.api.src.config import get_settings
 from services.api.src.models import Base
 
