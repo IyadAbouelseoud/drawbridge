@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from services.api.src.models import ReviewQueue
 from services.rules.src.triage import ReviewReason, Severity
@@ -64,7 +64,12 @@ class ResolveRequest(BaseModel):
 
 
 def _session(request: Request) -> AsyncSession:
-    maker = request.app.state.sessionmaker
+    """A session from the app-scoped maker.
+
+    `app.state` is untyped by construction, so the maker comes back as `Any` and the
+    annotation here is what re-establishes the type for every caller.
+    """
+    maker: async_sessionmaker[AsyncSession] = request.app.state.sessionmaker
     return maker()
 
 

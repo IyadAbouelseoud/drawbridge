@@ -8,7 +8,9 @@
 Common Customs Law PDF and are authoritative. Sections 3–5 are drawn from ZATCA's own
 pages plus Big-4 and law-firm advisories; they are directionally reliable but the article
 numbers of ZATCA Resolution 28624 were not obtainable in English. Treat section 4 numbers
-as needing confirmation against the Arabic Umm Al-Qura text before a live filing.
+as needing confirmation against the Arabic Umm Al-Qura text before a live filing; the
+packager enforces this automatically by emitting every 28624 citation as an
+`ANALYST_REVIEW` placeholder (§8.4.1).
 
 ---
 
@@ -383,3 +385,56 @@ Al-Qura print archive — and map the article numbers into `services/packager/`.
 
 Until then, §4 of this document remains marked as needing confirmation, and no claim
 citation asserts a Resolution 28624 article number it cannot support.
+
+### 8.4.1 Mitigation — the `ANALYST_REVIEW` citation default (week 6)
+
+The packager does not guess. Every ZATCA **procedural** citation in a generated output
+packet defaults to an `ANALYST_REVIEW` placeholder rather than an article number, and the
+placeholder is a first-class value in the payload, not an empty string.
+
+| Rule | Behaviour |
+|---|---|
+| A citation whose authority is the GCC Common Customs Law or its Rules of Implementation | Emitted verbatim. These are transcribed from the GCC Secretariat's own publication (§§1–2) and are authoritative. |
+| A citation whose authority is **ZATCA Resolution 28624** | Emitted as `CitationStatus.ANALYST_REVIEW` with `authority = "ZATCA Administrative Decision 28624 (23/05/1445 AH)"`, `article = null`, and the reason recorded. |
+| Any packet containing one or more `ANALYST_REVIEW` citations | Carries `requires_analyst_review = true` at the top level and **must not** be transmitted to ZATCA e-Services until an analyst supplies the article number. |
+
+The placeholder carries the reason string verbatim, so the person clearing it sees why it
+is open rather than an unexplained blank:
+
+> `28624 article number not obtainable from any published source; see COMPLIANCE-GCC.md §8.4`
+
+**Why a placeholder and not an inferred number.** A wrong article number on a refund
+request is worse than a missing one. A missing number invites a request for information; a
+confidently wrong number is a misstatement to the authority, and the whole design
+principle of this system is that the LLM never originates a figure or a citation. The same
+rule now applies to the packager: it never originates an article number either.
+
+**Closing it.** When the Arabic text is obtained, the article numbers are entered once in
+`services/packager/src/citations.py` and every placeholder resolves. No claim logic
+changes, because no claim logic ever depended on them.
+
+---
+
+## 9. Fasah partial-consignment probe — payload specification (week 6)
+
+`scripts/fasah_sandbox_probe.py` constructs, and prints for manual execution, the exact
+payloads that answer §8.2. It does **not** transmit: the Fasah sandbox requires credentials
+issued to a registered broker, which are not available from this environment, and firing a
+speculative declaration at a customs platform is not something to do on an assumption.
+
+The probe emits four requests in sequence, each isolating one unknown:
+
+| # | Probe | Answers |
+|---|---|---|
+| A | Re-export declaration for the **full** quantity of the linked import line | Baseline — establishes that the link mechanism works at all for this Bayan |
+| B | Re-export declaration for a **partial** quantity (40% of the import line) | Whether a below-quantity link is accepted |
+| C | Second re-export declaration for the **residual** 60% against the same Bayan | Whether residual quantity remains available after a partial draw |
+| D | Third re-export declaration **exceeding** the residual | What the platform returns on over-draw — the error code is the answer |
+
+Probe A is submitted against a distinct Bayan from B/C/D so the baseline is not consumed
+by the partial series.
+
+**Recording the result.** Each response is written to `scripts/fasah_probe_results.json`
+in a fixed shape, and §8.2 is updated from that file rather than from recollection. Until
+it exists, `PartialConsignmentBehaviour.UNDETERMINED` is what the engine assumes, and
+partial-shipment claims continue to route to `ANALYST_REVIEW`.

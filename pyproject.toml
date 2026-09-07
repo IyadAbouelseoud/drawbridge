@@ -22,6 +22,7 @@ dependencies = [
     "mcp>=1.2",
     "pdfplumber>=0.11",
     "pymupdf>=1.25",
+    "pypdf>=5.1",
     "ortools>=9.11",
     "opentelemetry-sdk>=1.29",
     "opentelemetry-instrumentation-fastapi>=0.50b0",

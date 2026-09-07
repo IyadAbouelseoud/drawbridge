@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 5 |
+| Current week | 6 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | Analyst MCP tools, HTS engine, queue resolution |
+| Current milestone | Packager, nested BOM explosion, tariff corpora, Fasah probe |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -93,18 +93,49 @@ depends on table extraction landing. Revisit once a real scanned *Bayan* corpus 
 - [x] Queue resolution notifies n8n to resume the suspended workflow
 - [x] Integration tests: exception -> MCP resolve -> claim reaches `approved`
 
-## Week 6 entry checklist
+## Week 6 task breakdown
 
-1. **Live Fasah sandbox test** for partial-consignment linkage — `COMPLIANCE-GCC.md`
-   §8.2. Permitted in law (Art. 16 §4, Art. 44(b)); platform behaviour undocumented.
-2. Obtain the Arabic text of ZATCA Resolution 28624 and map its article numbers into
-   `services/packager/` citations — §8.4. Every public route 404s or 500s; needs a direct
-   request to ZATCA or the Umm Al-Qura print archive.
-3. Real tariff corpora: USITC schedule + CROSS rulings, ZATCA Integrated Customs Tariff.
-   Week 5 ships the ingest and search path against a seeded corpus.
-4. Real OCR execution path against a scanned *Bayan* corpus, to tune the confidence floor.
-5. Multi-level BOM nesting (currently flattened at ingest), pending ERP integration.
-6. `services/packager`: CBP 7551/7552 and the ZATCA refund-request payload.
+- [x] Multi-level BOM nesting: `BomComponent.sub_components`, route-keyed designation
+      ceilings in CP-SAT, yield compounding down the tree
+- [x] Tariff corpus ingestion: USITC HTS (indent hierarchy resolved), ZATCA Integrated
+      Customs Tariff (bilingual), CBP CROSS rulings (revocation detected)
+- [x] `services/packager`: CBP 7551/7552 as AcroForm PDFs, ZATCA refund-request JSON
+- [x] Resolution 28624 mitigation: every ZATCA procedural citation is an
+      `ANALYST_REVIEW` placeholder that blocks transmission (`COMPLIANCE-GCC.md` §8.4.1)
+- [x] `scripts/fasah_sandbox_probe.py`: four payloads isolating the §8.2 unknown
+- [x] Golden fixtures for the recursive multiplier and both packager lanes
+
+### What week 6 deliberately did not do
+
+**Transmit the Fasah probe.** The sandbox needs credentials issued to a registered
+customs broker, and firing a speculative declaration at a customs platform on an
+assumption is not a thing to do quietly. The script constructs and prints; a human runs it
+and records the result in `scripts/fasah_probe_results.json`.
+
+**Guess a Resolution 28624 article number.** A missing number invites a request for
+information; a confidently wrong one is a misstatement to the authority. The placeholder
+carries the reason and blocks the packet.
+
+**Bundle the official CBP form templates.** They are CBP-published artefacts. The packager
+fills a real template through `pdf.fill_template` where a tenant has one on file, and
+otherwise renders a transcription that says on its face that it is not a CBP-issued form.
+
+## Week 7 entry checklist
+
+1. **Live Fasah sandbox test** — `COMPLIANCE-GCC.md` §8.2 and §9. The payloads are built
+   and the four questions are written down; what is missing is broker credentials.
+2. **Arabic text of ZATCA Resolution 28624** — §8.4. Every public route 404s or 500s;
+   needs a direct request to ZATCA or the Umm Al-Qura print archive. When it arrives, the
+   article numbers go into `services/packager/src/citations.py` and nothing else changes.
+3. **Real corpus volume.** The ingest path is proven end-to-end against real-shaped
+   exports; what has not been loaded is the full USITC schedule (~19,000 lines) and the
+   CROSS body. Also unwritten: the embedding pass, so vector search stays dark until the
+   `embedding` column is populated.
+4. **Real OCR execution path** against a scanned *Bayan* corpus, to tune the confidence
+   floor.
+5. **ERP integration** to source nested BOMs. The model and the solver handle depth now;
+   nothing yet reads a real multi-level bill of materials out of a customer system.
+6. **PSC and §1520(d)** renderers — the two US lanes the packager does not yet cover.
 
 ## Sequencing rationale
 

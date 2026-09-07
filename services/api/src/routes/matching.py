@@ -110,11 +110,12 @@ async def run_matching(body: MatchRequestBody) -> MatchResponse:
     coerced: a US line silently matched under GCC rules would produce a plausible
     allocation with no statutory basis.
     """
+    # Iterated as two homogeneous passes rather than one merged tuple: EntryLine and
+    # ExportLine share no base beyond BaseModel, so a single loop over both would be
+    # typed at BaseModel and lose the very fields being checked.
     mismatched = [
-        str(line.line_id)
-        for line in (*body.imports, *body.exports)
-        if line.jurisdiction is not body.jurisdiction
-    ]
+        str(line.line_id) for line in body.imports if line.jurisdiction is not body.jurisdiction
+    ] + [str(line.line_id) for line in body.exports if line.jurisdiction is not body.jurisdiction]
     if mismatched:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

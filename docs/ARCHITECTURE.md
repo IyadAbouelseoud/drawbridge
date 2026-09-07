@@ -221,6 +221,15 @@ would look plausible all the way to a filing.
 
 ### 3.6b Manufacturing drawback — BOM explosion (19 U.S.C. §1313(a)/(b))
 
+> **Week 6: the bill of materials is a tree, not a list.** A component may itself be a
+> subassembly manufactured from imported parts. Yield compounds down the route — a finished
+> good needing one subassembly at 90% yield, itself needing two castings at 80%, consumes
+> 2 / 0.8 / 0.9 = 2.7778 castings per unit. Only **leaves** are designatable: an
+> intermediate node was manufactured, not imported, so there is no entry line to designate
+> against it. The CP-SAT designation ceiling is keyed on the **route** rather than the leaf,
+> because the same casting reached through two subassemblies is consumed at two different
+> rates and one route's allocation must not eat the other's headroom.
+
 Week 3 covered **unused merchandise** (§1313(j)): the article exported is the article
 imported. Manufacturing drawback is the case where it is not — imported raw material is
 consumed to produce a different finished good, and the refund follows the material
@@ -419,9 +428,13 @@ drawbridge/
 │   └── mcp_ace/ mcp_hts/ mcp_docs/ mcp_claims/ mcp_ledger/
 ├── n8n/workflows/                # exported JSON, version-controlled
 ├── packages/schemas/             # shared contracts incl. jurisdiction.py profiles
+├── scripts/                      # ingest_tariff.py · fasah_sandbox_probe.py
 ├── tests/                        # unit · golden-claim fixtures · property-based rules
 └── infra/
 ```
+
+`scripts/` is type-checked under `mypy --strict` alongside the services. It builds customs
+payloads, which is not a lower standard of correctness than the code that consumes them.
 
 ## 8. Claim state machine (Postgres-owned)
 
@@ -487,3 +500,53 @@ Any figure whose only provenance is OCR below the confidence floor sets
 ZATCA publishes no field-level machine schema for the refund request, so the GCC payload is
 modelled as a typed Pydantic object rendered to both a human-completable form and JSON.
 When ZATCA publishes an API, only the renderer changes — the claim data core does not.
+
+### 11.1 The packager (week 6)
+
+`services/packager` is a renderer and nothing else. Every figure it prints arrives already
+quantified by the matcher and already checked by the rules engine — the same constraint the
+LLM operates under, applied one layer further out. That is what lets a packet be regenerated
+years later and reproduce byte-for-byte from stored input.
+
+| | US lane | KSA lane |
+|---|---|---|
+| Output | CBP 7551, plus 7552 where a transferor or manufacturing theory is involved | ZATCA refund-request JSON |
+| Format | AcroForm PDF — real fields, generated appearance streams | UTF-8 JSON, money as strings |
+| Why | A filer must be able to correct a figure in place, and a downstream reader must be able to pull values back out without parsing a layout | Arabic survives JSON intact; the PDF base-14 fonts cannot encode it |
+| Citations | All verified — the statute and the CFR are published | GCC law verified; **ZATCA 28624 procedural citations are `ANALYST_REVIEW` placeholders** |
+
+**The one thing the packager decides.** Whether the packet may be transmitted. A packet
+carrying an open citation sets `requires_analyst_review` and is blocked. That check lives in
+`FilingPacket` rather than in the caller, because a caller that forgets it produces a packet
+that looks finished.
+
+**Two rendering modes.** `pdf.fill_template` writes into an official CBP AcroForm template
+where a tenant has one on file — that output is literally CBP's form. Without one, the same
+field set renders as a paginated transcription that says on its face it is not a CBP-issued
+document. A packet that quietly *looked* like the official form while not being it would be
+worse than one that does not pretend.
+
+### 11.2 Tariff corpus ingestion (week 6)
+
+Three sources, three parsers, one table. Two decisions are the opposite of the obvious one:
+
+**Revisions are inserted, not replaced.** A claim is classified against the schedule in
+force on its entry date, and a five-year lookback spans several revisions. The unique key
+includes `revision`; reloading the same revision updates descriptive fields only, and the
+loader reports inserts against updates so a duplicated revision is visible rather than
+silently searched twice under two names.
+
+**Duty rates stay as published text.** "Free", "2.5%", "6.5c/kg", "4.4c/kg + 2.8%". A float
+column loses the specific and compound forms silently, and silently is how a compound rate
+becomes an understated claim. `ad_valorem_rate` is populated only where the rate is purely
+ad valorem.
+
+The USITC export is a tree flattened into rows, so a line reads "Other" and means four
+ancestors concatenated. Rows with no code are skipped but still walked, because those are
+exactly the rows holding the description their children inherit. The ZATCA export is
+bilingual and its Arabic is **cleaned but not folded** — NFKC and bidi-control stripping are
+encoding fixes, while the orthographic folding used for field matching would misspell a
+legal description of goods on every packet quoting the line.
+
+Ingest reads a downloaded file, never a live endpoint. A corpus assembled by a network call
+is reproducible only for as long as the publisher keeps the URL alive.

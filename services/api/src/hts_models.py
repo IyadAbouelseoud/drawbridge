@@ -21,6 +21,7 @@ would make the first load an all-or-nothing operation.
 from __future__ import annotations
 
 from datetime import date, datetime
+from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
@@ -178,7 +179,7 @@ class ClassificationQuery(Base):
     jurisdiction: Mapped[str] = mapped_column(String(8))
     query_text: Mapped[str] = mapped_column(Text)
     revision: Mapped[str | None] = mapped_column(String(32))
-    results: Mapped[dict] = mapped_column(JSONB, default=dict)
+    results: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     method: Mapped[str] = mapped_column(String(24))
     """vector | lexical | hybrid. Which path answered, so a weak lexical-only answer is
     distinguishable from a confident vector one after the fact."""

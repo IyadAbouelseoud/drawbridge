@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -126,7 +127,7 @@ class EntryLine(Base):
 
     quantity_designated: Mapped[Decimal] = mapped_column(Quantity, default=Decimal("0"))
 
-    provenance: Mapped[dict] = mapped_column(JSONB)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSONB)
 
     __table_args__ = (
         UniqueConstraint(
@@ -180,7 +181,7 @@ class ExportLine(Base):
     is_partial_shipment: Mapped[bool] = mapped_column(default=False)
     unused_and_unaltered: Mapped[bool] = mapped_column(default=True)
 
-    provenance: Mapped[dict] = mapped_column(JSONB)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSONB)
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "reference", "line_number", name="uq_export_line_ref"),
@@ -382,7 +383,7 @@ class ReviewQueue(Base):
     severity: Mapped[str] = mapped_column(String(16), default="normal")
     summary: Mapped[str] = mapped_column(Text)
     citation: Mapped[str | None] = mapped_column(Text)
-    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
 
     # n8n suspends on this row and resumes when it clears. The token is what the
     # workflow waits on, so it is unique and never reused.

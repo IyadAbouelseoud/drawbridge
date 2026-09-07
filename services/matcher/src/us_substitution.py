@@ -21,7 +21,13 @@ from typing import TYPE_CHECKING
 
 from ortools.sat.python import cp_model
 
-from drawbridge_schemas.bom import BillOfMaterials, BomComponent, ManufacturingBasis
+from drawbridge_schemas.bom import (
+    BillOfMaterials,
+    BomComponent,
+    ManufacturingBasis,
+    path_key,
+    required_for_path,
+)
 from drawbridge_schemas.jurisdiction import Jurisdiction, MatchTheory
 from drawbridge_schemas.trade import EntryLine, ExportLine, LineMatch
 from services.matcher.src.base import (
@@ -67,11 +73,22 @@ class _Candidate:
     days_clock_start_to_export: int
 
     component_key: str | None = None
-    """8-digit component subheading for manufacturing pairings; None for §1313(j)."""
+    """Route through the bill of materials for manufacturing pairings; None for §1313(j).
+
+    The *route*, not the leaf. A casting reached through a gearbox and the same casting
+    reached through a housing are consumed at different rates and hold separate
+    designation ceilings, so keying the ceiling on the leaf alone would let one route's
+    allocation eat the other's headroom."""
 
     component_required_scaled: int = 0
-    """Component quantity actually used to produce the exported finished goods —
-    the TFTEA ceiling on what may be designated. Zero for §1313(j)."""
+    """Leaf quantity actually used to produce the exported finished goods, compounded
+    down the whole route — the TFTEA ceiling on what may be designated. Zero for
+    §1313(j)."""
+
+    component_depth: int = 0
+    """How many manufacturing stages the route passes through. 1 for a flat bill of
+    materials, 0 for §1313(j). Carried so a nested designation is visible on the match
+    rather than being inferable only from the key."""
 
     @property
     def is_manufacturing(self) -> bool:
@@ -168,7 +185,7 @@ class UsSubstitutionMatcher(MatchStrategy):
                 if entry.quantity_available <= 0:
                     continue
 
-                theory, component = _theory_for(entry, export, bom)
+                theory, component_path = _theory_for(entry, export, bom)
                 if theory is None:
                     key_failures += 1
                     continue
@@ -211,18 +228,22 @@ class UsSubstitutionMatcher(MatchStrategy):
                     # and could displace a paying allocation.
                     continue
 
-                if component is not None:
+                if component_path is not None:
                     # Manufacturing: the import satisfies a component slot, and the
                     # ceiling is the quantity actually used to produce the exported
-                    # finished goods rather than the exported quantity itself.
-                    required = component.required_for(export.quantity_available)
+                    # finished goods rather than the exported quantity itself. In a
+                    # nested BOM that quantity compounds every yield down the route —
+                    # a 90% stage above an 80% stage loses material twice.
+                    required = required_for_path(component_path, export.quantity_available)
                     max_quantity = min(entry.quantity_available, required)
-                    component_key = component.component_hts.substitution_key
+                    component_key = path_key(component_path)
                     required_scaled = _scale_quantity(required)
+                    depth = len(component_path)
                 else:
                     max_quantity = min(entry.quantity_available, export.quantity_available)
                     component_key = None
                     required_scaled = 0
+                    depth = 0
 
                 if max_quantity <= 0:
                     continue
@@ -246,6 +267,7 @@ class UsSubstitutionMatcher(MatchStrategy):
                         days_clock_start_to_export=(export.export_date - clock_start).days,
                         component_key=component_key,
                         component_required_scaled=required_scaled,
+                        component_depth=depth,
                     )
                 )
                 eligible_for_export += 1
@@ -315,15 +337,19 @@ class UsSubstitutionMatcher(MatchStrategy):
                 capacity = _scale_quantity(request.exports[export_index].quantity_available)
                 model.add(sum(allocations[i] for i in unused) <= capacity)
 
-            by_component: dict[str, list[int]] = {}
+            # One ceiling per *route*, not per leaf. Two routes reaching the same leaf
+            # each consumed their own quantity to produce the finished good, and merging
+            # their ceilings would let the cheaper route absorb the dearer one's
+            # headroom and overstate the designation against neither.
+            by_route: dict[str, list[int]] = {}
             for index in manufacturing:
                 key = candidates[index].component_key
                 assert key is not None
-                by_component.setdefault(key, []).append(index)
+                by_route.setdefault(key, []).append(index)
 
-            for component_indices in by_component.values():
-                required = candidates[component_indices[0]].component_required_scaled
-                model.add(sum(allocations[i] for i in component_indices) <= required)
+            for route_indices in by_route.values():
+                required = candidates[route_indices[0]].component_required_scaled
+                model.add(sum(allocations[i] for i in route_indices) <= required)
 
         # Maximise refundable duty, not matched quantity. Matching units maximises
         # paperwork; matching duty maximises the refund.
@@ -381,17 +407,22 @@ class UsSubstitutionMatcher(MatchStrategy):
 
 def _theory_for(
     entry: EntryLine, export: ExportLine, bom: BillOfMaterials | None
-) -> tuple[MatchTheory | None, BomComponent | None]:
-    """Which §1313 theory, if any, could pair these two lines, and under which component.
+) -> tuple[MatchTheory | None, tuple[BomComponent, ...] | None]:
+    """Which §1313 theory could pair these two lines, and by which route through the BOM.
 
     Unused merchandise is tried first: where the imported article *is* the exported
     article, §1313(j) applies and no bill of materials is needed. Only when the codes do
     not line up does a BOM make the pairing possible, and then the claim is a
     manufacturing one under §1313(a)/(b).
 
-    Direct identity is preferred over substitution in both families: the full tariff code
-    matching needs no commercial-interchangeability narrative and survives a desk audit
+    Direct identity is preferred over substitution in both families: matching the full
+    tariff code needs no commercial-interchangeability narrative and survives a desk audit
     more easily.
+
+    The manufacturing arm returns a **path** — the whole root-to-leaf route — because in a
+    nested bill of materials the consumption multiplier is a property of the route and not
+    of the leaf. Only leaves are reachable: an intermediate subassembly was manufactured
+    rather than imported, so nothing can be designated against it.
     """
     if entry.hts.code == export.hts.code:
         return MatchTheory.DIRECT_IDENTITY, None
@@ -399,14 +430,14 @@ def _theory_for(
         return MatchTheory.HTS_SUBSTITUTION, None
 
     if bom is not None:
-        component = bom.component_for(entry.hts)
-        if component is not None:
+        path = bom.path_for(entry.hts)
+        if path is not None:
             theory = (
                 MatchTheory.MANUFACTURING_DIRECT_IDENTITY
-                if component.basis is ManufacturingBasis.DIRECT_IDENTITY
+                if path[-1].basis is ManufacturingBasis.DIRECT_IDENTITY
                 else MatchTheory.MANUFACTURING_SUBSTITUTION
             )
-            return theory, component
+            return theory, path
 
     return None, None
 

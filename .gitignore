@@ -29,3 +29,8 @@ node_modules/
 
 # Claude Code local overrides
 .claude/settings.local.json
+
+# Fasah probe results are recorded by a human running the probe against the live
+# sandbox; the committed repo carries the script, not an empty template that would
+# make `--record` refuse to write.
+scripts/fasah_probe_results.json

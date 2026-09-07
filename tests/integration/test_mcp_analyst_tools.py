@@ -286,28 +286,54 @@ class TestLedgerTools:
 
 
 class TestHtsTools:
-    """The corpus is empty in CI; these pin the contract, not the data."""
+    """These pin the contract, not the data.
 
-    def test_corpus_status_reports_empty_rather_than_failing(self) -> None:
+    Week 5 wrote them against an empty corpus and asserted zero results, which quietly
+    made "the ingest works" indistinguishable from "the ingest never ran". Week 6 loads
+    real corpora, so the assertions moved to what must hold at any corpus size.
+    """
+
+    def test_corpus_status_reports_what_is_loaded(self) -> None:
         from mcp_servers.mcp_hts import server as hts
 
         result = hts.corpus_status()
         assert result["ok"] is True
         assert isinstance(result["tariff_lines"], list)
+        for row in result["tariff_lines"]:
+            # Embedding coverage must be reported, because vector search silently skips
+            # unembedded rows and a partly-embedded corpus answers badly without saying so.
+            assert row["embedded"] <= row["lines"]
+            assert 0.0 <= row["embedded_pct"] <= 100.0
 
-    def test_classify_on_an_empty_corpus_returns_no_candidates(self) -> None:
+    def test_classify_returns_a_well_formed_result_at_any_corpus_size(self) -> None:
         from mcp_servers.mcp_hts import server as hts
 
         result = hts.classify(description="portable data processing machines")
         assert result["ok"] is True
-        assert result["count"] == 0
+        assert result["method"] in {"lexical", "vector", "hybrid"}
+        assert result["count"] == len(result["candidates"])
+        for candidate in result["candidates"]:
+            assert candidate["code"].isdigit()
+            assert candidate["matched_by"] in {"lexical", "vector", "both"}
 
-    def test_lookup_missing_code_reports_not_found(self) -> None:
+    def test_a_lexical_only_hit_does_not_demand_analyst_confirmation(self) -> None:
+        """A vector-only hit is a suggestion; a trigram match on published text is not."""
         from mcp_servers.mcp_hts import server as hts
 
-        result = hts.lookup_code(code="8471300100")
+        result = hts.classify(description="portable data processing machines")
+        for candidate in result["candidates"]:
+            if candidate["matched_by"] == "lexical":
+                assert candidate["needs_analyst_confirmation"] is False
+
+    def test_lookup_of_an_absent_code_reports_not_found(self) -> None:
+        from mcp_servers.mcp_hts import server as hts
+
+        # Chapter 99 is reserved for temporary US provisions; this suffix is not a line
+        # any published schedule carries, so it stays absent whatever has been ingested.
+        result = hts.lookup_code(code="9999999999")
         assert result["ok"] is True
         assert result["found"] is False
+        assert "no us tariff line" in result["detail"]
 
 
 @pytest.mark.skipif(
