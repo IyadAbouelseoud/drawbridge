@@ -14,7 +14,7 @@ x-python-base: &python-base
     DRAWBRIDGE_S3_ENDPOINT_URL: http://minio:9000
   volumes:
     - ./services:/app/services:ro
-    - ./mcp:/app/mcp:ro
+    - ./mcp_servers:/app/mcp_servers:ro
     - ./packages:/app/packages:ro
   depends_on:
     postgres: { condition: service_healthy }
@@ -22,6 +22,8 @@ x-python-base: &python-base
   restart: unless-stopped
   networks: [drawbridge]
 
+# A bare GET /mcp returns 400 - it is not a valid MCP request. Liveness therefore
+# means the process answered HTTP at all, not that the status was 2xx.
 x-mcp-health: &mcp-health
   interval: 15s
   timeout: 5s
@@ -131,42 +133,42 @@ services:
   # ---------------------------------------------------------------- MCP plane
   mcp-ace:
     <<: *python-base
-    command: ["python", "-m", "mcp.mcp_ace.server"]
+    command: ["python", "-m", "mcp_servers.mcp_ace.server"]
     ports: ["8101:8101"]
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8101/mcp"]
+      test: ["CMD", "curl", "-sS", "-o", "/dev/null", "--fail-early", "--connect-timeout", "3", "http://localhost:8101/mcp"]
       <<: *mcp-health
 
   mcp-hts:
     <<: *python-base
-    command: ["python", "-m", "mcp.mcp_hts.server"]
+    command: ["python", "-m", "mcp_servers.mcp_hts.server"]
     ports: ["8102:8102"]
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8102/mcp"]
+      test: ["CMD", "curl", "-sS", "-o", "/dev/null", "--fail-early", "--connect-timeout", "3", "http://localhost:8102/mcp"]
       <<: *mcp-health
 
   mcp-docs:
     <<: *python-base
-    command: ["python", "-m", "mcp.mcp_docs.server"]
+    command: ["python", "-m", "mcp_servers.mcp_docs.server"]
     ports: ["8103:8103"]
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8103/mcp"]
+      test: ["CMD", "curl", "-sS", "-o", "/dev/null", "--fail-early", "--connect-timeout", "3", "http://localhost:8103/mcp"]
       <<: *mcp-health
 
   mcp-claims:
     <<: *python-base
-    command: ["python", "-m", "mcp.mcp_claims.server"]
+    command: ["python", "-m", "mcp_servers.mcp_claims.server"]
     ports: ["8104:8104"]
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8104/mcp"]
+      test: ["CMD", "curl", "-sS", "-o", "/dev/null", "--fail-early", "--connect-timeout", "3", "http://localhost:8104/mcp"]
       <<: *mcp-health
 
   mcp-ledger:
     <<: *python-base
-    command: ["python", "-m", "mcp.mcp_ledger.server"]
+    command: ["python", "-m", "mcp_servers.mcp_ledger.server"]
     ports: ["8105:8105"]
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8105/mcp"]
+      test: ["CMD", "curl", "-sS", "-o", "/dev/null", "--fail-early", "--connect-timeout", "3", "http://localhost:8105/mcp"]
       <<: *mcp-health
 
 volumes:

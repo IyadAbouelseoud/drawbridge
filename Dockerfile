@@ -16,16 +16,18 @@ COPY --from=ghcr.io/astral-sh/uv:0.9 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-# Dependency layer, cached independently of source.
-COPY pyproject.toml uv.lock* ./
+# Dependency layer, cached independently of source. README.md comes along because the
+# root project declares it as its readme — hatchling reads it during metadata build.
+COPY pyproject.toml uv.lock* README.md ./
 COPY packages/schemas/pyproject.toml packages/schemas/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --no-install-project --extra dev || uv venv && uv pip install -e ".[dev]"
+    uv sync --no-install-project --no-install-workspace --extra dev
 
 COPY . .
 
+# Install the workspace members themselves, now that their sources are present.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install -e . -e ./packages/schemas
+    uv sync --extra dev
 
 RUN useradd --create-home --uid 10001 drawbridge \
  && chown -R drawbridge:drawbridge /app

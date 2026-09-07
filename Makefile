@@ -32,7 +32,7 @@ fmt:
 	uv run ruff format . && uv run ruff check --fix .
 
 type:
-	uv run mypy services mcp packages/schemas/src
+	uv run mypy services mcp_servers packages/schemas/src
 
 test:
 	uv run pytest

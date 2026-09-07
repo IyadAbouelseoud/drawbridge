@@ -193,7 +193,7 @@ drawbridge/
 │   ├── rules/                    # eligibility windows, deadlines, drawback-type routing
 │   ├── packager/                 # 7551/7552, PSC, 1520(d) generation
 │   └── agent/                    # Claude loop: narratives, exceptions, judgment calls
-├── mcp/
+├── mcp_servers/            # named to avoid shadowing the `mcp` SDK package
 │   └── mcp_ace/ mcp_hts/ mcp_docs/ mcp_claims/ mcp_ledger/
 ├── n8n/workflows/                # exported JSON, version-controlled
 ├── packages/schemas/             # shared Pydantic contracts (single source of truth)

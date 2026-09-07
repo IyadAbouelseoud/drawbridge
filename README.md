@@ -40,7 +40,7 @@ make check          # ruff + mypy --strict + pytest
 |---|---|
 | `packages/schemas` | Shared Pydantic contracts. Single source of truth |
 | `services/` | api · ingest · extraction · classifier · matcher · rules · packager · agent |
-| `mcp/` | Five typed MCP servers — the tool boundary |
+| `mcp_servers/` | Five typed MCP servers — the tool boundary |
 | `n8n/workflows` | Orchestration, version-controlled as JSON |
 | `tests/golden` | Known-answer claims that must reproduce to the cent |
 | `docs/` | `ARCHITECTURE.md`, `ROADMAP.md` — persistent project context |

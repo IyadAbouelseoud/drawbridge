@@ -24,4 +24,4 @@ repos:
       - id: mypy
         additional_dependencies: [pydantic>=2.11]
         args: [--strict, --ignore-missing-imports]
-        files: ^(services|mcp|packages)/
+        files: ^(services|mcp_servers|packages)/
