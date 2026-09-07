@@ -6,9 +6,9 @@
 
 | | |
 |---|---|
-| Current week | 1 |
-| Current milestone | Scaffold, compose stack, CI, schemas package |
-| Exit criterion | `docker compose up` brings all services green |
+| Current week | 1 complete → 2 |
+| Current milestone | `mcp-docs` + extraction service |
+| Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
 
@@ -37,11 +37,11 @@
 - [x] Persistent docs: `ARCHITECTURE.md`, `ROADMAP.md`
 - [x] Toolchain: `uv`, `pre-commit`, `make`, `psql`
 - [x] `git init`, GitHub repo created and pushed
-- [x] Repository scaffold: `services/`, `mcp/`, `packages/`, `n8n/`, `tests/`, `infra/`
+- [x] Repository scaffold: `services/`, `mcp_servers/`, `packages/`, `n8n/`, `tests/`, `infra/`
 - [x] `packages/schemas` — shared Pydantic contracts
 - [x] `docker-compose.yml` — Postgres/pgvector, Redis, MinIO, n8n, API, MCP placeholders
 - [x] CI: ruff + mypy + pytest on push
-- [ ] `docker compose up` verified green  <- Week 1 exit gate
+- [x] `docker compose up` verified green — Week 1 exit gate PASSED
 
 ## Week 2 entry checklist
 
