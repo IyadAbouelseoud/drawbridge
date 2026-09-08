@@ -1,7 +1,7 @@
 {
   "name": "drawbridge-review-dispatcher",
   "meta": {
-    "description": "Polls the review queue and escalates. Deadline-driven: an exception whose filing window is closing deserves more attention than an older one whose window is open."
+    "description": "Polls the review queue, drafts pre-analysis for anything still undrafted, and escalates. Deadline-driven: an exception whose filing window is closing deserves more attention than an older one whose window is open. The drafting sweep is a backstop for rows queued outside a pipeline run — the error workflow queues some — and is a no-op for rows the pipeline already drafted."
   },
   "settings": {
     "executionOrder": "v1"
@@ -50,14 +50,35 @@
     },
     {
       "parameters": {
-        "jsCode": "// Blocking first, then by how little time is left on the filing window. Age alone is\n// the wrong sort: a three-week-old item with six months of runway is less urgent than\n// yesterday's item with nine days.\nconst RANK = { blocking: 0, high: 1, normal: 2, low: 3 };\nconst items = $input.all().map(i => i.json);\nitems.sort(function (a, b) {\n  const s = (RANK[a.severity] === undefined ? 9 : RANK[a.severity])\n          - (RANK[b.severity] === undefined ? 9 : RANK[b.severity]);\n  if (s !== 0) return s;\n  const da = (a.payload && a.payload.days !== undefined) ? a.payload.days : 9999;\n  const db = (b.payload && b.payload.days !== undefined) ? b.payload.days : 9999;\n  return da - db;\n});\nreturn items.map(function (json) { return { json: json }; });"
+        "method": "POST",
+        "url": "http://api:8000/review/draft?tenant_id={{ $json.tenant_id }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "draft-missing-memos",
+      "name": "Draft Missing Memos",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Blocking first, then by how little time is left on the filing window. Age alone is\n// the wrong sort: a three-week-old item with six months of runway is less urgent than\n// yesterday's item with nine days.\n//\n// Reads the queue from the fetch node rather than from its own input, because the\n// drafting sweep sits between them and returns a count, not the rows.\nconst items = $('Fetch Open Queue').all().map(i => i.json);\nconst RANK = { blocking: 0, high: 1, normal: 2, low: 3 };\nitems.sort(function (a, b) {\n  const s = (RANK[a.severity] === undefined ? 9 : RANK[a.severity])\n          - (RANK[b.severity] === undefined ? 9 : RANK[b.severity]);\n  if (s !== 0) return s;\n  const da = (a.payload && a.payload.days !== undefined) ? a.payload.days : 9999;\n  const db = (b.payload && b.payload.days !== undefined) ? b.payload.days : 9999;\n  return da - db;\n});\nreturn items.map(function (json) { return { json: json }; });"
       },
       "id": "rank-by-urgency",
       "name": "Rank By Urgency",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        -180,
+        -40,
         300
       ]
     },
@@ -88,7 +109,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        40,
+        160,
         300
       ]
     },
@@ -101,7 +122,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        280,
+        380,
         160
       ]
     },
@@ -114,7 +135,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        280,
+        380,
         440
       ]
     }
@@ -132,6 +153,17 @@
       ]
     },
     "Fetch Open Queue": {
+      "main": [
+        [
+          {
+            "node": "Draft Missing Memos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Missing Memos": {
       "main": [
         [
           {

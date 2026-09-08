@@ -107,7 +107,10 @@ class EntryLine(Base):
     # import_date whenever duty payment is postponed — ZATCA permits up to 30 days.
     duty_payment_date: Mapped[date | None] = mapped_column(Date)
 
-    port_of_entry: Mapped[str] = mapped_column(String(16))
+    # 64, not 16. A US port is a 4-digit CBP code; a GCC one is a name — "Jeddah Islamic
+    # Port" — and the narrow column made every KSA claim unpersistable until week 9,
+    # when something first tried to write one. See migration e5c48b71d90a.
+    port_of_entry: Mapped[str] = mapped_column(String(64))
     country_of_origin: Mapped[str] = mapped_column(String(2))
 
     hts_code: Mapped[str] = mapped_column(String(12))

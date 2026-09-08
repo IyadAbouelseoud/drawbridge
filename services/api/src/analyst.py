@@ -273,9 +273,13 @@ def approve_claim(
 ) -> dict[str, Any]:
     """Move a claim from ANALYST_REVIEW to APPROVED.
 
-    Refuses while any exception on the claim is still open. The state machine already
-    forbids reaching APPROVED without passing through ANALYST_REVIEW; this adds the
-    complementary guard, that review actually happened rather than merely being entered.
+    Refuses while any exception on the claim is still open — the same guard
+    `transition_claim` applies, repeated here because this path also demands a reasoning
+    note and should fail on the cheaper condition first.
+
+    This is the analyst's route specifically: it requires ANALYST_REVIEW as the origin,
+    where `transition_claim` also permits the automated QUANTIFIED -> APPROVED lane. A
+    claim that stopped for a human is approved by a human.
     """
     note = _require_reasoning(reasoning, "approve_claim")
 
@@ -351,6 +355,19 @@ def transition_claim(
     if not current.can_move_to(target):
         msg = f"{current} cannot move to {target}"
         raise AnalystError(msg)
+
+    # The guard that used to be the state machine's. Since week 9 a clean claim may reach
+    # APPROVED straight from QUANTIFIED without a human, so "approval implies review
+    # happened" is no longer structural and has to be checked here — for every caller,
+    # not only for `approve_claim`, because the pipeline is now one of the callers.
+    if target is ClaimState.APPROVED:
+        outstanding = _outstanding_for_claim(session, claim_id)
+        if outstanding:
+            msg = (
+                f"claim {claim_id} still has {outstanding} unresolved exception(s); "
+                "it cannot be approved until they are resolved"
+            )
+            raise AnalystError(msg)
 
     claim.state = target.value
     session.add(

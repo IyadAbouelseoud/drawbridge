@@ -428,8 +428,9 @@ drawbridge/
 │   └── mcp_ace/ mcp_hts/ mcp_docs/ mcp_claims/ mcp_ledger/
 ├── n8n/workflows/                # exported JSON, version-controlled
 ├── packages/schemas/             # shared contracts incl. jurisdiction.py profiles
-├── scripts/                      # ingest_tariff.py · fasah_sandbox_probe.py
+├── scripts/                      # ingest_tariff.py · embed_corpus.py · e2e_pipeline_test.py
 ├── tests/                        # unit · golden-claim fixtures · property-based rules
+│   └── fixtures/                 # tariff_benchmark.json — the labelled retrieval set
 └── infra/
 ```
 
@@ -766,5 +767,149 @@ The ceiling now belongs to the backend (`Embedder.vector_ceiling`), because a di
 threshold is meaningful only inside one embedding space. It does not degrade gracefully
 across a model change: it suppresses everything or admits everything.
 
-The current value is provisional and says so. It was measured against nine tariff lines,
-which establishes that 0.55 was wrong and does not establish that 0.75 is right.
+The value week 8 chose was provisional and said so. Week 9 measured it against a labelled
+set and replaced it — see §14.6, which also explains why a ceiling was the wrong instrument
+for the job it was being asked to do.
+---
+
+## 14. The closed loop (week 9)
+
+### 14.1 What was actually missing
+
+The n8n pipeline had existed since week 4 and referenced four endpoints that did not exist:
+`/documents/batch`, `/extraction/run`, `/claims/persist`, `/claims/transition`. It described
+the intended shape and could not run. Week 9 built the endpoints, added
+`/classification/run` and `/packaging/build`, and rewrote the workflow around all six.
+
+The registration order in `services/api/src/main.py` is the loop, and is deliberately not
+alphabetical:
+
+```
+/documents/batch      bytes into MinIO, content-addressed, registered against the tenant
+/extraction/run       reads them back; native or scan, and how confidently
+/classification/run   corroborates the declared codes against the schedule
+/matching/run         CP-SAT (US) or declaration linkage (GCC)
+/triage/evaluate      does a human need to see this
+/review/*             the human
+/claims/persist       the computation becomes state
+/claims/transition    the state machine
+/packaging/build      7551/7552 or ZATCA JSON
+```
+
+### 14.2 The two paths, and where they rejoin
+
+```
+                                     ┌── triage: nothing ──> approved ──┐
+ingest -> extract -> classify -> match -> persist                       ├─> package -> packaged
+                                     └── triage: exception ──> suspend ─┘
+                                            -> draft memo -> wait
+                                            -> analyst resolves -> approved
+```
+
+The claim is persisted **before** the branch. An analyst opening a suspended run needs a
+claim to look at — an id, a refund figure, a derivation — not a workflow variable, and
+`mcp-claims` needs something to point at. It also means a crashed run loses the workflow
+and not the work, which is the whole reason §4 puts the state in Postgres.
+
+### 14.3 Approval without a human
+
+`QUANTIFIED -> APPROVED` opened in week 9. Before it, every claim passed through
+`ANALYST_REVIEW`, including the ones triage had nothing to say about — a queue of
+non-decisions, which is a queue people stop reading.
+
+The guarantee did not go away, it moved. `analyst.transition_claim` refuses **any**
+transition into `APPROVED` while the claim carries an unresolved `review_queue` row,
+whoever is asking. It had to move out of `approve_claim`, because the pipeline is now a
+caller and it is the caller that runs unattended. Transition rows record `pipeline` as the
+actor, so which claims took the automated lane is a query rather than an inference.
+
+### 14.4 What the pipeline is not allowed to decide
+
+Two endpoints report rather than act, and the distinction is load-bearing.
+
+**`/classification/run` corroborates; it never rewrites.** The tariff codes on a claim are
+the codes that were actually declared. A mismatch between a declared code and what the
+schedule's own text points to becomes a review item with the schedule text attached — not a
+correction. Reclassifying merchandise is a customs matter with its own procedure; a
+classifier that quietly changed a code would put an embedding model between a description
+and a duty rate.
+
+**`/extraction/run` reports readability; it does not produce lines.** It says whether a
+document has a usable native text layer, what fields it found, and how confidently — and it
+is allowed to refuse. Typed `EntryLine`/`ExportLine` objects come from the structured source
+(ERP feed, broker export). Assembling them from a scanned *Bayan* table needs the glyph
+x-coordinate work deferred since week 3. That division is not a placeholder: the figures
+come from a system of record and the documents are what evidences them, which is the shape
+19 CFR §163 asks for.
+
+### 14.5 Classification confidence: what confirms an answer
+
+A `TariffHit` carries `needs_analyst_confirmation`, and week 9 changed what sets it.
+
+The old rule was "the vector path alone found this". The week 9 benchmark
+(`tests/fixtures/tariff_benchmark.json`) showed that treating agreement between the two
+paths as corroboration ignores how weak either was: "wooden lead pencils" reached wooden
+office furniture on a trigram coincidence over the word *wooden* at 0.157, with a mediocre
+vector distance agreeing, and came back as an answer needing no analyst.
+
+The rule now: **the lexical path confirms, alone, above
+`search.CONFIRMATION_LEXICAL_FLOOR`.** A strong trigram match against published tariff text
+is the schedule saying so. A near vector neighbour is a model saying so. Those are different
+claims, and only the first is evidence. The vector path finds and ranks — which is what it
+is good at, and is why cross-lingual retrieval still works — and never confirms.
+
+The floor in force is stored on the hit rather than looked up, because a classification an
+auditor asks about in 2030 has to be explicable against the threshold that was actually
+applied, not the one the constant holds by then.
+
+### 14.6 The vector ceiling is a rubbish filter, not a precision mechanism
+
+Week 8 left `vector_ceiling` at 0.75, measured against nine lines, and said so. Measured
+against twenty labelled queries it admitted eight of the ten hard negatives.
+
+The result that matters is the one no value fixes: the worst true positive sits at 0.624 and
+the nearest unanswerable query at 0.508. The ranges **overlap**. "Ruggedised field laptop
+computer" and "portable cordless electric hand drill" are not separable by distance against
+this corpus at any threshold, so no ceiling delivers precision.
+
+0.68 is therefore calibrated for recall alone — the smallest value that still retrieves the
+correct code for all ten positives, keeping "live breeding cattle" and "marine cargo
+insurance brokerage" outside. Everything under it is a candidate; §14.5 decides which
+candidates are answers.
+
+`test_the_two_distance_ranges_overlap` asserts the overlap. If a future model separates the
+classes, the suite says so rather than carrying a mechanism nobody re-examines.
+
+### 14.7 Synchronous work inside an async API
+
+Three paths cannot run on the async session: the agent worker (the SDK call blocks), the
+packager (rendering is CPU work), and persistence, which is shared verbatim with
+`mcp-claims`. `services/api/src/sync_db.py` gives them one process-wide engine and runs them
+in a worker thread.
+
+The alternative was two implementations of the claim state machine, one async for the API
+and one sync for the MCP servers, with the interesting bugs in whichever the tests missed.
+
+### 14.8 What running it found
+
+**`entry_lines.port_of_entry` was `String(16)`.** Wide enough for a 4-digit CBP port code,
+too narrow for "Jeddah Islamic Port". Every KSA claim was unpersistable and nothing caught
+it, because until week 9 nothing persisted a claim — the GCC matcher was exercised entirely
+in memory. Migration `e5c48b71d90a`.
+
+This is the argument for building orchestration after the components rather than before.
+The defect is not in a component; it is a disagreement between the schema's US assumptions
+and the GCC lane's data, and only a run that crosses both surfaces it.
+
+### 14.9 `scripts/e2e_pipeline_test.py`
+
+Drives the deployed API the way n8n drives it — one call per node, same order, same payload
+shapes. Case A is a clean US claim that reaches a 7551 with no human in the transition
+trail. Case B is a GCC claim with one re-export ~7% under the Article 16 §2 minimum: the
+short line is rejected, the rejection raises a `threshold_near_miss` row, the run suspends,
+`mcp-claims` resolves it, and a ZATCA payload comes out.
+
+Case B is expected to end **untransmittable**. The packet carries five open Resolution 28624
+citations and the packager blocks it (`COMPLIANCE-GCC.md` §8.4.1). A run reporting Case B as
+ready to file would mean that guard had been lost, so the script asserts the block rather
+than the absence of one.

@@ -255,9 +255,30 @@ class TestClaimState:
         for current, nxt in pairwise(path):
             assert current.can_move_to(nxt), f"{current} -> {nxt}"
 
-    def test_cannot_skip_analyst_review(self) -> None:
-        assert not ClaimState.QUANTIFIED.can_move_to(ClaimState.APPROVED)
+    def test_a_clean_claim_may_be_approved_without_stopping(self) -> None:
+        """The week 9 automated lane.
+
+        Before it, every claim passed through ANALYST_REVIEW — including the ones triage
+        had nothing to say about, which filled a human queue with items whose only
+        possible action was to wave them through. A queue of non-decisions is a queue
+        people stop reading, and the exceptions that matter go with it.
+
+        What stops this being a hole is that the guarantee moved rather than went away:
+        `analyst.transition_claim` refuses any move into APPROVED while the claim carries
+        an unresolved review row. The state machine says the shape is reachable; the guard
+        says when.
+        """
+        assert ClaimState.QUANTIFIED.can_move_to(ClaimState.APPROVED)
+
+    def test_the_stages_still_cannot_be_skipped(self) -> None:
+        """Approval got a shortcut. Packaging did not.
+
+        A packet may only be rendered from an approved claim, automated lane or not, so
+        there is exactly one place the "may this be filed" question is asked.
+        """
         assert not ClaimState.MATCHED.can_move_to(ClaimState.PACKAGED)
+        assert not ClaimState.QUANTIFIED.can_move_to(ClaimState.PACKAGED)
+        assert not ClaimState.MATCHED.can_move_to(ClaimState.APPROVED)
 
     def test_terminal_states_are_terminal(self) -> None:
         for terminal in (ClaimState.PAID, ClaimState.REJECTED, ClaimState.EXPIRED):

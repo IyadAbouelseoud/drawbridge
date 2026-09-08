@@ -187,15 +187,23 @@ class FastEmbedEmbedder(Embedder):
     importing a config module or listing the available backends.
     """
 
-    # Measured against the week 8 corpus, and provisional. This model's distances are
-    # compressed into a narrow band: a good match sits around 0.52-0.63 and an unrelated
-    # one around 0.86, so the separation is real but the margin is thin and the ceiling
-    # sits closer to the noise than is comfortable. It was set from nine tariff lines,
-    # which is enough to show the old 0.55 was wrong and not enough to call this right —
-    # see ROADMAP.md, week 9. Erring high: a vector-only hit is flagged for analyst
-    # confirmation rather than returned as an answer, so a loose ceiling costs a review
-    # and a tight one loses the match entirely.
-    vector_ceiling = 0.75
+    # Calibrated in week 9 against tests/fixtures/tariff_benchmark.json — twenty labelled
+    # queries, ten the corpus answers and ten it does not.
+    #
+    # The measurement retired the assumption the week 8 value rested on. There is no
+    # ceiling that admits every correct answer and rejects every wrong one: the worst true
+    # positive sits at 0.624 and the nearest hard negative at 0.508, so the two ranges
+    # overlap and the separation the old comment described does not exist at this
+    # granularity. A ceiling cannot deliver precision, and 0.75 was quietly admitting
+    # eight of the ten negatives while appearing to.
+    #
+    # So the ceiling is calibrated for *recall* and nothing else: 0.68 is the smallest
+    # value that still retrieves the correct code for all ten positives (worst case
+    # 0.624), with headroom before the rubbish band — "live breeding cattle" and "marine
+    # cargo insurance" sit at 0.74 and 0.80 and stay excluded. Everything admitted below
+    # it is a candidate, not an answer. Precision is `search.CONFIRMATION_LEXICAL_FLOOR`'s
+    # job, and it is measured separately.
+    vector_ceiling = 0.68
 
     def __init__(
         self,

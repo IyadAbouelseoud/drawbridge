@@ -23,6 +23,7 @@ from sqlalchemy import text
 from mcp_servers.mcp_claims.db import session_scope
 from services.classifier.src.embeddings import BACKENDS, DEFAULT_BACKEND
 from services.classifier.src.search import (
+    CONFIRMATION_LEXICAL_FLOOR,
     LEXICAL_FLOOR,
     search_rulings,
     search_tariff,
@@ -132,6 +133,7 @@ def classify_with_embedding(
             "thresholds": {
                 "lexical_floor": LEXICAL_FLOOR,
                 "vector_ceiling": ceiling,
+                "confirmation_lexical_floor": CONFIRMATION_LEXICAL_FLOOR,
                 "backend": backend,
             },
         }

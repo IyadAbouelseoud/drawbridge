@@ -1,7 +1,7 @@
 {
   "name": "drawbridge-claim-pipeline",
   "meta": {
-    "description": "Ingest -> extract -> match -> triage -> persist. The Postgres claim state machine is authoritative; this workflow fires transitions and never holds business state (docs/ARCHITECTURE.md section 4)."
+    "description": "Ingest -> extract -> classify -> match -> triage -> persist -> approve or suspend -> package. The Postgres claim state machine is authoritative; this workflow fires transitions and never holds business state (docs/ARCHITECTURE.md section 4)."
   },
   "settings": {
     "executionOrder": "v1",
@@ -21,21 +21,21 @@
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
       "position": [
-        -760,
+        -1120,
         300
       ],
       "webhookId": "drawbridge-ingest"
     },
     {
       "parameters": {
-        "jsCode": "// Fail fast on a malformed batch. A claim reaching the matcher without its jurisdiction\n// would be matched under whichever statute happens to be the default, which is exactly\n// the failure that looks plausible all the way to a filing.\nconst b = $input.first().json;\nfor (const f of ['tenant_id', 'jurisdiction', 'documents']) {\n  if (!b[f]) throw new Error('ingest payload missing required field: ' + f);\n}\nif (!['us', 'ksa'].includes(b.jurisdiction)) {\n  throw new Error('unknown jurisdiction: ' + b.jurisdiction);\n}\nreturn [{ json: Object.assign({}, b, {\n  as_of: b.as_of || new Date().toISOString().slice(0, 10),\n}) }];"
+        "jsCode": "// Fail fast on a malformed batch. A claim reaching the matcher without its jurisdiction\n// would be matched under whichever statute happens to be the default, which is exactly\n// the failure that looks plausible all the way to a filing.\n//\n// `claimant` is required here rather than at the packaging step because that step runs\n// twenty minutes and one analyst decision later, and discovering then that the filing\n// identity was never supplied means the run is lost, not delayed.\nconst b = $input.first().json;\nconst REQUIRED = ['tenant_id', 'jurisdiction', 'documents', 'imports', 'exports', 'claimant'];\nfor (const f of REQUIRED) {\n  if (!b[f]) throw new Error('ingest payload missing required field: ' + f);\n}\nif (!['us', 'ksa'].includes(b.jurisdiction)) {\n  throw new Error('unknown jurisdiction: ' + b.jurisdiction);\n}\nif (!b.imports.length || !b.exports.length) {\n  throw new Error('a claim needs at least one import line and one export line');\n}\nreturn [{ json: Object.assign({}, b, {\n  as_of: b.as_of || new Date().toISOString().slice(0, 10),\n}) }];"
       },
       "id": "validate-payload",
       "name": "Validate Payload",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        -560,
+        -940,
         300
       ]
     },
@@ -59,7 +59,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        -360,
+        -760,
         300
       ]
     },
@@ -76,27 +76,64 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, documents: $json.stored }) }}"
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, documents: $json.stored.map(function (d) { return d.document_id; }) }) }}"
       },
       "id": "extract",
       "name": "Extract",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        -160,
+        -580,
         300
       ]
     },
     {
       "parameters": {
-        "jsCode": "// Extraction confidence below the floor means a figure may be misread. Matching on a\n// misread figure yields an internally consistent claim for the wrong amount, which no\n// downstream check would catch.\nconst FLOOR = 0.95;\nconst x = $input.first().json;\nconst scores = (x.confidences || []).map(c => c.score);\nconst below = scores.filter(s => s < FLOOR);\nreturn [{ json: Object.assign({}, x, {\n  confidence_min: scores.length ? Math.min.apply(null, scores) : null,\n  confidence_below_floor: below.length,\n  confidence_ok: below.length === 0,\n}) }];"
+        "jsCode": "// /extraction/run already applied the floor and said what it found. This node decides\n// what the pipeline does about it, which is a different question and belongs here rather\n// than in the API: the floor is a rule, the response to breaching it is a policy.\n//\n// A document that could not be read at all is treated as below floor, not as absent. The\n// two are indistinguishable downstream and only one of them is safe to ignore.\nconst x = $input.first().json;\nconst unreadable = (x.documents || []).filter(d => d.readable === false).length;\nconst below = (x.confidence_below_floor || 0) + unreadable;\nreturn [{ json: Object.assign({}, x, {\n  confidence_below_floor: below,\n  confidence_ok: below === 0,\n  unreadable_documents: unreadable,\n}) }];"
       },
       "id": "confidence-gate",
       "name": "Confidence Gate",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        40,
+        -400,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/classification/run",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ jurisdiction: $('Validate Payload').item.json.jurisdiction, lines: $('Validate Payload').item.json.imports.map(function (l) { return { line_id: l.line_id, description: l.description, declared_code: l.hts.code }; }) }) }}"
+      },
+      "id": "classify",
+      "name": "Classify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// A declared code the schedule does not corroborate is not an error and not an approval.\n// It is the case an analyst should see, because classification drives the duty rate and\n// the pipeline is not permitted to change a code that was actually declared.\nconst c = $input.first().json;\nconst unsupported = c.unsupported || [];\nreturn [{ json: Object.assign({}, c, {\n  classification_ok: unsupported.length === 0,\n  unsupported_count: unsupported.length,\n}) }];"
+      },
+      "id": "classification-gate",
+      "name": "Classification Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -40,
         300
       ]
     },
@@ -113,14 +150,14 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ jurisdiction: $('Validate Payload').item.json.jurisdiction, imports: $json.imports, exports: $json.exports, as_of: $('Validate Payload').item.json.as_of }) }}"
+        "jsonBody": "={{ JSON.stringify({ jurisdiction: $('Validate Payload').item.json.jurisdiction, imports: $('Validate Payload').item.json.imports, exports: $('Validate Payload').item.json.exports, as_of: $('Validate Payload').item.json.as_of }) }}"
       },
       "id": "match",
       "name": "Match",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        240,
+        140,
         300
       ]
     },
@@ -144,7 +181,31 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        440,
+        320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/claims/persist",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, jurisdiction: $('Validate Payload').item.json.jurisdiction, imports: $('Validate Payload').item.json.imports, exports: $('Validate Payload').item.json.exports, matches: $('Match').item.json.matches, total_refund: $('Match').item.json.total_refund, requires_review: $('Triage').item.json.requires_review }) }}"
+      },
+      "id": "persist-claim",
+      "name": "Persist Claim",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
         300
       ]
     },
@@ -162,7 +223,7 @@
                 "type": "boolean",
                 "operation": "true"
               },
-              "leftValue": "={{ $json.requires_review }}",
+              "leftValue": "={{ $('Triage').item.json.requires_review }}",
               "rightValue": ""
             }
           ],
@@ -175,7 +236,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        640,
+        680,
         300
       ]
     },
@@ -192,15 +253,36 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, claim_id: $('Match').item.json.claim_id, workflow_run_id: $execution.id, items: $json.items }) }}"
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, claim_id: $('Persist Claim').item.json.claim_id, workflow_run_id: $execution.id, items: $('Triage').item.json.items }) }}"
       },
       "id": "suspend-for-analyst",
       "name": "Suspend For Analyst",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        860,
-        160
+        880,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/review/draft?tenant_id={{ $('Validate Payload').item.json.tenant_id }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "draft-analyst-memos",
+      "name": "Draft Analyst Memos",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1060,
+        140
       ]
     },
     {
@@ -213,28 +295,59 @@
       "type": "n8n-nodes-base.wait",
       "typeVersion": 1.1,
       "position": [
-        1060,
-        160
+        1240,
+        140
       ],
       "webhookId": "drawbridge-review-resume"
     },
     {
       "parameters": {
-        "jsCode": "// An analyst may approve, correct, reject or defer. Only the first two continue; a\n// rejected claim stops here with its reason recorded rather than proceeding quietly.\nconst r = $input.first().json;\nif (['approved', 'corrected'].indexOf(r.resolution) === -1) {\n  return [{ json: Object.assign({}, r, { halt: true, final_state: 'rejected' }) }];\n}\nreturn [{ json: Object.assign({}, r, { halt: false }) }];"
+        "jsCode": "// An analyst may approve, correct, reject or defer. Only the first two continue; a\n// rejected claim stops here with its reason recorded rather than proceeding quietly.\n// A deferred one also stops — it is still open, and the dispatcher will bring it back.\nconst r = $input.first().json;\nconst proceed = ['approved', 'corrected'].indexOf(r.resolution) !== -1;\nreturn [{ json: Object.assign({}, r, {\n  halt: !proceed,\n  next_state: proceed ? 'approved' : 'rejected',\n}) }];"
       },
       "id": "apply-resolution",
       "name": "Apply Resolution",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1260,
-        160
+        1420,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "operator": {
+                "type": "boolean",
+                "operation": "false"
+              },
+              "leftValue": "={{ $json.halt }}",
+              "rightValue": ""
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "analyst-continued",
+      "name": "Analyst Continued",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        140
       ]
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "http://api:8000/claims/persist",
+        "url": "http://api:8000/claims/transition",
         "options": {
           "response": {
             "response": {
@@ -244,14 +357,14 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, jurisdiction: $('Validate Payload').item.json.jurisdiction, match_result: $('Match').item.json, review: $('Triage').item.json }) }}"
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, to_state: 'approved', actor: 'pipeline', reason: 'pipeline run ' + $execution.id }) }}"
       },
-      "id": "persist-claim",
-      "name": "Persist Claim",
+      "id": "approve-claim",
+      "name": "Approve Claim",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1480,
+        1820,
         300
       ]
     },
@@ -268,21 +381,69 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ claim_id: $json.claim_id, to_state: $json.next_state, actor: 'n8n', reason: 'pipeline run ' + $execution.id }) }}"
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, to_state: 'rejected', actor: 'analyst', reason: $('Apply Resolution').item.json.resolution_note || 'analyst did not approve' }) }}"
       },
-      "id": "advance-state",
-      "name": "Advance State",
+      "id": "halt-claim",
+      "name": "Halt Claim",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1680,
+        1820,
+        -20
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/packaging/build",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, claimant: $('Validate Payload').item.json.claimant, include_artifacts: false }) }}"
+      },
+      "id": "build-packet",
+      "name": "Build Packet",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2000,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/claims/transition",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, to_state: 'packaged', actor: 'pipeline', reason: 'packet rendered by run ' + $execution.id }) }}"
+      },
+      "id": "mark-packaged",
+      "name": "Mark Packaged",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2180,
         300
       ]
     },
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ claim_id: $json.claim_id, state: $json.state, refund: $json.total_refund }) }}",
+        "responseBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, state: $json.state, refund: $('Persist Claim').item.json.total_refund, transmittable: $('Build Packet').item.json.transmittable, artifacts: $('Build Packet').item.json.manifest.artifacts }) }}",
         "options": {}
       },
       "id": "respond",
@@ -290,8 +451,23 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
       "position": [
-        1880,
+        2360,
         300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, state: 'rejected', resolution: $('Apply Resolution').item.json.resolution }) }}",
+        "options": {}
+      },
+      "id": "respond-halted",
+      "name": "Respond Halted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2000,
+        -20
       ]
     }
   ],
@@ -344,6 +520,28 @@
       "main": [
         [
           {
+            "node": "Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify": {
+      "main": [
+        [
+          {
+            "node": "Classification Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classification Gate": {
+      "main": [
+        [
+          {
             "node": "Match",
             "type": "main",
             "index": 0
@@ -366,6 +564,17 @@
       "main": [
         [
           {
+            "node": "Persist Claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Claim": {
+      "main": [
+        [
+          {
             "node": "Needs Review",
             "type": "main",
             "index": 0
@@ -384,7 +593,7 @@
         ],
         [
           {
-            "node": "Persist Claim",
+            "node": "Approve Claim",
             "type": "main",
             "index": 0
           }
@@ -392,6 +601,17 @@
       ]
     },
     "Suspend For Analyst": {
+      "main": [
+        [
+          {
+            "node": "Draft Analyst Memos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Analyst Memos": {
       "main": [
         [
           {
@@ -417,25 +637,65 @@
       "main": [
         [
           {
-            "node": "Persist Claim",
+            "node": "Analyst Continued",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Persist Claim": {
+    "Analyst Continued": {
       "main": [
         [
           {
-            "node": "Advance State",
+            "node": "Approve Claim",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Halt Claim",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Advance State": {
+    "Halt Claim": {
+      "main": [
+        [
+          {
+            "node": "Respond Halted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approve Claim": {
+      "main": [
+        [
+          {
+            "node": "Build Packet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Packet": {
+      "main": [
+        [
+          {
+            "node": "Mark Packaged",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Packaged": {
       "main": [
         [
           {

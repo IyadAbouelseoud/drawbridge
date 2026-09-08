@@ -45,6 +45,23 @@ LEXICAL_FLOOR = 0.15
 # for the lexical backend and for callers that have no embedder to ask.
 VECTOR_CEILING = 0.55
 
+# Lexical similarity a hit must reach before agreement between the two paths counts as
+# corroboration. Distinct from LEXICAL_FLOOR, which decides whether a lexical hit is
+# returned at all; this decides whether one is strong enough to stand behind an answer.
+#
+# Week 9 added it because the benchmark found the previous rule wrong. `matched_by ==
+# "both"` was treated as confirmation regardless of how weak the lexical side was, and
+# two of the twenty labelled queries produced exactly that: "wooden lead pencils" reached
+# wooden office furniture at 0.157, and a desktop-computer query reached the portable ADP
+# subheading at 0.160. Both came back as corroborated answers needing no analyst, and both
+# were wrong. Every correct corroborated answer in the set scored 0.216 or better.
+#
+# 0.20 sits in that gap. It is a narrow gap measured on twenty queries, so it is a floor
+# that will move — but the shape of the rule is the finding, not the constant: weak
+# agreement between two weak signals is not evidence, and reading it as evidence is how a
+# misclassification reaches a filing unexamined.
+CONFIRMATION_LEXICAL_FLOOR = 0.20
+
 # Weight given to each path when both contribute. Lexical is trusted slightly more
 # because an exact phrase match against published tariff text is stronger evidence than
 # embedding proximity.
@@ -67,6 +84,13 @@ class TariffHit:
     lexical_score: float | None
     vector_distance: float | None
 
+    confirmation_lexical_floor: float = CONFIRMATION_LEXICAL_FLOOR
+    """The floor this hit was judged against, carried on the hit rather than looked up.
+
+    A stored classification has to stay explicable: an auditor asking in 2030 why a line
+    was taken without review needs the threshold that was in force, not the one the
+    constant holds by then."""
+
     @property
     def matched_by(self) -> str:
         if self.lexical_score is not None and self.vector_distance is not None:
@@ -77,12 +101,24 @@ class TariffHit:
     def needs_analyst_confirmation(self) -> bool:
         """Whether this hit should be confirmed rather than taken.
 
-        A vector-only hit is a suggestion: the model found something semantically near,
-        which is not the same as the schedule saying so. Classification drives the duty
-        rate, so an unconfirmed suggestion reaching a filing is a misclassification
-        waiting to be assessed.
+        The lexical path decides this, alone. A strong trigram match is the published
+        schedule text saying so; the vector path only ever says a model found something
+        near, which is not the same claim however near it got. So the vector path finds
+        and ranks, and never confirms.
+
+        The week 9 benchmark is why there is a *strength* condition and not just a path
+        condition. The previous rule confirmed anything both paths reached, and "wooden
+        lead pencils" reached wooden office furniture on a trigram coincidence over the
+        word wooden — 0.157, comfortably over the retrieval floor — with a mediocre vector
+        distance agreeing. Two weak signals agreeing is one piece of noise counted twice.
+        Every correct corroborated answer in that set scored 0.216 or better.
+
+        Classification drives the duty rate, so an unconfirmed suggestion reaching a
+        filing is a misclassification waiting to be assessed.
         """
-        return self.matched_by == "vector"
+        if self.lexical_score is None:
+            return True
+        return self.lexical_score < self.confirmation_lexical_floor
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +136,7 @@ class TariffHit:
                 round(self.vector_distance, 4) if self.vector_distance is not None else None
             ),
             "needs_analyst_confirmation": self.needs_analyst_confirmation,
+            "confirmation_lexical_floor": self.confirmation_lexical_floor,
         }
 
 
@@ -149,6 +186,7 @@ def search_tariff(
     revision: str | None = None,
     limit: int = 10,
     vector_ceiling: float = VECTOR_CEILING,
+    confirmation_lexical_floor: float = CONFIRMATION_LEXICAL_FLOOR,
 ) -> tuple[list[TariffHit], str]:
     """Classify a goods description. Returns hits and which method answered.
 
@@ -199,13 +237,15 @@ def search_tariff(
         if vector
         else "lexical"
     )
-    hits = _merge(lexical, vector)
+    hits = _merge(lexical, vector, confirmation_lexical_floor)
     hits.sort(key=lambda h: h.score, reverse=True)
     return hits[:limit], method
 
 
 def _merge(
-    lexical: dict[str, dict[str, Any]], vector: dict[str, dict[str, Any]]
+    lexical: dict[str, dict[str, Any]],
+    vector: dict[str, dict[str, Any]],
+    confirmation_lexical_floor: float = CONFIRMATION_LEXICAL_FLOOR,
 ) -> list[TariffHit]:
     """Combine the two paths into one ranked list.
 
@@ -241,6 +281,7 @@ def _merge(
                 score=score,
                 lexical_score=lex_score,
                 vector_distance=distance,
+                confirmation_lexical_floor=confirmation_lexical_floor,
             )
         )
     return hits

@@ -125,7 +125,20 @@ _TRANSITIONS: dict[ClaimState, frozenset[ClaimState]] = {
         {ClaimState.MATCHED, ClaimState.ANALYST_REVIEW, ClaimState.REJECTED}
     ),
     ClaimState.MATCHED: frozenset({ClaimState.QUANTIFIED}),
-    ClaimState.QUANTIFIED: frozenset({ClaimState.ANALYST_REVIEW, ClaimState.EXPIRED}),
+    # QUANTIFIED -> APPROVED is the automated lane, added in week 9. Until then every
+    # claim was routed through ANALYST_REVIEW, which meant a clean high-confidence claim
+    # occupied a human's queue to be waved through — and a queue of claims that never
+    # need attention is a queue people stop reading.
+    #
+    # The guarantee that edge could have destroyed is preserved elsewhere rather than
+    # dropped: `analyst.transition_claim` refuses any move into APPROVED while the claim
+    # carries an unresolved `review_queue` row, whoever is moving it. So approval without
+    # a human happens only where triage found nothing for a human to do, and the
+    # transition row records `pipeline` as the actor, so which claims took this lane is a
+    # query rather than an inference.
+    ClaimState.QUANTIFIED: frozenset(
+        {ClaimState.ANALYST_REVIEW, ClaimState.APPROVED, ClaimState.EXPIRED}
+    ),
     ClaimState.ANALYST_REVIEW: frozenset({ClaimState.APPROVED, ClaimState.REJECTED, *_WORKING}),
     ClaimState.APPROVED: frozenset({ClaimState.PACKAGED}),
     ClaimState.PACKAGED: frozenset({ClaimState.HANDED_OFF}),

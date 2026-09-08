@@ -44,6 +44,27 @@ _NUMERIC = re.compile(r"\d[\d,.\u066b\u066c/:%-]*\d|\d")
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
 
 
+class FabricatedCitationError(ValueError):
+    """A memo cited an authority that was not in the set it was given.
+
+    A distinct type rather than a bare `ValueError`, because the two guards fail for
+    different reasons and a caller that cannot tell them apart cannot log them apart
+    either. Week 9 named it: an invented CFR section and a Pydantic validation slip were
+    arriving as the same exception, so the rate at which the agent fabricates authorities
+    — the number worth watching — was unmeasurable.
+
+    Carries the offending citations so the failure can be diagnosed without a re-run.
+    """
+
+    def __init__(self, invented: Iterable[str], available: Iterable[str]) -> None:
+        self.invented = sorted(set(invented))
+        self.available = sorted(set(available))
+        super().__init__(
+            f"memo cites {self.invented!r}, which was not in the supplied citation set "
+            f"{self.available!r}. The agent may not originate an authority."
+        )
+
+
 class UngroundedFigureError(ValueError):
     """Generated text contained a number the facts do not support.
 
@@ -187,8 +208,4 @@ def check_citations(cited: Any, facts: Any) -> None:
     }
     invented = [c for c in cited if c not in available]
     if invented:
-        msg = (
-            f"memo cites {invented!r}, which was not in the supplied citation set. "
-            "The agent may not originate an authority."
-        )
-        raise ValueError(msg)
+        raise FabricatedCitationError(invented, available)

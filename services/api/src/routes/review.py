@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import Session
 
 from services.api.src.models import ReviewQueue
 from services.rules.src.triage import ReviewReason, Severity
@@ -210,25 +211,18 @@ async def draft_memos(tenant_id: UUID, limit: int = 20) -> dict[str, Any]:
     Anthropic SDK call in the middle is blocking and the agent worker is shared with the
     CLI entry point. Wrapping it here keeps one implementation instead of two.
     """
-    from anyio import to_thread
-
     from services.agent.src.queue import draft_pending
-    from services.api.src.config import get_settings
+    from services.api.src.sync_db import in_thread
 
-    def _run() -> dict[str, Any]:
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import Session
-
-        engine = create_engine(get_settings().sync_database_url)
-        with Session(engine) as session:
-            report = draft_pending(session, tenant_id=tenant_id, limit=limit)
+    def _run(session: Session) -> dict[str, Any]:
+        report = draft_pending(session, tenant_id=tenant_id, limit=limit)
         return {
             "drafted": report.drafted,
             "skipped": report.skipped,
             "unavailable": report.unavailable,
         }
 
-    return await to_thread.run_sync(_run)
+    return await in_thread(_run)
 
 
 @router.get("/pending/{resume_token}")

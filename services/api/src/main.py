@@ -1,6 +1,10 @@
 """Drawbridge API — tenants, claims, review queue, webhooks.
 
-Week 1 scope: process wiring and dependency health only. Claim routes land in week 6.
+The closed loop, in order: `/documents/batch` and `/extraction/run` take the file in,
+`/classification/run` corroborates its codes, `/matching/run` allocates, `/triage/evaluate`
+decides whether a human is needed, `/review/*` is that human, `/claims/persist` and
+`/claims/transition` hold the state, and `/packaging/build` renders what a licensed filer
+submits. n8n drives the sequence and holds none of the state (`docs/ARCHITECTURE.md` §4).
 """
 
 from __future__ import annotations
@@ -17,7 +21,16 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.sql import text
 
 from services.api.src.config import Settings, get_settings
-from services.api.src.routes import matching, review, triage
+from services.api.src.routes import (
+    claims,
+    classification,
+    documents,
+    matching,
+    packaging,
+    review,
+    triage,
+)
+from services.api.src.sync_db import reset_engine
 
 log = structlog.get_logger()
 
@@ -35,6 +48,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         await app.state.redis.aclose()
         await app.state.engine.dispose()
+        # The synchronous pool is process-wide and outlives any single request, so it has
+        # to be released here or the connections linger until Postgres times them out.
+        reset_engine()
         log.info("api.shutdown")
 
 
@@ -46,9 +62,16 @@ app = FastAPI(
 )
 
 
+# Registered in pipeline order rather than alphabetically: the list is the closed loop
+# — ingest, extract, classify, match, triage, suspend, persist, package — and reading it
+# in that order is how someone new finds out what the pipeline actually does.
+app.include_router(documents.router)
+app.include_router(classification.router)
 app.include_router(matching.router)
-app.include_router(review.router)
 app.include_router(triage.router)
+app.include_router(review.router)
+app.include_router(claims.router)
+app.include_router(packaging.router)
 
 
 @app.get("/health")

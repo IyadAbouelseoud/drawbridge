@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 8 |
+| Current week | 9 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | **The autonomous agent layer** (`services/agent/`) + real semantic embeddings |
+| Current milestone | **The closed loop** — n8n orchestration end to end, both jurisdictions |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -235,27 +235,122 @@ the old one was wrong and not enough to call the new one right — see week 9.
 - **Draft inside `POST /review/suspend`.** n8n waits on that call; coupling workflow
   suspension to a model round trip would make it fail for an unrelated reason.
 
-## Week 9 entry checklist
+## Week 9 task breakdown
 
-1. **Full-volume corpus load.** Still the largest single unblock, and now the gating one
-   for two other things. Downloading the ~19,000-line USITC schedule and the CROSS body
-   and running the proven pass. Bounded by download and compute, not by design.
-2. **Calibrate `vector_ceiling` against that corpus.** The current 0.75 was set from nine
-   lines. Nine is enough to show 0.55 was wrong and not enough to call 0.75 right. This
-   needs a labelled query set — a few dozen descriptions with known correct codes — and
-   the threshold chosen from the measured separation rather than from inspection.
-3. **A live agent run against real queue rows.** The fixtures use a stub client, because
-   what needed testing was whether the guardrails hold when the prose is bad, and a live
-   call cannot be made to hallucinate on demand. What the stub cannot tell us is how often
-   a real memo trips the numeric guard. If that rate is high the prompt is wrong; if it is
-   zero the guard may not be doing anything.
-4. **Real scanned *Bayan* corpus** to calibrate the OCR floor against measured error
-   rather than a defensible default. Same shape of problem as (2).
-5. **A real ERP connector.** `erp_mock.py` fixes the contract — SAP/Oracle field shapes,
-   multi-level explosion, yield and scrap. Swapping in a live connector changes the
-   source, not the shape.
-6. **n8n orchestration + HITL gates** (weeks 8–9 on the milestone table).
-7. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text.
+- [x] **The loop closed.** `/documents/batch`, `/extraction/run`, `/classification/run`,
+      `/claims/persist`, `/claims/transition`, `/packaging/build` — the six endpoints n8n
+      was already calling in a workflow that referenced four that did not exist.
+- [x] **The n8n pipeline rewritten** around them: intake, extraction, classification,
+      matching, triage, persistence, then either the automated lane or the HITL branch,
+      then packaging. Twenty-two nodes, generated from `n8n/generate_workflows.py`.
+- [x] **The automated lane.** A clean claim now goes `quantified -> approved -> packaged`
+      with no human in it.
+- [x] **`vector_ceiling` calibrated** against `tests/fixtures/tariff_benchmark.json` —
+      twenty labelled queries, ten the corpus answers and ten it cannot.
+- [x] **Adversarial guard fixtures** (`tests/golden/test_agent_adversarial.py`): forty-odd
+      deliberate hallucinations — invented duty amounts, fabricated entry numbers,
+      non-existent CFR sections, unverified ZATCA articles — each asserted to fail closed
+      with a named error type.
+- [x] **`scripts/e2e_pipeline_test.py`**: both jurisdictions through the deployed stack.
+
+### The ceiling could not be calibrated, and that was the finding
+
+Week 8 set it to 0.75 from nine tariff lines and said nine was not enough. It was not, but
+not in the direction expected: 0.75 admitted **eight of the ten hard negatives**. The
+useful result is the one no value fixes. The worst true positive sits at 0.624 and the
+nearest unanswerable query at 0.508, so the two ranges *overlap* — "ruggedised field laptop
+computer" and "portable cordless electric hand drill" are not separable by distance against
+this corpus, at any threshold.
+
+So the ceiling stopped being a precision mechanism and became what it can actually be: a
+rubbish filter calibrated for recall. 0.68 is the smallest value that still retrieves the
+correct code for all ten positives, and it keeps "live breeding cattle" and "marine cargo
+insurance brokerage" out. Everything admitted below it is a candidate, not an answer.
+
+`tests/golden/test_tariff_benchmark.py::test_the_two_distance_ranges_overlap` asserts the
+overlap, so if a future model does separate the classes the suite says so rather than
+silently continuing to carry a mechanism that is no longer needed.
+
+### The defect the benchmark found
+
+`needs_analyst_confirmation` was "the vector path alone found this". That treated agreement
+between the two paths as corroboration regardless of how weak either was, and two of the
+twenty queries produced exactly that: "wooden lead pencils" reached wooden office furniture
+on a trigram coincidence over the word *wooden* — 0.157, comfortably over the retrieval
+floor — with a mediocre vector distance agreeing. It came back as an answer needing no
+analyst. Every *correct* corroborated answer in the set scored 0.216 or better.
+
+The rule is now: the lexical path confirms, alone, and only above
+`search.CONFIRMATION_LEXICAL_FLOOR` (0.20). The vector path finds and ranks and never
+confirms — a strong trigram match is the published schedule text saying so, where a near
+vector neighbour is a model saying so, and those are different claims. Precision over
+confirmed answers is 1.00 on the benchmark; it was 0.67 before.
+
+The floor sits in a gap of 0.06 measured on twenty queries. It will move. The shape of the
+rule is the finding, not the constant.
+
+### Approval without a human, and the guard that replaced the old one
+
+Until week 9 `ClaimState.QUANTIFIED` could only reach `ANALYST_REVIEW`, so every claim —
+including the ones triage had nothing to say about — occupied a human's queue to be waved
+through. A queue of non-decisions is a queue people stop reading, and the exceptions that
+matter go with it.
+
+`QUANTIFIED -> APPROVED` is now permitted. What stops that being a hole is that the
+guarantee moved rather than went away: `analyst.transition_claim` refuses **any** move into
+`APPROVED` while the claim carries an unresolved `review_queue` row, whoever is asking. The
+check had to move out of `approve_claim` because the pipeline is now a caller, and it is
+the caller that runs unattended.
+
+### Two things week 9 found by running it
+
+**`entry_lines.port_of_entry` was 16 characters.** Wide enough for a 4-digit CBP port code,
+too narrow for "Jeddah Islamic Port". Every KSA claim was unpersistable and no test caught
+it, because until week 9 nothing persisted a claim at all — the GCC matcher was exercised
+entirely in memory. Migration `e5c48b71d90a` widens it to 64.
+
+**A five-field test document scores 0.87 and fails the extraction floor.** The first e2e
+run routed a clean US claim to review. The gate was right: character density is how the
+native path scores its confidence, and a page with five lines on it has almost nothing to
+be confident about. The fixture now carries the forty-odd fields a real 7501 and *Bayan*
+carry. Worth recording because the tempting fix was to lower the floor.
+
+### What week 9 deliberately did not do
+
+- **Build a document-to-typed-lines extractor.** `/extraction/run` reports what can be read
+  and how confidently; the typed lines still arrive from the structured source. Assembling
+  them from a scanned *Bayan* table needs the glyph x-coordinate work deferred since week
+  3, and faking it would put a fabricated provenance span on a filing.
+- **Let the pipeline change a declared tariff code.** `/classification/run` corroborates and
+  reports; it never rewrites. Reclassifying merchandise is a customs matter, not a
+  data-cleaning one.
+- **Run the agent live.** The e2e reports `unavailable` with no API key and the row keeps a
+  NULL memo, which is exactly the state analysts worked in before the service existed. The
+  question week 8 raised — how often a *real* memo trips the numeric guard — is still open
+  and still needs an API key and real queue rows, not a stub.
+- **Send anything to a customs authority.** Case B ends untransmittable by design: the ZATCA
+  packet carries five open Resolution 28624 citations and the packager blocks it.
+
+## Week 10 entry checklist
+
+1. **Full-volume corpus load** — the ~19,000-line USITC schedule and the CROSS body.
+   Carried from week 9. It gates (2), and the twenty-four-line benchmark corpus is the
+   reason the current thresholds are provisional rather than wrong.
+2. **Re-run the benchmark against that corpus.** Both constants — `vector_ceiling` 0.68 and
+   `CONFIRMATION_LEXICAL_FLOOR` 0.20 — were measured against twenty-four lines. The second
+   sits in a 0.06 gap and is the one likeliest to move.
+3. **A live agent run against real queue rows.** Unchanged from week 8, and now cheaper to
+   do: the pipeline produces real rows with real claims attached.
+4. **Import the workflows into n8n and run one for real.** The JSON is generated and the
+   endpoints it calls are exercised, but nothing has executed inside n8n yet — the Wait
+   node's resume path in particular is asserted by `services/api/src/resume.py` and
+   `mcp-claims`, not observed.
+5. **Real scanned *Bayan* corpus** to calibrate the OCR floor against measured error.
+6. **A real ERP connector** to replace `erp_mock.py`.
+7. **Tenant profiles.** `/packaging/build` takes the claimant per request because filing
+   identity — EIN, CR number, broker code, IBAN — is not modelled. It has to be before a
+   pilot, and it is a small schema change, not a design question.
+8. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text.
 
 ## Sequencing rationale
 
@@ -282,3 +377,11 @@ happens to break it.
 The pilot (wk 12–13) targets a backward-looking claim rather than live flow: a 5-year
 lookback has a known answer set and no operational dependency on the customer's current
 quarter.
+
+Orchestration (wk 8–9) lands last among the mechanisms rather than first, and week 9 is why
+that ordering was right. Wiring the loop is what forced the first *write* of a GCC claim,
+and the write is what found a column too narrow to hold a Saudi port name. A pipeline built
+before the pieces it connects would have been rewritten around each of them in turn; a
+pipeline built after them is where their contracts get tested against each other for the
+first time. Two of the three defects week 9 found were of exactly that kind — not bugs in a
+component, but disagreements between components that only a run can surface.
