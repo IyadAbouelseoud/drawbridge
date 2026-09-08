@@ -17,6 +17,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Session
 
+from services.api.src.auth import authorise_tenant, expected_tenant
 from services.api.src.models import ReviewQueue
 from services.api.src.tenancy import (
     TenantScopeError,
@@ -91,13 +92,14 @@ async def suspend(body: SuspendRequest, request: Request) -> dict[str, Any]:
     miss has not thereby resolved a low-confidence extraction, and collapsing them would
     let the second disappear behind the first.
     """
+    tenant_id = authorise_tenant(body.tenant_id)
     created: list[dict[str, Any]] = []
     async with _session(request) as session, session.begin():
-        await set_tenant_async(session, body.tenant_id)
+        await set_tenant_async(session, tenant_id)
         for item in body.items:
             row = ReviewQueue(
                 review_id=uuid4(),
-                tenant_id=body.tenant_id,
+                tenant_id=tenant_id,
                 claim_id=body.claim_id,
                 reason=item.reason.value,
                 severity=item.severity.value,
@@ -138,13 +140,14 @@ async def list_queue(
     Oldest first because the deadline clock is the thing that kills a claim, and the
     oldest item is the closest to it.
     """
+    scope = authorise_tenant(tenant_id)
     async with _session(request) as session:
-        await set_tenant_async(session, tenant_id)
+        await set_tenant_async(session, scope)
         rows = (
             await session.execute(
                 select(ReviewQueue)
                 .where(
-                    ReviewQueue.tenant_id == tenant_id,
+                    ReviewQueue.tenant_id == scope,
                     ReviewQueue.state == state,
                 )
                 .order_by(ReviewQueue.created_at)
@@ -177,7 +180,7 @@ async def resolve(review_id: UUID, body: ResolveRequest, request: Request) -> di
     """
     async with _session(request) as session, session.begin():
         try:
-            await scope_to_review_async(session, review_id)
+            await scope_to_review_async(session, review_id, expected_tenant())
         except TenantScopeError as exc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -229,15 +232,17 @@ async def draft_memos(tenant_id: UUID, limit: int = 20) -> dict[str, Any]:
     from services.agent.src.queue import draft_pending
     from services.api.src.sync_db import in_thread
 
+    scope = authorise_tenant(tenant_id)
+
     def _run(session: Session) -> dict[str, Any]:
-        report = draft_pending(session, tenant_id=tenant_id, limit=limit)
+        report = draft_pending(session, tenant_id=scope, limit=limit)
         return {
             "drafted": report.drafted,
             "skipped": report.skipped,
             "unavailable": report.unavailable,
         }
 
-    return await in_thread(_run, tenant_id)
+    return await in_thread(_run, scope)
 
 
 @router.get("/pending/{resume_token}")
@@ -245,7 +250,7 @@ async def poll(resume_token: str, request: Request) -> dict[str, Any]:
     """What n8n polls while suspended."""
     async with _session(request) as session:
         try:
-            await scope_to_resume_token_async(session, resume_token)
+            await scope_to_resume_token_async(session, resume_token, expected_tenant())
         except TenantScopeError as exc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="unknown token"

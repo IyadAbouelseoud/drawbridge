@@ -44,7 +44,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ tenant_id: $json.tenant_id, workflow_run_id: $json.payload.workflow, items: [$json] }) }}"
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $json.tenant_id, workflow_run_id: $json.payload.workflow, items: [$json] }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
+        }
       },
       "id": "queue-exception",
       "name": "Queue Exception",

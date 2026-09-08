@@ -177,6 +177,7 @@ def _entry_row(entry: AuditLedger) -> dict[str, Any]:
         "payload": entry.payload or {},
         "prev_hash": entry.prev_hash,
         "entry_hash": entry.entry_hash,
+        "trace_id": entry.trace_id,
         "recorded_at": entry.recorded_at.isoformat() if entry.recorded_at else None,
     }
 

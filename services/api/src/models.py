@@ -429,6 +429,17 @@ class AuditLedger(Base):
     prev_hash: Mapped[str | None] = mapped_column(String(64))
     entry_hash: Mapped[str] = mapped_column(String(64))
 
+    # The OpenTelemetry trace the event was recorded under, 32 hex characters, or NULL
+    # when it was written outside a traced request (a CLI run, a migration, a test).
+    #
+    # Deliberately *not* part of `entry_hash`. The digest covers the row's content —
+    # what happened, to what, on whose authority — and a trace id is where to go looking
+    # for how, which is observability rather than record. Hashing it would also make an
+    # artifact exported before this column existed fail to verify against a chain
+    # recomputed after it, and would make the same logical event hash differently on a
+    # retry. `ledger._digest` is the list of what a record actually asserts.
+    trace_id: Mapped[str | None] = mapped_column(String(32))
+
     recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

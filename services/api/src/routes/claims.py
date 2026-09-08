@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from drawbridge_schemas.jurisdiction import Jurisdiction
 from drawbridge_schemas.trade import EntryLine, ExportLine, LineMatch
 from services.api.src.analyst import AnalystError, claim_history, claim_summary, transition_claim
+from services.api.src.auth import authorise_tenant
 from services.api.src.persistence import PersistenceError, persist_claim
 from services.api.src.sync_db import in_thread, in_thread_for_claim
 from services.api.src.tenancy import TenantScopeError
@@ -82,11 +83,14 @@ async def persist(body: PersistRequest) -> dict[str, Any]:
     back. Withholding it would leave the analyst reviewing a workflow variable instead of
     a claim, and nothing to point `mcp-claims` at.
     """
+    # The verified tenant, not the posted one. Before this the row-level policies
+    # compared each written row against a value the caller supplied.
+    tenant_id = authorise_tenant(body.tenant_id)
     try:
         return await in_thread(
             lambda session: persist_claim(
                 session,
-                tenant_id=body.tenant_id,
+                tenant_id=tenant_id,
                 jurisdiction=body.jurisdiction,
                 imports=body.imports,
                 exports=body.exports,
@@ -95,7 +99,7 @@ async def persist(body: PersistRequest) -> dict[str, Any]:
                 requires_review=body.requires_review,
                 actor=body.actor,
             ),
-            body.tenant_id,
+            tenant_id,
         )
     except PersistenceError as exc:
         raise HTTPException(

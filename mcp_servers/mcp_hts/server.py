@@ -21,6 +21,8 @@ from pydantic import Field
 from sqlalchemy import text
 
 from mcp_servers.mcp_claims.db import session_scope
+from services.api.src.config import get_settings
+from services.api.src.telemetry import configure_tracing
 from services.classifier.src.embeddings import BACKENDS, DEFAULT_BACKEND
 from services.classifier.src.search import (
     CONFIRMATION_LEXICAL_FLOOR,
@@ -321,6 +323,10 @@ def corpus_status() -> dict[str, Any]:
 
 
 def main() -> None:
+    # A provider per process, so a tool call made on behalf of an API request lands in
+    # the same trace. Without an exporter configured the spans are created and dropped —
+    # see services/api/src/telemetry.py; the server starts either way.
+    configure_tracing("drawbridge-mcp-hts", endpoint=get_settings().otel_exporter_endpoint)
     # MCP SDK 2.x takes the bind address on run(), not on the constructor.
     server.run(transport="streamable-http", host="0.0.0.0", port=8102)
 

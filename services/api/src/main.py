@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.sql import text
 
+from services.api.src.auth import AuthMiddleware, check_auth_configuration
 from services.api.src.config import Settings, get_settings
 from services.api.src.routes import (
     claims,
@@ -31,6 +32,7 @@ from services.api.src.routes import (
     triage,
 )
 from services.api.src.sync_db import reset_engine
+from services.api.src.telemetry import configure_tracing, instrument_fastapi, shutdown_tracing
 
 log = structlog.get_logger()
 
@@ -39,6 +41,9 @@ log = structlog.get_logger()
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     app.state.settings = settings
+    # Before any connection is opened. A deployment that authenticates nobody should fail
+    # here rather than serve every tenant's rows to whoever asks.
+    check_auth_configuration(settings)
     app.state.engine = create_async_engine(settings.database_url, pool_pre_ping=True)
     app.state.sessionmaker = async_sessionmaker(app.state.engine, expire_on_commit=False)
     app.state.redis = aioredis.from_url(settings.redis_url, decode_responses=True)
@@ -51,6 +56,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # The synchronous pool is process-wide and outlives any single request, so it has
         # to be released here or the connections linger until Postgres times them out.
         reset_engine()
+        # Flush the batch processor; the last seconds of spans are the ones containing
+        # whatever made someone restart the container.
+        shutdown_tracing()
         log.info("api.shutdown")
 
 
@@ -60,6 +68,20 @@ app = FastAPI(
     summary="Autonomous customs duty recovery",
     lifespan=lifespan,
 )
+
+
+# Every request carries a verified tenant before it reaches a router, and that tenant is
+# what the row-level policies compare against — `services/api/src/auth.py` explains why the
+# `SET LOCAL` itself stays down in the session helpers rather than happening here.
+app.add_middleware(AuthMiddleware, settings=get_settings())
+
+# Instrumented here rather than in the lifespan, and that placement is the whole of it:
+# Starlette builds its middleware stack once, so a middleware added at startup is added to
+# a list nothing reads again and the request spans never appear. Added last, which makes
+# the OpenTelemetry middleware outermost — so a request rejected by the auth middleware
+# still produces a span, and a burst of 401s is visible as one.
+configure_tracing("drawbridge-api", endpoint=get_settings().otel_exporter_endpoint)
+instrument_fastapi(app)
 
 
 # Registered in pipeline order rather than alphabetically: the list is the closed loop

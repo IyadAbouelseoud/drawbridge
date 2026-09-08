@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import select, text
 
 from services.api.src.models import AuditLedger
+from services.api.src.telemetry import current_trace_id
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -134,6 +135,9 @@ def record(
         document_sha256=document_sha256,
         payload=body,
         prev_hash=prev_hash,
+        # Stamped, not hashed — see the column's note on the model. This is what ties a
+        # row an auditor is reading four years from now to the run that wrote it.
+        trace_id=current_trace_id(),
         entry_hash=_digest(
             tenant_id=tenant_id,
             claim_id=claim_id,

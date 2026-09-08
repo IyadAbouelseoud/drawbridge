@@ -91,12 +91,21 @@ async def in_thread_for_claim[T](claim_id: UUID, work: Callable[[Session], T]) -
     way. The owner is resolved through `tenancy.scope_to_claim` — one SECURITY DEFINER
     lookup — and the rest of the transaction runs scoped, so a caller holding a claim id
     still cannot reach anything else belonging to that tenant.
+
+    Since week 12 the resolved owner is also checked against the token's tenant. Reading
+    that here rather than taking it as an argument keeps the web layer out of every call
+    site: `expected_tenant` returns None outside a request, which is what the CLI entry
+    points and the offboarding script want, and the token's tenant inside one.
     """
     from anyio import to_thread
 
+    from services.api.src.auth import expected_tenant
+
+    expected = expected_tenant()
+
     def _run() -> T:
         with sync_session() as session:
-            scope_to_claim(session, claim_id)
+            scope_to_claim(session, claim_id, expected)
             return work(session)
 
     return await to_thread.run_sync(_run)

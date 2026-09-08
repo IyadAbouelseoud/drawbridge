@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from drawbridge_schemas.bom import BillOfMaterials
 from drawbridge_schemas.jurisdiction import Jurisdiction, profile_for
 from drawbridge_schemas.trade import EntryLine, ExportLine
+from services.api.src.telemetry import tracer
 from services.matcher.src.base import MatchRequest, MatchResult
 from services.matcher.src.router import run_match
 
@@ -139,7 +140,17 @@ async def run_matching(body: MatchRequestBody) -> MatchResponse:
         proof_of_purchase=body.proof_of_purchase,
         boms=body.boms,
     )
-    return _to_response(run_match(request))
+    # The one span worth having on this path. Everything above it is validation; this is
+    # a CP-SAT solve with a time limit, and "which claim was slow" is the question a
+    # trace gets asked. `line_count` rather than the lines: a span is not a record, and
+    # the record is the ledger.
+    with tracer("drawbridge.matching").start_as_current_span("matching.run") as span:
+        span.set_attribute("drawbridge.jurisdiction", str(body.jurisdiction))
+        span.set_attribute("drawbridge.import_lines", len(body.imports))
+        span.set_attribute("drawbridge.export_lines", len(body.exports))
+        result = run_match(request)
+        span.set_attribute("drawbridge.match_status", str(result.status))
+    return _to_response(result)
 
 
 @router.get("/strategies")

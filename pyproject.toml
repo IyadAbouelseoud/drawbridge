@@ -26,6 +26,13 @@ dependencies = [
     "ortools>=9.11",
     "opentelemetry-sdk>=1.29",
     "opentelemetry-instrumentation-fastapi>=0.50b0",
+    # OTLP over HTTP rather than gRPC: one fewer transitive dependency, and Jaeger, Tempo
+    # and the collector all accept it on 4318. Imported lazily — services/api/src/
+    # telemetry.py starts without it and drops the spans rather than refusing to boot.
+    "opentelemetry-exporter-otlp-proto-http>=1.29",
+    # Bearer-token verification: RS256 against Authentik's JWKS, HS256 locally. Already
+    # present transitively; declared because services/api/src/auth.py imports it directly.
+    "pyjwt[crypto]>=2.10",
     "pgvector>=0.3.6",
     "psycopg[binary]>=3.2",
     # Ed25519 signatures over the offboarding ledger export. Already present
@@ -105,6 +112,13 @@ mypy_path = "packages/schemas/src"
 # PyMuPDF, the OCR engines and OR-Tools ship no usable type information: PyMuPDF's
 # constructors are untyped, and pytesseract/paddleocr have no stubs at all. Their call
 # sites are still checked for our own types; only the library boundary is relaxed.
+# The OTLP exporter is imported lazily and its absence is a supported state — the API
+# starts, creates spans and drops them (services/api/src/telemetry.py). Without this,
+# type-checking would require an optional runtime dependency to be installed.
+[[tool.mypy.overrides]]
+module = ["opentelemetry.exporter.*"]
+ignore_missing_imports = true
+
 [[tool.mypy.overrides]]
 module = ["pdfplumber.*", "fitz.*", "pymupdf.*", "ortools.*", "pytesseract.*", "paddleocr.*", "PIL.*"]
 ignore_missing_imports = true

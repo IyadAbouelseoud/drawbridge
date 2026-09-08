@@ -40,6 +40,7 @@ from mcp_servers.mcp_docs.store import (
     StoreConfig,
     document_id_for,
 )
+from services.api.src.auth import authorise_tenant
 from services.api.src.config import get_settings
 from services.api.src.ledger import record
 from services.api.src.models import Document
@@ -154,6 +155,11 @@ async def store_batch(body: BatchRequest) -> dict[str, Any]:
     costs storage; a row pointing at a missing object breaks every later span lookup and
     is discovered during an audit.
     """
+    # First, before a single byte is written. `store.put` is a side effect on a bucket
+    # under the tenant's prefix, so authorising after it would let a rejected request
+    # leave an object behind under someone else's key.
+    tenant_id = authorise_tenant(body.tenant_id)
+
     store = _store()
     refs: list[DocumentRef] = []
 
@@ -168,7 +174,7 @@ async def store_batch(body: BatchRequest) -> dict[str, Any]:
                 ) from exc
             refs.append(
                 store.put(
-                    tenant_id=body.tenant_id,
+                    tenant_id=tenant_id,
                     kind=item.kind,
                     data=data,
                     suffix=_suffix(item.filename),
@@ -199,14 +205,14 @@ async def store_batch(body: BatchRequest) -> dict[str, Any]:
     def _work(session: Session) -> None:
         for ref in refs:
             before = session.get(Document, ref.document_id) is not None
-            _register(session, body.tenant_id, ref)
+            _register(session, tenant_id, ref)
             if before:
                 # Re-ingesting identical bytes is a no-op, and a ledger row saying a
                 # document arrived twice would misdescribe it as two documents.
                 continue
             record(
                 session,
-                tenant_id=body.tenant_id,
+                tenant_id=tenant_id,
                 event_type="document_ingested",
                 actor="pipeline",
                 subject=ref.kind.value,
@@ -219,10 +225,10 @@ async def store_batch(body: BatchRequest) -> dict[str, Any]:
                 },
             )
 
-    await in_thread(_work, body.tenant_id)
+    await in_thread(_work, tenant_id)
 
     return {
-        "tenant_id": str(body.tenant_id),
+        "tenant_id": str(tenant_id),
         "stored": [
             {
                 "document_id": str(ref.document_id),
@@ -257,6 +263,9 @@ async def run_extraction(body: ExtractionRequest) -> dict[str, Any]:
     an unreadable attachment among five is a reason to review that attachment, not to
     re-run extraction over four files that were fine.
     """
+    # Same reasoning as `/documents/batch`: the fetch loop below reads objects out of the
+    # tenant's prefix, so the token is checked before anything is read.
+    tenant_id = authorise_tenant(body.tenant_id)
     store = _store()
 
     def _work(session: Session) -> dict[str, Any]:
@@ -344,7 +353,7 @@ async def run_extraction(body: ExtractionRequest) -> dict[str, Any]:
             )
             record(
                 session,
-                tenant_id=body.tenant_id,
+                tenant_id=tenant_id,
                 event_type="extraction_run",
                 actor="pipeline",
                 subject=row.kind,
@@ -361,7 +370,7 @@ async def run_extraction(body: ExtractionRequest) -> dict[str, Any]:
 
         below = [r for r in results if r.get("readable") and r["confidence"]["score"] < body.floor]
         return {
-            "tenant_id": str(body.tenant_id),
+            "tenant_id": str(tenant_id),
             "documents": results,
             "floor": body.floor,
             "confidence_below_floor": len(below),
@@ -370,4 +379,4 @@ async def run_extraction(body: ExtractionRequest) -> dict[str, Any]:
             "confidences": [c.model_dump(mode="json") for c in confidences],
         }
 
-    return await in_thread(_work, body.tenant_id)
+    return await in_thread(_work, tenant_id)

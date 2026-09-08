@@ -51,6 +51,7 @@ import httpx
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from services.api.src.auth import SERVICE_SCOPE, mint
 from services.api.src.config import get_settings
 
 DEFAULT_API = "http://localhost:8000"
@@ -283,7 +284,23 @@ class Api:
     """Thin client. Never raises on a non-2xx; the caller decides what a status means."""
 
     def __init__(self, base: str) -> None:
-        self._client = httpx.Client(base_url=base.rstrip("/"), timeout=TIMEOUT)
+        # A service token, because this script plays the part n8n plays: one run, driving
+        # a named tenant through the pipeline. Minted locally against
+        # DRAWBRIDGE_JWT_SECRET; against a real Authentik there is no secret here and the
+        # token has to be supplied in DRAWBRIDGE_SERVICE_TOKEN instead.
+        token = os.environ.get("DRAWBRIDGE_SERVICE_TOKEN", "").strip()
+        if not token:
+            token = mint(
+                get_settings(),
+                subject="e2e-pipeline",
+                scopes=(SERVICE_SCOPE,),
+                ttl_seconds=1800,
+            )
+        self._client = httpx.Client(
+            base_url=base.rstrip("/"),
+            timeout=TIMEOUT,
+            headers={"Authorization": f"Bearer {token}"},
+        )
 
     def post(self, path: str, body: Any = None, **params: Any) -> tuple[int, Any]:
         response = self._client.post(path, json=body, params=params or None)

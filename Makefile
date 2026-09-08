@@ -1,4 +1,4 @@
-.PHONY: help up down logs ps build lint fmt type test check clean rls-bootstrap
+.PHONY: help up down logs ps build lint fmt type test check clean rls-bootstrap \n	token token-service pilot-seed
 
 help:
 	@echo "up      - bring the stack up"
@@ -10,6 +10,9 @@ help:
 	@echo "test    - pytest"
 	@echo "check   - lint + type + test"
 	@echo "rls-bootstrap - create drawbridge_app and grant it; run before up"
+	@echo "token TENANT=<uuid> - mint a local user token"
+	@echo "token-service - mint the cross-tenant token n8n carries"
+	@echo "pilot-seed  - seed both pilot tenants and write their trigger payloads"
 
 up:
 	docker compose up -d --build
@@ -47,6 +50,19 @@ check: lint type test
 # because the owner role bypasses every policy.
 rls-bootstrap:
 	uv run python scripts/rls_bootstrap.py
+
+token:
+	@test -n "$(TENANT)" || (echo 'usage: make token TENANT=<uuid>' && exit 2)
+	@uv run python scripts/mint_token.py --tenant $(TENANT)
+
+# Cross-tenant by design: one workflow runs whichever tenant its trigger names.
+# Put the output in DRAWBRIDGE_SERVICE_TOKEN and treat it accordingly.
+token-service:
+	@uv run python scripts/mint_token.py --service
+
+pilot-seed:
+	uv run python scripts/pilot_us.py --write-payload pilot/
+	uv run python scripts/pilot_ksa.py --write-payload pilot/
 
 clean:
 	docker compose down -v

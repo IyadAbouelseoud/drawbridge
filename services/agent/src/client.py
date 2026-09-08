@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ValidationError
 
+from services.api.src.telemetry import tracer
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -89,6 +91,37 @@ def _tool_input(response: Any) -> dict[str, Any]:
     raise AgentRefusedError(msg)
 
 
+def _call(
+    anthropic: Any,
+    *,
+    model: str,
+    system: str,
+    tool: dict[str, Any],
+    messages: list[dict[str, Any]],
+) -> Any:
+    """One model call, with every transport failure collapsed to one exception type.
+
+    Extracted from `generate` when the span went in: an unavailable model is a condition
+    the caller handles by leaving the memo undrafted, and the shape of the exception is
+    what it dispatches on.
+    """
+    try:
+        return anthropic.messages.create(
+            model=model,
+            max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE,
+            system=system,
+            tools=[tool],
+            tool_choice={"type": "tool", "name": "record_memo"},
+            messages=messages,
+        )
+    except AgentUnavailableError:
+        raise
+    except Exception as exc:
+        msg = f"the Anthropic API call failed: {exc}"
+        raise AgentUnavailableError(msg) from exc
+
+
 def generate[T: BaseModel](
     *,
     output_model: type[T],
@@ -120,23 +153,16 @@ def generate[T: BaseModel](
     ]
 
     last_error: ValidationError | None = None
+    span_maker = tracer("drawbridge.agent")
     for attempt in range(_MAX_ATTEMPTS):
-        try:
-            response = anthropic.messages.create(
-                model=model,
-                max_tokens=MAX_TOKENS,
-                temperature=TEMPERATURE,
-                system=system,
-                tools=[tool],
-                tool_choice={"type": "tool", "name": "record_memo"},
-                messages=messages,
-            )
-        except AgentUnavailableError:
-            raise
-        except Exception as exc:
-            msg = f"the Anthropic API call failed: {exc}"
-            raise AgentUnavailableError(msg) from exc
-
+        # One span per attempt rather than one per call: the retry exists because the
+        # model returned something the schema refused, and collapsing the two into one
+        # span would hide exactly the event worth seeing.
+        with span_maker.start_as_current_span("agent.generate") as span:
+            span.set_attribute("drawbridge.model", model)
+            span.set_attribute("drawbridge.output_model", output_model.__name__)
+            span.set_attribute("drawbridge.attempt", attempt + 1)
+            response = _call(anthropic, model=model, system=system, tool=tool, messages=messages)
         payload = _tool_input(response)
         try:
             return output_model.model_validate(payload)

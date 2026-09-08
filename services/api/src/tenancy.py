@@ -319,24 +319,39 @@ def tenant_of_resume_token(session: Session, token: str) -> UUID | None:
     return _lookup(session, "app_tenant_of_resume_token", token)
 
 
-def scope_to_claim(session: Session, claim_id: UUID) -> UUID:
+def _require(owner: UUID | None, expected: UUID | None, missing: str) -> UUID:
+    """The owner an identifier resolved to, checked against the one the caller may see.
+
+    Week 11 resolved the owner and scoped to it, which made a claim id sufficient to read
+    a claim — stated at the time as the exact size of the hole fail-closed semantics left.
+    `expected` is week 12 closing it: `auth.expected_tenant()` supplies the token's tenant,
+    and a mismatch raises the same error a missing row does.
+
+    The same error on purpose. Distinguishing "not yours" from "does not exist" turns a
+    guessed uuid into a membership oracle, and the caller cannot act on the difference.
+
+    None means no constraint, which is the service principal running the pipeline across
+    tenants — not an absent check.
+    """
+    if owner is None or (expected is not None and owner != expected):
+        raise TenantScopeError(missing)
+    return owner
+
+
+def scope_to_claim(session: Session, claim_id: UUID, expected: UUID | None = None) -> UUID:
     """Resolve a claim's owner and scope the session to it.
 
     Raises rather than returning None. A caller that reached here has a claim id and
     intends to act on it; continuing unscoped would produce an empty result that reads
     like "no such claim" whichever of the two it actually was.
     """
-    owner = tenant_of_claim(session, claim_id)
-    if owner is None:
-        raise TenantScopeError(f"no claim {claim_id}")
+    owner = _require(tenant_of_claim(session, claim_id), expected, f"no claim {claim_id}")
     set_tenant(session, owner)
     return owner
 
 
-def scope_to_review(session: Session, review_id: UUID) -> UUID:
-    owner = tenant_of_review(session, review_id)
-    if owner is None:
-        raise TenantScopeError(f"no review {review_id}")
+def scope_to_review(session: Session, review_id: UUID, expected: UUID | None = None) -> UUID:
+    owner = _require(tenant_of_review(session, review_id), expected, f"no review {review_id}")
     set_tenant(session, owner)
     return owner
 
@@ -348,7 +363,9 @@ async def _lookup_async(session: AsyncSession, function: str, key: object) -> UU
     return UUID(str(row)) if row else None
 
 
-async def scope_to_review_async(session: AsyncSession, review_id: UUID) -> UUID:
+async def scope_to_review_async(
+    session: AsyncSession, review_id: UUID, expected: UUID | None = None
+) -> UUID:
     """The async equivalent of `scope_to_review`, for the review routes.
 
     `POST /review/{id}/resolve` is addressed by review id alone — an analyst clicking a
@@ -356,17 +373,17 @@ async def scope_to_review_async(session: AsyncSession, review_id: UUID) -> UUID:
     `WHERE` then executes inside the tenant's scope. Without it the update would find any
     tenant's row by a guessed uuid.
     """
-    owner = await _lookup_async(session, "app_tenant_of_review", review_id)
-    if owner is None:
-        raise TenantScopeError(f"no review {review_id}")
+    resolved = await _lookup_async(session, "app_tenant_of_review", review_id)
+    owner = _require(resolved, expected, f"no review {review_id}")
     await set_tenant_async(session, owner)
     return owner
 
 
-async def scope_to_resume_token_async(session: AsyncSession, token: str) -> UUID:
+async def scope_to_resume_token_async(
+    session: AsyncSession, token: str, expected: UUID | None = None
+) -> UUID:
     """Scope by the token n8n polls with. The token *is* the credential on that path."""
-    owner = await _lookup_async(session, "app_tenant_of_resume_token", token)
-    if owner is None:
-        raise TenantScopeError("unknown token")
+    resolved = await _lookup_async(session, "app_tenant_of_resume_token", token)
+    owner = _require(resolved, expected, "unknown token")
     await set_tenant_async(session, owner)
     return owner

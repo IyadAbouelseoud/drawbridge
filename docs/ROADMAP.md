@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 11 |
+| Current week | 12 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | **The boundary** — Bayan templates, tenant offboarding, row-level isolation |
+| Current milestone | **The caller** — Authentik-shaped identity, traced writes, pilot corpora |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -27,7 +27,7 @@
 | 8–9 | n8n orchestration + HITL approval gates | End-to-end run with no manual intervention outside gates |
 | 9–10 | `packager`: 7551/7552/PSC/1520(d) + ZATCA refund request payload | Packet accepted by a licensed broker in each jurisdiction |
 | 10–11 | `mcp-ledger` + §163 recordkeeping posture | Any figure traceable to source span, four years later |
-| 11–12 | Multi-tenant hardening: RLS, Authentik, secrets, OTel | Second tenant onboarded with zero code change |
+| 11–12 | Multi-tenant hardening: RLS (wk 11) **then** Authentik on top of it (wk 12), secrets, OTel | Second tenant onboarded with zero code change |
 | 12–13 | Pilot: one US importer + one KSA re-exporter, backward-looking claims | Filed claim in each jurisdiction, refund in motion |
 | 14 | Broker white-label packaging + on-prem compose | Reproducible `.onprem.yml` deploy |
 
@@ -599,27 +599,175 @@ printable ASCII without backslashes first and the quote doubled second. Worth re
 because the obvious code passes a bind parameter, and it fails at runtime rather than at
 type-check time.
 
-## Week 12 entry checklist
+## Week 12 task breakdown
 
-1. **Full-volume corpus load** — the ~19,000-line USITC schedule and the CROSS body.
-   Carried from weeks 9, 10 and 11. It gates (2), and it is now the oldest open item.
-2. **Re-run the tariff benchmark against that corpus.** `vector_ceiling` 0.68 and
+- [x] `services/api/src/auth.py` — bearer verification, Authentik JWKS (RS256) or a local
+      shared secret (HS256), and the tenant claim that feeds week 11's `SET LOCAL tenant.id`
+- [x] `AuthMiddleware` on every route but `/health`, `/ready` and the schema endpoints
+- [x] `authorise_tenant` / `expected_tenant` — the token overrules the request body
+- [x] Authentik server and worker in compose behind an `identity` profile; Jaeger always on
+- [x] `services/api/src/telemetry.py` — one provider per process, exporter optional
+- [x] `audit_ledger.trace_id`, stamped and deliberately not hashed (migration c8e41b7f52d9)
+- [x] `tests/integration/test_tenant_isolation.py` — two users, two tenants, through HTTP
+- [x] `scripts/pilot_us.py`, `scripts/pilot_ksa.py`, `scripts/pilot_common.py`
+- [x] `scripts/mint_token.py`; n8n's HTTP nodes now send a bearer token
+
+### How this attaches to week 11, precisely
+
+Week 11 installed row-level policies comparing every row against `app_current_tenant()`,
+which reads a GUC the application sets per transaction. It ended by saying the control
+answers *which rows may this connection see* and that nothing answered *who is this caller*.
+
+That gap had a specific shape rather than a general one. The value in `tenant.id` came from
+the request body — `POST /claims/persist` scoped the transaction to `body.tenant_id` — so
+the policies were comparing each row against a number the caller supplied. Against an honest
+client that is isolation. Against a client that edits one field it is nothing, and Postgres
+cannot tell the difference: from its side both requests look like a correctly scoped
+connection.
+
+Authentik closes it at exactly one join. The `tenant_id` claim on a verified token becomes
+the argument to `tenancy.set_tenant`, and `auth.authorise_tenant` refuses a body that
+disagrees with it. Everything else about the two weeks is unchanged — same policies, same
+`drawbridge_app` role, same fail-closed GUC. What changed is the provenance of one value.
+
+The layering is what makes the milestone's "second tenant with zero code change" true.
+Authentik decides *who*, the token carries *which tenant*, and Postgres enforces *which
+rows*. Three mechanisms, and none of them is a filter in a query a developer has to remember
+to write.
+
+### The four identifier-addressed routes, closed
+
+Week 11 enumerated the entry points that hold an identifier and no tenant — `GET
+/claims/{id}`, `POST /packaging/build`, `POST /review/{id}/resolve`, `GET
+/review/pending/{token}` — gave each a `SECURITY DEFINER` owner lookup, and recorded the
+consequence: a caller holding a claim id could read that claim, because the lookup resolved
+the owner and scoped to it.
+
+`auth.expected_tenant()` is the constraint that was missing. The owner the lookup returns
+must equal the token's tenant or `tenancy._require` raises, and the route reports the same
+404 a nonexistent id gets. Same status, same body — distinguishing "not yours" from "does
+not exist" turns a guessed uuid into a membership oracle, and the caller cannot act on the
+difference anyway.
+
+It returns None for a service principal, which is a stated exemption rather than an absent
+check.
+
+### The service token is a cross-tenant credential, and it is not pretended otherwise
+
+n8n runs one workflow against whichever tenant its trigger names, and is addressed by claim
+id four times in a single run. Minting it a token per tenant would put tenant credentials in
+a workflow file; giving it none would put the API back where it started. So there are two
+principal shapes: a *user* bound to one tenant by its `tenant_id` claim, and a *service*
+carrying `drawbridge:service` and no tenant, which may act for any of them provided it names
+one.
+
+A token that is both is refused at `decode`, because "may this caller act for tenant X" would
+otherwise depend on which field the reader looked at first.
+
+This is the largest hole in the week, so it is written down rather than mitigated: anyone
+holding `DRAWBRIDGE_SERVICE_TOKEN` reads every tenant. It is minted by a separate command, it
+is the one credential in `.env.example` annotated as a cross-tenant breach, and
+`TestTheServiceTokenIsDeliberatelyDifferent` pins what it can do, so a change to that surface
+is visible rather than incidental.
+
+### The trace id is recorded and not hashed
+
+`audit_ledger.trace_id` ties a row an auditor reads in 2030 to the run that wrote it. It is
+not part of `entry_hash`, and the reason is what the digest is for: it covers what the row
+*asserts* — the event, its subject, its actor, the document behind it — and a trace id says
+where to look for how it happened.
+
+Hashing it would have cost two things and bought nothing. Artifacts exported by
+`tenant_offboard.py` before this migration would stop verifying against a chain recomputed
+after it, which is precisely the false positive that teaches people to ignore a
+tamper-evidence mechanism. And the same logical event replayed after a failure would hash
+differently, so a retry would read as a rewrite.
+
+The append-only triggers refuse `UPDATE` on this table, so the column can only ever be
+written by the `INSERT` that creates the row. A trace id cannot be attached after the fact,
+which is the property that keeps it honest.
+
+### Two things found by wiring it up
+
+**`FastAPIInstrumentor.instrument_app` in the lifespan does nothing.** Starlette builds its
+middleware stack once, so a middleware added at startup goes into a list nothing reads again.
+The first run produced spans for the single hand-written span in `/matching/run` and for no
+request at all — which looked like working instrumentation right up until the operation list
+was read and had one entry in it. Instrumentation now happens at module scope, last, which
+also makes the OpenTelemetry middleware outermost: a request rejected by auth still gets a
+span, and a burst of 401s is visible as one.
+
+**`/documents/batch` authorised after it had already written the object.** The handler puts
+each document into MinIO under the tenant's prefix and only then calls `in_thread`, so the
+first version of the tenant check ran after the side effect — a forged request was refused
+and left an object behind under someone else's key. The integration test caught it by failing
+on a MinIO connection error rather than on the assertion it was written for. Both document
+routes now authorise before touching the store. Worth recording because the check was in the
+right function and still in the wrong place.
+
+### What week 12 deliberately did not do
+
+- **Configure Authentik.** The containers are in compose behind an `identity` profile and the
+  API verifies RS256 against a JWKS URL, but no provider, application or property mapping is
+  scripted, and nothing has issued a real RS256 token to this API. The local HS256 path is
+  what the suite and the e2e exercise. Until a blueprint exists and one round trip has
+  actually happened, "Authentik integration" means the API is shaped to accept it.
+- **Put secrets anywhere but the environment.** `DRAWBRIDGE_JWT_SECRET`,
+  `DRAWBRIDGE_SERVICE_TOKEN` and `DRAWBRIDGE_APP_DB_PASSWORD` are environment variables with
+  development defaults. That was the third item in the week 11–12 milestone and it is the
+  one that did not land.
+- **Trace the MCP servers in the same trace as the API.** Each configures a provider and each
+  produces its own spans, but nothing propagates `traceparent` across the MCP transport, so
+  an analyst tool call is a separate trace from the request that prompted it.
+- **Rotate or expire anything.** Tokens carry an `exp` and nothing refreshes them; there is
+  no revocation list and no key rotation.
+- **Seed a pilot from real documents.** Both corpora are fiction and every figure in them
+  carries a `pilot-fixture` box that traces to no PDF. `pilot_common.assert_not_evidence`
+  exists so that nothing can quietly file one.
+
+### The KSA pilot cannot be five years old, and that is the statute
+
+The instruction was a five-year-old corpus in both jurisdictions. It works in the US lane:
+§1313(j) allows five years from import to export and §1313(r) three years from export to
+file, so 2021 entries exported in 2024 are still filable this year — which is the shape of a
+real backward-looking engagement, old imports and live money.
+
+It does not work in KSA. Common Customs Law Art. 174 bars any claim for duties paid more than
+three years ago, with no discretion, and `KSA_PROFILE` encodes it as an absolute bar. A 2021
+Saudi corpus does not produce a small refund; it produces zero, because every line is dead
+before the matcher sees it.
+
+So `pilot_ksa.py` defaults to the oldest duty payments still inside Art. 174, and keeps the
+literal five-year corpus behind `--time-barred` — because week 13 will need to show a
+customer *why* their older entries are gone, and a rejection nobody can reproduce is an
+assertion. Both corpora print their caveats rather than carrying them in a comment.
+
+## Week 13 entry checklist
+
+1. **Run a pilot corpus end to end.** `make pilot-seed` writes both trigger payloads and
+   nothing has yet pushed one through the pipeline. This is the week's own scaffolding, and
+   the first thing to spend.
+2. **An Authentik blueprint** — provider, application, and a property mapping that emits
+   `tenant_id` — plus one real RS256 round trip against the API. The API side is done; the
+   identity provider side is not configured at all.
+3. **Secrets out of the environment.** The last third of the week 11–12 milestone.
+4. **Full-volume corpus load** — the ~19,000-line USITC schedule and the CROSS body. Carried
+   from weeks 9, 10, 11 and 12; the oldest open item, and it gates (5).
+5. **Re-run the tariff benchmark against that corpus.** `vector_ceiling` 0.68 and
    `CONFIRMATION_LEXICAL_FLOOR` 0.20 were both measured against twenty-four lines.
-3. **A *Bayan* header-block template**, so a declaration number and an importer come off
-   the form alongside the line table. Partially blocked on **B3**.
-4. **Tenant profiles** — EIN, CR number, broker code, IBAN. Carried from weeks 9, 10 and
-   11, and now the last thing between the packager and a second tenant.
-5. **A live agent run against real queue rows.** Carried from week 8.
-6. **Import the workflows into n8n and run one for real.** Carried from weeks 9 and 10;
-   the Wait node's resume path is still asserted rather than observed. Note that the
-   workflows now run against connections that must carry a tenant scope.
-7. **A retention job**: `verify_chain` on a schedule, and an answer to where the ledger is
-   replicated. Carried from week 10.
-8. **Authentik, secrets and OTel** — the rest of the week 11–12 milestone. RLS answers
-   "which rows may this connection see"; none of it answers "who is this caller", which is
-   the other half of onboarding a second tenant.
-9. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text, **B3** a
-   real scanned *Bayan* corpus.
+6. **Tenant profiles** — EIN, CR number, broker code, IBAN. Carried from weeks 9–12, and
+   now concrete: two pilot tenants exist and neither has any of these, so the packager still
+   cannot address a second claimant.
+7. **A *Bayan* header-block template.** Partially blocked on **B3**.
+8. **Import the workflows into n8n and run one for real.** Carried from weeks 9, 10 and 11.
+   The HTTP nodes now send `DRAWBRIDGE_SERVICE_TOKEN`, which is asserted and not observed.
+9. **A live agent run against real queue rows.** Carried from week 8.
+10. **A retention job**: `verify_chain` on a schedule, and an answer to where the ledger is
+    replicated. Carried from weeks 10 and 11.
+11. **Propagate `traceparent` across the MCP transport**, so an analyst tool call joins the
+    trace of the request that prompted it.
+12. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text, **B3** a real
+    scanned *Bayan* corpus.
 
 ## Sequencing rationale
 
@@ -673,3 +821,13 @@ are enumerable, they turned out to be four, and each needed a decision rather th
 The one thing week 2 would have got right and week 11 nearly got wrong is the role: the
 control is worth nothing while the services connect as the owner, and that is not visible
 from the schema — only from the DSN.
+
+Identity (wk 12) after row-level security (wk 11) rather than before it, which is the reverse
+of the usual order and was the right way round here. Authentication first would have produced
+a verified caller with nowhere to put the answer: every query would still have filtered on a
+tenant id in application code, and the token would have been one more input to a filter
+somebody has to remember to write. Built second, it has exactly one job and one join —
+supply the value that goes into `tenant.id` — and the enforcement underneath it had already
+been proven against a second tenant. The evidence that the ordering was right is how small
+the week 12 diff is at the point where the two meet: one function, called at seven route
+entry points, and nothing in the policies changed at all.

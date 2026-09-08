@@ -26,6 +26,17 @@ x-python-base: &python-base
     DRAWBRIDGE_S3_SECRET_KEY: drawbridge
     DRAWBRIDGE_S3_BUCKET_DOCUMENTS: drawbridge-documents
     DRAWBRIDGE_S3_BUCKET_ARCHIVE: drawbridge-archive
+    # Spans go to Jaeger's OTLP/HTTP receiver. Empty would still be a working stack —
+    # the trace id reaches audit_ledger either way; see services/api/src/telemetry.py.
+    DRAWBRIDGE_OTEL_EXPORTER_ENDPOINT: http://jaeger:4318
+    # Identity. HS256 against a shared secret locally; point DRAWBRIDGE_OIDC_JWKS_URL at
+    # Authentik (profile `identity` below) to verify RS256 tokens instead, at which point
+    # the secret stops being consulted and nothing here can issue a token.
+    DRAWBRIDGE_AUTH_REQUIRED: "${DRAWBRIDGE_AUTH_REQUIRED:-true}"
+    DRAWBRIDGE_JWT_SECRET: ${DRAWBRIDGE_JWT_SECRET:-dev-only-change-me}
+    DRAWBRIDGE_JWT_ISSUER: drawbridge
+    DRAWBRIDGE_JWT_AUDIENCE: drawbridge-api
+    DRAWBRIDGE_OIDC_JWKS_URL: ${DRAWBRIDGE_OIDC_JWKS_URL:-}
   volumes:
     - ./services:/app/services:ro
     - ./mcp_servers:/app/mcp_servers:ro
@@ -122,12 +133,75 @@ services:
       GENERIC_TIMEZONE: America/New_York
       # n8n holds no business state. It fires transitions against mcp-claims.
       N8N_DIAGNOSTICS_ENABLED: "false"
+      # Every HTTP Request node sends this as a bearer token. It is a *service* token:
+      # cross-tenant by design, because one workflow runs whichever tenant its trigger
+      # names. Mint it with `make token-service` and treat it as the most valuable secret
+      # in the deployment — see services/api/src/auth.py.
+      DRAWBRIDGE_SERVICE_TOKEN: ${DRAWBRIDGE_SERVICE_TOKEN:-}
     volumes:
       - n8n-data:/home/node/.n8n
       - ./n8n/workflows:/workflows:ro
     ports: ["5678:5678"]
     depends_on:
       postgres: { condition: service_healthy }
+    restart: unless-stopped
+    networks: [drawbridge]
+
+  # ------------------------------------------------------------- observability
+  # all-in-one rather than a collector plus a backend: one container, OTLP in on 4318,
+  # UI out on 16686, and nothing persisted. Traces are for the last hour of debugging;
+  # what has to survive four years is in audit_ledger, and it carries the trace id.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # UI
+      - "4318:4318"    # OTLP/HTTP
+    restart: unless-stopped
+    networks: [drawbridge]
+
+  # ------------------------------------------------------------------ identity
+  # Behind a profile: `docker compose --profile identity up -d`. Authentik is two
+  # containers and wants a database and a cache of its own, which is a lot of stack to
+  # carry for a suite that verifies tokens against a shared secret. Bring it up when
+  # working on the OIDC path, then set DRAWBRIDGE_OIDC_JWKS_URL and restart the API.
+  #
+  # It reuses this Postgres instance through its own database (infra/postgres/init.sql)
+  # and Redis database 1, so nothing of Authentik's lands in the drawbridge schema.
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2025.2
+    profiles: [identity]
+    command: server
+    environment: &authentik-env
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: drawbridge
+      AUTHENTIK_POSTGRESQL__PASSWORD: drawbridge
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_REDIS__DB: 1
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:-dev-only-change-me}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD:-drawbridge}
+    volumes:
+      - authentik-media:/media
+    ports: ["9443:9000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+    networks: [drawbridge]
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2025.2
+    profiles: [identity]
+    command: worker
+    environment: *authentik-env
+    volumes:
+      - authentik-media:/media
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
     restart: unless-stopped
     networks: [drawbridge]
 
@@ -204,6 +278,7 @@ services:
       <<: *mcp-health
 
 volumes:
+  authentik-media:
   postgres-data:
   redis-data:
   minio-data:

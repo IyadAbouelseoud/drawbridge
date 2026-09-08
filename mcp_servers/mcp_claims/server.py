@@ -43,7 +43,9 @@ from services.api.src.analyst import (
     resolve_exception,
     transition_claim,
 )
+from services.api.src.config import get_settings
 from services.api.src.resume import resume_workflow
+from services.api.src.telemetry import configure_tracing
 
 server = MCPServer("mcp-claims")
 
@@ -363,6 +365,10 @@ def reopen(
 
 
 def main() -> None:
+    # A provider per process, so a tool call made on behalf of an API request lands in
+    # the same trace. Without an exporter configured the spans are created and dropped —
+    # see services/api/src/telemetry.py; the server starts either way.
+    configure_tracing("drawbridge-mcp-claims", endpoint=get_settings().otel_exporter_endpoint)
     # MCP SDK 2.x takes the bind address on run(), not on the constructor.
     server.run(transport="streamable-http", host="0.0.0.0", port=8104)
 

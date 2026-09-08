@@ -52,7 +52,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ tenant_id: $json.tenant_id, documents: $json.documents }) }}"
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $json.tenant_id, documents: $json.documents }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
+        }
       },
       "id": "store-documents",
       "name": "Store Documents",
@@ -76,7 +85,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, documents: $json.stored.map(function (d) { return d.document_id; }) }) }}"
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, documents: $json.stored.map(function (d) { return d.document_id; }) }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
+        }
       },
       "id": "extract",
       "name": "Extract",
@@ -113,7 +131,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ jurisdiction: $('Validate Payload').item.json.jurisdiction, lines: $('Validate Payload').item.json.imports.map(function (l) { return { line_id: l.line_id, description: l.description, declared_code: l.hts.code }; }) }) }}"
+        "jsonBody": "={{ JSON.stringify({ jurisdiction: $('Validate Payload').item.json.jurisdiction, lines: $('Validate Payload').item.json.imports.map(function (l) { return { line_id: l.line_id, description: l.description, declared_code: l.hts.code }; }) }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
+        }
       },
       "id": "classify",
       "name": "Classify",
@@ -150,7 +177,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ jurisdiction: $('Validate Payload').item.json.jurisdiction, imports: $('Validate Payload').item.json.imports, exports: $('Validate Payload').item.json.exports, as_of: $('Validate Payload').item.json.as_of }) }}"
+        "jsonBody": "={{ JSON.stringify({ jurisdiction: $('Validate Payload').item.json.jurisdiction, imports: $('Validate Payload').item.json.imports, exports: $('Validate Payload').item.json.exports, as_of: $('Validate Payload').item.json.as_of }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
+        }
       },
       "id": "match",
       "name": "Match",
@@ -174,7 +210,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ match_result: $json, confidences: $('Confidence Gate').item.json.confidences, as_of: $('Validate Payload').item.json.as_of }) }}"
+        "jsonBody": "={{ JSON.stringify({ match_result: $json, confidences: $('Confidence Gate').item.json.confidences, as_of: $('Validate Payload').item.json.as_of }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
+        }
       },
       "id": "triage",
       "name": "Triage",
@@ -198,7 +243,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, jurisdiction: $('Validate Payload').item.json.jurisdiction, imports: $('Validate Payload').item.json.imports, exports: $('Validate Payload').item.json.exports, matches: $('Match').item.json.matches, total_refund: $('Match').item.json.total_refund, requires_review: $('Triage').item.json.requires_review }) }}"
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, jurisdiction: $('Validate Payload').item.json.jurisdiction, imports: $('Validate Payload').item.json.imports, exports: $('Validate Payload').item.json.exports, matches: $('Match').item.json.matches, total_refund: $('Match').item.json.total_refund, requires_review: $('Triage').item.json.requires_review }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
+        }
       },
       "id": "persist-claim",
       "name": "Persist Claim",
@@ -253,7 +307,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, claim_id: $('Persist Claim').item.json.claim_id, workflow_run_id: $execution.id, items: $('Triage').item.json.items }) }}"
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, claim_id: $('Persist Claim').item.json.claim_id, workflow_run_id: $execution.id, items: $('Triage').item.json.items }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
+        }
       },
       "id": "suspend-for-analyst",
       "name": "Suspend For Analyst",
@@ -274,6 +337,15 @@
               "neverError": true
             }
           }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
         }
       },
       "id": "draft-analyst-memos",
@@ -302,7 +374,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// An analyst may approve, correct, reject or defer. Only the first two continue; a\n// rejected claim stops here with its reason recorded rather than proceeding quietly.\n// A deferred one also stops — it is still open, and the dispatcher will bring it back.\nconst r = $input.first().json;\nconst proceed = ['approved', 'corrected'].indexOf(r.resolution) !== -1;\nreturn [{ json: Object.assign({}, r, {\n  halt: !proceed,\n  next_state: proceed ? 'approved' : 'rejected',\n}) }];"
+        "jsCode": "// An analyst may approve, correct, reject or defer. Only the first two continue; a\n// rejected claim stops here with its reason recorded rather than proceeding quietly.\n// A deferred one also stops \u2014 it is still open, and the dispatcher will bring it back.\nconst r = $input.first().json;\nconst proceed = ['approved', 'corrected'].indexOf(r.resolution) !== -1;\nreturn [{ json: Object.assign({}, r, {\n  halt: !proceed,\n  next_state: proceed ? 'approved' : 'rejected',\n}) }];"
       },
       "id": "apply-resolution",
       "name": "Apply Resolution",
@@ -357,7 +429,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, to_state: 'approved', actor: 'pipeline', reason: 'pipeline run ' + $execution.id }) }}"
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, to_state: 'approved', actor: 'pipeline', reason: 'pipeline run ' + $execution.id }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
+        }
       },
       "id": "approve-claim",
       "name": "Approve Claim",
@@ -381,7 +462,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, to_state: 'rejected', actor: 'analyst', reason: $('Apply Resolution').item.json.resolution_note || 'analyst did not approve' }) }}"
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, to_state: 'rejected', actor: 'analyst', reason: $('Apply Resolution').item.json.resolution_note || 'analyst did not approve' }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
+        }
       },
       "id": "halt-claim",
       "name": "Halt Claim",
@@ -405,7 +495,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, claimant: $('Validate Payload').item.json.claimant, include_artifacts: false }) }}"
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, claimant: $('Validate Payload').item.json.claimant, include_artifacts: false }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
+        }
       },
       "id": "build-packet",
       "name": "Build Packet",
@@ -429,7 +528,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, to_state: 'packaged', actor: 'pipeline', reason: 'packet rendered by run ' + $execution.id }) }}"
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, to_state: 'packaged', actor: 'pipeline', reason: 'packet rendered by run ' + $execution.id }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
+        }
       },
       "id": "mark-packaged",
       "name": "Mark Packaged",

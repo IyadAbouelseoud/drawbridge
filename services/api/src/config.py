@@ -28,6 +28,29 @@ class Settings(BaseSettings):
     # lifecycle rules. See scripts/tenant_offboard.py.
     s3_bucket_archive: str = "drawbridge-archive"
 
+    # ------------------------------------------------------------------ identity
+    # Authentik issues the tokens in a deployment and this service only verifies them, so
+    # what is configured here is a key source and the three claims that must match.
+    #
+    # `auth_required` defaults on. Off is a development convenience and the API says so at
+    # startup, because a deployment with it off is indistinguishable from a working one
+    # from the outside: every request succeeds.
+    auth_required: bool = True
+    jwt_issuer: str = "drawbridge"
+    jwt_audience: str = "drawbridge-api"
+    jwt_tenant_claim: str = "tenant_id"
+    # RS256 against Authentik. Set this in any deployment.
+    oidc_jwks_url: str | None = None
+    # HS256 against a shared secret. Local only — the test suite and `make token` use it,
+    # and standing up an identity provider to run the suite would be its own dishonesty.
+    jwt_secret: str | None = None
+
+    # --------------------------------------------------------------- observability
+    # Empty means spans are created and dropped. See services/api/src/telemetry.py: the
+    # trace id reaches `audit_ledger` either way, so recordkeeping does not depend on a
+    # collector being up.
+    otel_exporter_endpoint: str = ""
+
     anthropic_api_key: str | None = None
     model_reasoning: str = "claude-opus-5"
     model_extraction: str = "claude-haiku-4-5-20251001"

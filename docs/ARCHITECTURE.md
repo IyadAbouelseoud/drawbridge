@@ -430,6 +430,7 @@ drawbridge/
 ├── packages/schemas/             # shared contracts incl. jurisdiction.py profiles
 ├── scripts/                      # ingest_tariff.py · embed_corpus.py · e2e_pipeline_test.py
 │                                 # rls_bootstrap.py · tenant_offboard.py (operator, owner DSN)
+│                                 # mint_token.py · pilot_us.py / pilot_ksa.py (wk 13 corpora)
 ├── tests/                        # unit · golden-claim fixtures · property-based rules
 │   └── fixtures/                 # tariff_benchmark.json · bayan.py (synthetic RTL table)
 └── infra/
@@ -1203,9 +1204,125 @@ having to remember. The rows stay exactly where 19 CFR §163 and GCC Art. 175 re
 
 - **Authenticate.** RLS answers which rows a connection may see. Nothing here answers who
   the caller is; that is Authentik, and it is the other half of onboarding a second tenant.
+  Week 12 supplies it — see §17.1 for exactly where the two join.
 - **Protect against the owner.** Stated rather than mitigated — see 16.4. Anyone holding
   the owner DSN reads every tenant, and the answer to that is secret management, not SQL.
 - **Verify an archived artifact from anywhere.** `verify_artifact` is written and tested and
   is not exposed to an auditor.
 - **Assemble a declaration from a template.** Typed cells and their provenance, yes; a whole
   `EntryLine` off a *Bayan*, not yet — that needs a header block and a real form.
+
+---
+
+## 17. The caller (week 12)
+
+### 17.1 Where this attaches
+
+§16.7 says row-level security answers which rows a connection may see and that nothing
+answers who the caller is. This is that, and it joins the week 11 machinery at one point:
+
+```
+Authentik / local issuer   who
+   -> JWT tenant_id claim  which tenant
+      -> set_tenant()      SET LOCAL tenant.id
+         -> RLS policy     which rows          (unchanged from week 11)
+```
+
+Before this, the value in `tenant.id` came out of the request body. The policies were
+comparing every row against a number the caller supplied, which is isolation from a client
+that fills in the form honestly and nothing at all from one that edits a field. Postgres
+cannot see the difference: both look like a correctly scoped connection.
+
+### 17.2 The middleware, and what it deliberately does not do
+
+`services/api/src/auth.py` verifies the bearer token and puts a `Principal` on a context
+variable for the duration of the request. It does **not** run `SET LOCAL tenant.id`.
+
+A request here does not hold one connection. It opens a session per unit of work — some
+async on `app.state`, some synchronous in a worker thread — and `SET LOCAL` is
+transaction-scoped by design, because a value set outside a transaction survives the
+connection's return to the pool and arrives on somebody else's next request. So the scope
+statement stays in `sync_session` and `set_tenant_async`, where the transaction is. What
+changed is where those callers get the tenant: `auth.authorise_tenant(body.tenant_id)`
+rather than `body.tenant_id`.
+
+A context variable rather than `request.state`, because the code that needs the answer is
+several layers down — `sync_session`, the packager, the agent worker — and threading a
+`Request` through them would put a web framework in the signature of the claim state
+machine.
+
+### 17.3 Two kinds of principal
+
+| | tenant claim | `drawbridge:service` | may act for | `expected_tenant()` |
+|---|---|---|---|---|
+| User | required | absent | its own tenant only | that tenant |
+| Service | forbidden | required | any tenant it names | None |
+
+A token carrying both is refused at `decode`. Resolving it either way would make "may this
+caller act for tenant X" depend on which field the reader looked at first, and there are two
+readers.
+
+The service principal exists because n8n runs one workflow against whichever tenant its
+trigger names, and is addressed by claim id four times in a single run. It is a cross-tenant
+credential and the most valuable secret in a deployment. Stated rather than mitigated — the
+same posture as §16.4 takes toward the owner DSN.
+
+### 17.4 Identifier-addressed routes
+
+§16.5 listed four entry points that hold an identifier and no tenant, gave each a
+`SECURITY DEFINER` owner lookup, and recorded that this made a claim id sufficient to read a
+claim. `expected_tenant()` supplies the constraint: `tenancy._require` compares the resolved
+owner against the token's tenant and raises `TenantScopeError` on a mismatch, which the
+routes already report as a 404.
+
+The same 404 a nonexistent id gets, with the same body. Distinguishing "not yours" from
+"does not exist" turns a guessed uuid into a membership oracle, and the caller cannot act on
+the difference.
+
+### 17.5 Authorise before the side effect
+
+`/documents/batch` and `/extraction/run` call `authorise_tenant` as their first statement,
+before `store.put` or any read. Both touch MinIO under the tenant's prefix, and a check that
+runs after the object is written refuses the request while leaving the object behind under
+someone else's key.
+
+The general form: the tenant check belongs before the first effect, not before the first
+database write. Being inside the right function is not the same as being in the right place.
+
+### 17.6 Tracing
+
+`services/api/src/telemetry.py` installs one provider per process. Every service configures
+one — the API at import, each MCP server in `main()`, the agent through the module it
+imports.
+
+**The exporter is optional and the tracing is not.** Without one, spans are created,
+sampled and dropped. The trace id still reaches `audit_ledger`, so the recordkeeping value
+does not depend on an observability container being up, and an API that refuses to start
+because Jaeger is down has traded a real dependency for an imaginary one. The import is
+lazy and its absence is logged.
+
+Instrumentation is installed at module scope and last. Starlette builds its middleware
+stack once, so `instrument_app` in a lifespan hook adds a middleware to a list nothing reads
+again; last means the OpenTelemetry middleware is outermost, so a request rejected by auth
+still produces a span.
+
+`audit_ledger.trace_id` is stamped by `ledger.record` and is **not** part of `entry_hash`.
+The digest covers what the row asserts; a trace id says where to look for how it happened.
+Hashing it would break verification of artifacts exported before the column existed, and
+would make a retry of one logical event read as a rewrite. The append-only triggers refuse
+`UPDATE`, so the id can only be written by the `INSERT` that creates the row.
+
+Not yet propagated across the MCP transport: an analyst tool call is its own trace.
+
+### 17.7 What this does not do
+
+- **Authenticate against Authentik.** The containers are in compose behind an `identity`
+  profile and the API verifies RS256 against a JWKS URL, but no provider or property mapping
+  is scripted and no RS256 token has ever reached this API. The exercised path is local
+  HS256. The API is shaped to accept Authentik; it has not met it.
+- **Manage a secret.** `DRAWBRIDGE_JWT_SECRET`, `DRAWBRIDGE_SERVICE_TOKEN` and
+  `DRAWBRIDGE_APP_DB_PASSWORD` are environment variables with development defaults.
+- **Authorise anything but the tenant.** There are no roles: every user principal for a
+  tenant can do everything to that tenant. An analyst and a read-only auditor are the same
+  caller.
+- **Revoke or rotate.** Tokens expire and nothing refreshes or revokes them.

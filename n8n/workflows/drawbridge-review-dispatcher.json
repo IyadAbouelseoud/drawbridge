@@ -1,7 +1,7 @@
 {
   "name": "drawbridge-review-dispatcher",
   "meta": {
-    "description": "Polls the review queue, drafts pre-analysis for anything still undrafted, and escalates. Deadline-driven: an exception whose filing window is closing deserves more attention than an older one whose window is open. The drafting sweep is a backstop for rows queued outside a pipeline run — the error workflow queues some — and is a no-op for rows the pipeline already drafted."
+    "description": "Polls the review queue, drafts pre-analysis for anything still undrafted, and escalates. Deadline-driven: an exception whose filing window is closing deserves more attention than an older one whose window is open. The drafting sweep is a backstop for rows queued outside a pipeline run \u2014 the error workflow queues some \u2014 and is a no-op for rows the pipeline already drafted."
   },
   "settings": {
     "executionOrder": "v1"
@@ -37,6 +37,15 @@
               "neverError": true
             }
           }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
         }
       },
       "id": "fetch-open-queue",
@@ -58,6 +67,15 @@
               "neverError": true
             }
           }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+            }
+          ]
         }
       },
       "id": "draft-missing-memos",
