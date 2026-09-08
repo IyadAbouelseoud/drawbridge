@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 6 |
+| Current week | 7 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | Packager, nested BOM explosion, tariff corpora, Fasah probe |
+| Current milestone | Embedding pass, OCR gating, ERP BOM source, PSC + §1520(d) |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -120,22 +120,81 @@ carries the reason and blocks the packet.
 fills a real template through `pdf.fill_template` where a tenant has one on file, and
 otherwise renders a transcription that says on its face that it is not a CBP-issued form.
 
-## Week 7 entry checklist
+## Blocked on external acquisition — off the automated critical path
 
-1. **Live Fasah sandbox test** — `COMPLIANCE-GCC.md` §8.2 and §9. The payloads are built
-   and the four questions are written down; what is missing is broker credentials.
-2. **Arabic text of ZATCA Resolution 28624** — §8.4. Every public route 404s or 500s;
-   needs a direct request to ZATCA or the Umm Al-Qura print archive. When it arrives, the
-   article numbers go into `services/packager/src/citations.py` and nothing else changes.
-3. **Real corpus volume.** The ingest path is proven end-to-end against real-shaped
-   exports; what has not been loaded is the full USITC schedule (~19,000 lines) and the
-   CROSS body. Also unwritten: the embedding pass, so vector search stays dark until the
-   `embedding` column is populated.
-4. **Real OCR execution path** against a scanned *Bayan* corpus, to tune the confidence
-   floor.
-5. **ERP integration** to source nested BOMs. The model and the solver handle depth now;
-   nothing yet reads a real multi-level bill of materials out of a customer system.
-6. **PSC and §1520(d)** renderers — the two US lanes the packager does not yet cover.
+Two items cannot be closed by any amount of engineering. Both were carried as checklist
+entries through weeks 5 and 6 on the assumption that another routing attempt might work;
+that assumption is now retired. They move here, and the roadmap stops pretending a build
+step will reach them.
+
+### B1. Fasah sandbox credentials
+
+**Status: requires a commercial relationship, not a request.** The Tabadul/Fasah sandbox
+issues credentials to registered customs brokers against a Saudi commercial registration.
+There is no self-service developer signup, and no public endpoint answers without one.
+
+Acquisition routes, in the order worth trying:
+
+1. **Engage a licensed broker in Jeddah or Riyadh** and probe under their credentials.
+   This is the intended route regardless — Drawbridge never files, so a broker
+   relationship is a prerequisite for the KSA lane going live, not an extra cost.
+2. Apply to Tabadul directly as an integrating party once a Saudi entity exists.
+3. A logistics provider already integrated with Fasah, as a sponsoring partner.
+
+`scripts/fasah_sandbox_probe.py` is finished and waiting: four payloads, four questions,
+`--curl` prints the commands. It needs an hour of a credentialed operator's time and
+nothing else.
+
+**Until then:** `PartialConsignmentBehaviour.UNDETERMINED` holds, partial-shipment claims
+route to `ANALYST_REVIEW`, and no code depends on the answer.
+
+### B2. ZATCA Resolution 28624 article numbers
+
+**Status: requires a document, not a URL.** Every published route failed
+(`COMPLIANCE-GCC.md` §8.4): ZATCA's own PDF 404s, the Umm Al-Qura issue page 500s, its
+decisions page carries the operative text as an unlinked attachment, the istitlaa
+consultation copy resets, two aggregators 503.
+
+Acquisition routes:
+
+1. **Academic legal databases** carrying the Umm Al-Qura gazette — a Saudi or Gulf
+   university law library, or a subscription service indexing the gazette in Arabic.
+2. **A local customs broker or Saudi trade-law practice**, which will hold the operative
+   text as working material.
+3. **The Umm Al-Qura print archive** by direct request, or ZATCA by written enquiry.
+
+**Until then:** every ZATCA procedural citation is an `ANALYST_REVIEW` placeholder that
+blocks transmission, and the packet says why (`COMPLIANCE-GCC.md` §8.4.1). This is a
+stable resting state, not a temporary patch — the operative constants all come from the
+GCC Common Customs Law, which is transcribed and authoritative. Closing B2 is one edit to
+`services/packager/src/citations.py`.
+
+## Week 7 task breakdown
+
+- [x] Embedding pass: batched, resumable, pluggable backend; `pgvector` columns populated
+      for USITC, ZATCA and CROSS
+- [x] OCR confidence gating: per-token floor, per-field aggregate, hard rejection before
+      the matcher sees a figure
+- [x] `services/ingest/erp_mock.py`: deeply nested BOM source feeding the week 6
+      recursive CP-SAT matcher
+- [x] PSC (19 CFR §141.11) and §1520(d) renderers in `services/packager`
+
+## Week 8 entry checklist
+
+1. **Full-volume corpus load.** The embedding pass is proven; what remains is downloading
+   the ~19,000-line USITC schedule and the CROSS body and running it. Bounded by download
+   and compute, not by design.
+2. **A real embedding backend.** `services/classifier/src/embeddings.py` ships a
+   deterministic hashing vectorizer and an Ollama client. The hashing backend is honest
+   about being lexical-only; a semantic backend needs a model endpoint decision.
+3. **Real scanned *Bayan* corpus** to calibrate the OCR floor against measured error
+   rather than a defensible default.
+4. **A real ERP connector.** `erp_mock.py` fixes the contract — SAP/Oracle field shapes,
+   multi-level explosion, yield and scrap. Swapping in a live connector changes the
+   source, not the shape.
+5. **The agent layer** (weeks 9-10): Claude scoped to exactly the residue the rules
+   engine cannot decide.
+6. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text.
 
 ## Sequencing rationale
 

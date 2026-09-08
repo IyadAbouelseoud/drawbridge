@@ -550,3 +550,93 @@ legal description of goods on every packet quoting the line.
 
 Ingest reads a downloaded file, never a live endpoint. A corpus assembled by a network call
 is reproducible only for as long as the publisher keeps the URL alive.
+
+
+---
+
+## 12. Week 7 additions
+
+### 12.1 Embeddings — a choice, not a default
+
+`services/classifier/src/embeddings.py` makes the backend configurable rather than baked
+in, because a corpus embedded with one model and queried with another produces confident
+nonsense: cosine distance between two embedding spaces is meaningless, not merely
+inaccurate. Every backend carries `model_id`, and a corpus is queryable only by the backend
+that wrote it.
+
+`HashingEmbedder` is deterministic character-trigram projection — offline, reproducible
+forever, and **lexical**. It reports `is_semantic = False` so nothing presents it as
+semantic search. It exists to make the whole ingest-and-search path exercisable end to end
+before a model endpoint is chosen. `OllamaEmbedder` is the real one, local by choice: a
+classification that reached a filing must be reproducible without a third-party API still
+being alive, and tenant document text should not leave the deployment.
+
+`scripts/embed_corpus.py` selects only rows with a NULL embedding, so it is resumable by
+construction and a second run over a finished corpus is a no-op. `FOR UPDATE SKIP LOCKED`
+lets two workers share a corpus without blocking or double-writing. It never prints a
+vector.
+
+### 12.2 OCR: recognition and acceptance are different steps
+
+Nothing used to stand between the OCR engine and the matcher, which meant a
+43%-confidence digit could become a filed figure. `ocr.gate` now decides what may leave
+extraction, against three deliberately different thresholds:
+
+| Threshold | Value | What it catches |
+|---|---|---|
+| `OCR_CONFIDENCE_FLOOR` | 0.90 | A single unreliable token |
+| `OCR_FIELD_FLOOR` | 0.85 | A field where *nothing* failed and *everything* is mediocre — the ordinary shape of a bad scan |
+| `OCR_NUMERIC_FLOOR` | 0.95 | A digit, held stricter than a letter |
+
+The numeric asymmetry is the point. A misread letter in a goods description is a defect an
+analyst corrects by eye; a misread digit in a duty amount is a wrong number filed with a
+customs authority. So a low-confidence *word* is `REVIEW` and a low-confidence *digit* is
+`REJECT` — it never reaches the matcher in any form.
+
+The field mean is weighted by character count, so a one-character fragment at 0.99 cannot
+carry a twelve-character amount at 0.80 over the line. A numeric field carrying letters
+from a second script is rejected outright: it means the engine merged an adjacent label
+into the value, and the number that survives that is not the number on the document.
+
+**0.90 is conservative, not measured.** Tuning needs a labelled scanned *Bayan* corpus,
+which does not exist yet. At 0.90 the pipeline over-rejects, and over-rejection costs
+analyst time while under-rejection costs a misfiled claim. `OcrConfig` carries the floors
+per tenant, so calibration is a config change.
+
+### 12.3 ERP-sourced nested bills
+
+An ERP does not return a tree. SAP's CS_BOM_EXPL and Oracle's BOM_COMPONENTS both return a
+flat parent-child list, and `services/ingest/src/erp_mock.py` reconstructs the tree from
+it. Three things that list does, all handled rather than assumed away:
+
+- **Scrap, not yield.** ERPs record 5% scrap, not 0.95 yield. Backwards, every level
+  understates consumption, compounding with depth.
+- **Phantom assemblies.** A grouping level never stocked or built. It has no imported
+  article behind it, so it collapses into its parent with its quantity multiplied through
+  — leaving it in place would create a designation level with nothing importable under it.
+- **Cycles.** A part listed as its own ancestor. Fatal, not truncated: cutting the loop
+  would yield a plausible multiplier from an incoherent bill.
+
+The mock is keyed by `(tenant, part)`. A mock that ignored tenancy would pass every test
+and then leak one customer's bill into another's claim the day a real connector replaced it.
+
+### 12.4 The two US lanes that are not drawback
+
+Drawback recovers duty on goods that left. These recover duty never owed.
+
+**PSC (19 CFR §141.11).** There is no paper form — a PSC is transmitted through ABI as a
+full replacement entry summary, so the output is the structured payload plus a human
+summary for authorisation. Its deadline is the **earlier** of 300 days from entry and 15
+days before liquidation; liquidation usually binds first, and an offset-only check calls
+claims timely that CBP will refuse. A correction that *increases* duty is a valid PSC and
+is refused here, because presenting an amount owed as an amount recoverable would misstate
+the claim.
+
+**§1520(d).** A written post-importation preference claim, so it renders as a document as
+well as a payload. One year from importation, no extension. The preferential rate is not
+assumed to be zero — several agreements phase rates down rather than to nothing — and a
+line with no certification of origin on file is named on the claim itself, because filing
+without it is a claim CBP will deny and the year cannot be reclaimed.
+
+`PacketRequest.lane` now routes. The router refuses the two alternates with a pointer
+rather than rendering a 7551, since a 7551 for a PSC is a coherent form for the wrong claim.

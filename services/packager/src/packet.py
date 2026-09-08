@@ -19,6 +19,7 @@ from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
+from drawbridge_schemas.claim import RecoveryLane
 from drawbridge_schemas.jurisdiction import Currency, Jurisdiction
 from services.packager.src.citations import Citation, open_citations
 
@@ -104,6 +105,14 @@ class PacketRequest:
     period_end: date
     filing_deadline: date
     prepared_on: date
+
+    lane: RecoveryLane = RecoveryLane.DRAWBACK
+    """Which statutory recovery path this packet is for.
+
+    Drawback is the default because it is the only lane whose rendering needs nothing
+    beyond this object. The two US alternates carry lane-specific input — the entry being
+    corrected, the agreement claimed — so the router directs them rather than rendering
+    a 7551 for a claim that is not a drawback claim."""
 
     drawback_provision: str = ""
     """US only: the §1313 subsection claimed, printed on the 7551."""
