@@ -324,14 +324,31 @@ class TestHtsTools:
             assert candidate["code"].isdigit()
             assert candidate["matched_by"] in {"lexical", "vector", "both"}
 
-    def test_a_lexical_only_hit_does_not_demand_analyst_confirmation(self) -> None:
-        """A vector-only hit is a suggestion; a trigram match on published text is not."""
+    def test_a_lexical_hit_is_confirmed_exactly_when_it_clears_the_floor(self) -> None:
+        """A vector-only hit is a suggestion; a strong trigram match on published text is not.
+
+        Rewritten in week 13, when the corpus went from nine lines to 28,899. The previous
+        form asserted that *no* lexical candidate ever needs confirmation, which held only
+        because nine lines could not produce a weak tail: at volume `classify` returns ten
+        candidates and the last four score under 0.19, which is exactly the case the floor
+        exists to catch. The old assertion also passed vacuously on an empty result.
+
+        What is actually contracted is that the flag tracks the floor carried on the hit —
+        not the constant, because a stored classification has to stay explicable against
+        the threshold that was in force when it was made.
+        """
         from mcp_servers.mcp_hts import server as hts
 
         result = hts.classify(description="portable data processing machines")
-        for candidate in result["candidates"]:
-            if candidate["matched_by"] == "lexical":
-                assert candidate["needs_analyst_confirmation"] is False
+        lexical = [c for c in result["candidates"] if c["matched_by"] == "lexical"]
+        assert lexical, "no lexical candidate at all; the trigram index is not answering"
+        assert any(not c["needs_analyst_confirmation"] for c in lexical), (
+            "every lexical hit needs confirmation; published tariff text should match "
+            "published tariff language"
+        )
+        for candidate in lexical:
+            clears = candidate["lexical_score"] >= candidate["confirmation_lexical_floor"]
+            assert candidate["needs_analyst_confirmation"] is not clears
 
     def test_lookup_of_an_absent_code_reports_not_found(self) -> None:
         from mcp_servers.mcp_hts import server as hts

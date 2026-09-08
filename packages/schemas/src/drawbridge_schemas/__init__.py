@@ -37,6 +37,7 @@ from drawbridge_schemas.provenance import (
     Provenance,
     Span,
 )
+from drawbridge_schemas.tenant import TenantProfile, iban_checksum_ok
 from drawbridge_schemas.trade import (
     EntryLine,
     ExportLine,
@@ -76,7 +77,9 @@ __all__ = [
     "RecoveryLane",
     "RefundLine",
     "Span",
+    "TenantProfile",
     "ValuationBasis",
+    "iban_checksum_ok",
     "profile_for",
 ]
 

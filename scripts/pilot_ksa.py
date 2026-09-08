@@ -34,6 +34,7 @@ from pathlib import Path
 
 from drawbridge_schemas.jurisdiction import Currency, Jurisdiction
 from drawbridge_schemas.provenance import DocumentKind, Language
+from drawbridge_schemas.tenant import TenantProfile
 from drawbridge_schemas.trade import EntryLine, ExportLine, HTSCode, ValuationBasis
 from scripts.pilot_common import (
     PilotCorpus,
@@ -48,10 +49,29 @@ from scripts.pilot_common import (
     trigger_payload,
 )
 
+_SLUG = "ksa-alrajhi-logistics"
+
 TENANT = PilotTenant(
-    slug="ksa-alrajhi-logistics",
+    slug=_SLUG,
     name="Al-Rajhi Regional Logistics Co. (pilot)",
     jurisdiction="ksa",
+    # The IBAN is the field that matters here and it is a real mod-97 check digit over a
+    # fictional account: ZATCA settles an approved refund to this number, so a corpus
+    # carrying one that fails validation would exercise the validator instead of the
+    # payment instruction. 24 characters, as every Saudi IBAN is.
+    profile=TenantProfile(
+        tenant_id=pilot_uuid("tenant", _SLUG),
+        legal_name="Al-Rajhi Regional Logistics Co.",
+        cr_number="4030298871",
+        vat_number="310298871400003",
+        iban="SA0380000000608010167519",
+        address_line1="Al-Rawdah District, King Abdulaziz Road",
+        city="Jeddah",
+        postal_code="23434",
+        country="SA",
+        contact_email="customs@alrajhi-logistics.example",
+        contact_phone="+966-12-555-0177",
+    ),
 )
 
 ENTRY_FIGURES = ("quantity", "entered_value", "duty_paid", "vat_paid")
@@ -147,12 +167,44 @@ def _export(
     )
 
 
-def build_corpus(*, time_barred: bool = False) -> PilotCorpus:
+# Offsets from the filing date, in days. Every KSA date is derived rather than written
+# down, and that is a correction rather than a preference.
+#
+# Week 12 wrote literal dates and never ran the corpus through the rules engine. By the
+# time week 13 did, the clean re-export was 461 days behind the filing date and Art. 16
+# §3(b) had closed on it — so the corpus asserted a recoverable SAR 54,687.50 that no
+# filing date could actually produce. The GCC lane cannot hold fixed dates: six months
+# from re-export to filing means any literal corpus expires within two quarters of being
+# written, and expires silently.
+#
+# The three gates, and where each offset sits inside it:
+#   Art. 174        duty paid within 3 years of filing      210 days  (of 1095)
+#   Art. 16 §3(a)   re-exported within 1 year of payment     90 days  (of 365)
+#   Art. 16 §3(b)   filed within 6 months of re-export      120 days  (of ~182)
+_DUTY_PAID_AGO = 210
+_REEXPORT_AGO = 120
+
+# The second declaration exists to fail §3(a) and only §3(a): paid 500 days before filing,
+# re-exported on the same day as the others, which is 380 days after payment — outside the
+# one-year window while still inside the six-month filing window. A line that failed two
+# gates would not show which one did the work.
+_LATE_DUTY_PAID_AGO = 500
+
+
+def build_corpus(*, time_barred: bool = False, as_of: date | None = None) -> PilotCorpus:
     """Two declarations, three re-exports, one below the Art. 16 §2 minimum.
 
-    `time_barred` shifts every date back four years, which puts the duty payments outside
-    Art. 174 and should produce a claim of zero with a stated reason.
+    Dates are relative to `as_of`, the date the claim would be filed on. See the offsets
+    above for why: a GCC corpus with literal dates goes stale in a quarter.
+
+    `time_barred` moves the duty payments back beyond four years, outside Art. 174, and
+    should produce a claim of zero with the article named in the rejection.
     """
+    today = as_of or date.today()
+
+    def ago(days: int) -> date:
+        return date.fromordinal(today.toordinal() - days)
+
     shift = 4 * 365 if time_barred else 0
 
     def back(value: date) -> date:
@@ -162,7 +214,7 @@ def build_corpus(*, time_barred: bool = False) -> PilotCorpus:
         _entry(
             declaration="21001-2024-0447213",
             line_number=1,
-            duty_payment=back(date(2024, 11, 12)),
+            duty_payment=back(ago(_DUTY_PAID_AGO)),
             hts="847130000",
             description="حاسبات آلية محمولة / Portable computers",
             quantity=Decimal("3000"),
@@ -172,7 +224,7 @@ def build_corpus(*, time_barred: bool = False) -> PilotCorpus:
         _entry(
             declaration="21001-2024-0447213",
             line_number=2,
-            duty_payment=back(date(2024, 11, 12)),
+            duty_payment=back(ago(_DUTY_PAID_AGO)),
             hts="844331000",
             description="طابعات / Printers",
             quantity=Decimal("850"),
@@ -182,7 +234,7 @@ def build_corpus(*, time_barred: bool = False) -> PilotCorpus:
         _entry(
             declaration="21001-2025-0113988",
             line_number=1,
-            duty_payment=back(date(2025, 2, 26)),
+            duty_payment=back(ago(_LATE_DUTY_PAID_AGO)),
             hts="852852000",
             description="شاشات عرض / Display monitors",
             quantity=Decimal("1250"),
@@ -192,12 +244,13 @@ def build_corpus(*, time_barred: bool = False) -> PilotCorpus:
     )
 
     exports = (
-        # Seven months after payment: inside the one-year re-export window, and filed
-        # inside the six months that then start running.
+        # 90 days after payment: inside the one-year re-export window, and filed 120
+        # days later, inside the six months that then start running. The only line in the
+        # corpus that clears all three gates.
         _export(
             reference="RX-2025-0091447",
             line_number=1,
-            export_date=back(date(2025, 6, 4)),
+            export_date=back(ago(_REEXPORT_AGO)),
             hts="847130000",
             description="حاسبات آلية محمولة معاد تصديرها دون استعمال",
             quantity=Decimal("1400"),
@@ -211,7 +264,7 @@ def build_corpus(*, time_barred: bool = False) -> PilotCorpus:
         _export(
             reference="RX-2025-0091448",
             line_number=1,
-            export_date=back(date(2025, 6, 4)),
+            export_date=back(ago(_REEXPORT_AGO)),
             hts="844331000",
             description="طابعات معاد تصديرها دون استعمال",
             quantity=Decimal("60"),
@@ -219,11 +272,12 @@ def build_corpus(*, time_barred: bool = False) -> PilotCorpus:
             linked_declaration="21001-2024-0447213",
             destination="BH",
         ),
-        # Outside Art. 16 §3(a): re-exported fourteen months after the duty was paid.
+        # Outside Art. 16 §3(a): re-exported 380 days after the duty was paid. Filed
+        # inside the six-month window, so §3(a) is the only gate this line fails.
         _export(
             reference="RX-2026-0044120",
             line_number=1,
-            export_date=back(date(2026, 4, 30)),
+            export_date=back(ago(_REEXPORT_AGO)),
             hts="852852000",
             description="شاشات عرض معاد تصديرها دون استعمال",
             quantity=Decimal("500"),

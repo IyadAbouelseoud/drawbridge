@@ -28,6 +28,7 @@ from pathlib import Path
 
 from drawbridge_schemas.jurisdiction import Currency, Jurisdiction
 from drawbridge_schemas.provenance import DocumentKind, Language
+from drawbridge_schemas.tenant import TenantProfile
 from drawbridge_schemas.trade import EntryLine, ExportLine, HTSCode
 from scripts.pilot_common import (
     PilotCorpus,
@@ -42,10 +43,29 @@ from scripts.pilot_common import (
     trigger_payload,
 )
 
+_SLUG = "us-northbridge"
+
 TENANT = PilotTenant(
-    slug="us-northbridge",
+    slug=_SLUG,
     name="Northbridge Trading LLC (pilot)",
     jurisdiction="us",
+    # Fictional and structurally valid, which is the combination that matters: the EIN
+    # matches the format CBP prints on a 7551 and the broker code is three characters, so
+    # the packager exercises its real path rather than its validation errors. `95-` is a
+    # California prefix, consistent with the Long Beach entries below.
+    profile=TenantProfile(
+        tenant_id=pilot_uuid("tenant", _SLUG),
+        legal_name="Northbridge Trading LLC",
+        ein="95-4417293",
+        broker_code="J7K",
+        address_line1="4400 Harbor Scenic Drive",
+        address_line2="Suite 210",
+        city="Long Beach",
+        postal_code="90802",
+        country="US",
+        contact_email="trade.compliance@northbridge.example",
+        contact_phone="+1-562-555-0148",
+    ),
 )
 
 ENTRY_FIGURES = (
@@ -211,9 +231,20 @@ def build_corpus() -> PilotCorpus:
 
     # Duty at risk over the two lines still inside the filing window, allocated pro rata
     # on quantity. Stated so week 13 has a number to reproduce rather than a number to
-    # accept; the matcher computes the real allocation and the two should agree.
-    computer_share = Decimal("250000.00") * Decimal("1600") / Decimal("4000")
-    printer_share = Decimal("75000.00") * Decimal("450") / Decimal("1200")
+    # accept; the matcher computes the real allocation and the two must agree to the cent.
+    #
+    # **The merchandise processing fee is part of the base.** Week 12 wrote this figure
+    # from the Section 301 duty alone and never ran the corpus, so the omission stood: MPF
+    # is a fee collected on entry and refundable on a drawback claim
+    # (19 U.S.C. §1313(l), and Ford Motor Co. v. United States on the principle), so a
+    # base that leaves it out under-states the claim by the one component a client is
+    # least likely to have counted themselves. The matcher was right and the corpus was
+    # wrong, which is the direction that would have been caught last week by running it.
+    def _share(duty: Decimal, mpf: Decimal, designated: str, entered: str) -> Decimal:
+        return (duty + mpf) * Decimal(designated) / Decimal(entered)
+
+    computer_share = _share(Decimal("250000.00"), Decimal("3456.00"), "1600", "4000")
+    printer_share = _share(Decimal("75000.00"), Decimal("1036.80"), "450", "1200")
 
     return PilotCorpus(
         tenant=TENANT,

@@ -73,14 +73,29 @@ class TariffLine(Base):
     description_ar: Mapped[str | None] = mapped_column(Text)
     """ZATCA publishes bilingually; USITC does not. Null for US lines."""
 
+    search_text: Mapped[str | None] = mapped_column(Text)
+    """The same chain, leaf-first and truncated — what gets embedded.
+
+    Separate from `description_en` because the two are read by different things. A person
+    needs the chain root-first or a line reading "Other" is meaningless; an embedding
+    needs the leaf first or the shared chapter heading drowns it. Null falls back to the
+    description, which is right for ZATCA: one leaf per row, no hierarchy to flatten.
+    See migration f2b90d47ac13 for the measurement behind it."""
+
     unit_of_quantity: Mapped[str | None] = mapped_column(String(24))
-    duty_rate_general: Mapped[str | None] = mapped_column(String(64))
+    duty_rate_general: Mapped[str | None] = mapped_column(Text)
     """Kept as published text, not parsed to a number. Rates are expressed as
     '2.5%', 'Free', '6.5c/kg', and compound forms; parsing them to a float would lose
-    the specific and compound cases silently."""
+    the specific and compound cases silently.
 
-    duty_rate_special: Mapped[str | None] = mapped_column(String(255))
-    duty_rate_column2: Mapped[str | None] = mapped_column(String(64))
+    `Text`, not `String(64)`, since week 13. The width was set against a hand-built
+    fixture where every rate read 'Free' or '2.5%'. The published schedule carries rates
+    that run to 439 characters — sugar under general note 15, and the tobacco lines that
+    recite an entire in-lieu-of formula — and 105 of them overflowed. A published rate is
+    prose with no natural bound, so it gets the type that has none."""
+
+    duty_rate_special: Mapped[str | None] = mapped_column(Text)
+    duty_rate_column2: Mapped[str | None] = mapped_column(Text)
 
     ad_valorem_rate: Mapped[float | None] = mapped_column(Numeric(7, 4))
     """Parsed ad valorem percentage where the rate is purely ad valorem. Null where the

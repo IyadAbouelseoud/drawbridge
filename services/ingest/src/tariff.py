@@ -62,6 +62,13 @@ class TariffRecord:
     duty_rate_column2: str | None = None
     effective_to: date | None = None
 
+    search_text: str | None = None
+    """What to embed for this line, when it differs from `description_en`.
+
+    Set by the parser, because the parser is where the ancestor chain exists. Null falls
+    back to the description, which is right for ZATCA — its export is already one leaf
+    description per row, with no hierarchy to flatten and so nothing to dilute."""
+
     @property
     def heading(self) -> str:
         return self.code[:4]
@@ -177,6 +184,20 @@ def resolve_hierarchy(
     stack, because real exports contain them and refusing the file over a formatting
     artefact would lose the whole schedule.
     """
+    for index, parts in hierarchy_parts(rows):
+        yield index, ", ".join(parts)
+
+
+def hierarchy_parts(
+    rows: Sequence[tuple[int, str]],
+) -> Iterator[tuple[int, list[str]]]:
+    """The same walk, yielding the ancestor chain root-first instead of joining it.
+
+    Separated out because two callers want different arrangements of the same chain:
+    `resolve_hierarchy` wants it root-first for a human, and `retrieval_text` wants it
+    leaf-first for an embedding. Deriving one from the other by splitting on ", " would be
+    wrong — published descriptions contain commas.
+    """
     stack: list[str] = []
     for index, (indent, description) in enumerate(rows):
         level = max(indent, 0)
@@ -185,8 +206,65 @@ def resolve_hierarchy(
             # Gap in the indent sequence. Pad rather than misattribute the ancestor.
             stack.append("")
         stack.append(description.strip())
-        parts = [part for part in stack if part]
-        yield index, ", ".join(parts)
+        yield index, [part for part in stack if part]
+
+
+#: How much ancestor text an embedding is allowed to carry, in characters.
+#:
+#: The number is a consequence of mean pooling, not a preference. The published
+#: description of 8471.30.01.00 is 240 characters, of which the first 190 are the chapter
+#: heading — "Automatic data processing machines and units thereof; magnetic or optical
+#: readers, machines for transcribing data onto data media in coded form..." — and that
+#: prefix is shared verbatim by every one of the hundreds of lines under heading 8471.
+#: Averaged over the whole string, the twenty characters that distinguish a laptop from a
+#: mainframe contribute almost nothing, so every sibling embeds to nearly the same point.
+#:
+#: Week 13 measured it: against the full schedule the benchmark retrieved 1 of 10 correct
+#: lines in the top 10, and the nearest neighbours for "ruggedised field laptop computer"
+#: were five machine-tool subheadings whose own long headings happened to sit closer.
+#:
+#: 200 rather than 120, chosen by measurement and not by taste. At 120 the immediate
+#: parent of 8471.41.01.50 — "Comprising in the same housing at least a central processing
+#: unit and an input and output unit" — is 5 characters too long to fit beside a leaf
+#: reading "Other", so the line embeds as the word "Other" alone and its distance to a
+#: plain-language query is 0.868. At 200 the parent fits and the distance is 0.592. Across
+#: the five benchmark codes that exist in the published schedule, mean distance to the
+#: correct line is 0.458 at 120 and 0.404 at 200.
+RETRIEVAL_TEXT_CAP = 200
+
+
+def retrieval_text(parts: Sequence[str]) -> str:
+    """What gets embedded for one line: the leaf, then ancestors until the cap is reached.
+
+    The code is deliberately not included. `scripts/embed_corpus.py` prefixes it for every
+    backend and every table, so adding it here would embed it twice and weight a ten-digit
+    number as heavily as the goods description.
+
+    Leaf-first, because the leaf is what distinguishes this line from its siblings and
+    mean pooling weights every token equally. Ancestors are still included — a leaf
+    reading "Other" carries no meaning at all, which is the reason `resolve_hierarchy`
+    exists — but they are the part that gets truncated when something has to be.
+
+    An ancestor is taken whole or not at all. Half a clause reads as a different clause.
+    Once one does not fit, the walk stops rather than skipping to a shorter ancestor
+    further up: ancestors nearer the leaf are the more specific ones, and reaching past a
+    parent to include a grandparent would add breadth exactly where precision was wanted.
+
+    Trailing colons go. The schedule punctuates a heading that continues into its children
+    with one, which is typography rather than meaning, and it is a token the model spends
+    attention on in every single line.
+    """
+    cleaned = [part.strip().rstrip(":").strip() for part in parts]
+    chosen: list[str] = []
+    used = 0
+    for part in reversed(cleaned):
+        if not part:
+            continue
+        if chosen and used + len(part) > RETRIEVAL_TEXT_CAP:
+            break
+        chosen.append(part)
+        used += len(part)
+    return ", ".join(chosen)
 
 
 # ----------------------------------------------------------------------------- loading
@@ -194,17 +272,18 @@ def resolve_hierarchy(
 _UPSERT_LINE = text("""
     INSERT INTO tariff_lines (
         jurisdiction, source, code, heading, hs6,
-        description_en, description_ar, unit_of_quantity,
+        description_en, description_ar, search_text, unit_of_quantity,
         duty_rate_general, duty_rate_special, duty_rate_column2, ad_valorem_rate,
         revision, effective_from, effective_to
     ) VALUES (
         :jurisdiction, :source, :code, :heading, :hs6,
-        :description_en, :description_ar, :unit_of_quantity,
+        :description_en, :description_ar, :search_text, :unit_of_quantity,
         :duty_rate_general, :duty_rate_special, :duty_rate_column2, :ad_valorem_rate,
         :revision, :effective_from, :effective_to
     )
     ON CONFLICT (jurisdiction, source, code, revision) DO UPDATE SET
         description_en    = EXCLUDED.description_en,
+        search_text       = EXCLUDED.search_text,
         description_ar    = COALESCE(EXCLUDED.description_ar, tariff_lines.description_ar),
         unit_of_quantity  = EXCLUDED.unit_of_quantity,
         duty_rate_general = EXCLUDED.duty_rate_general,
@@ -259,6 +338,7 @@ def load_tariff_lines(
                 "heading": record.heading,
                 "hs6": record.hs6,
                 "description_en": record.description_en,
+                "search_text": record.search_text,
                 "description_ar": record.description_ar,
                 "unit_of_quantity": record.unit_of_quantity,
                 "duty_rate_general": record.duty_rate_general,

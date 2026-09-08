@@ -31,6 +31,7 @@ from services.api.src.routes import (
     review,
     triage,
 )
+from services.api.src.secrets import check_secret_posture
 from services.api.src.sync_db import reset_engine
 from services.api.src.telemetry import configure_tracing, instrument_fastapi, shutdown_tracing
 
@@ -44,6 +45,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Before any connection is opened. A deployment that authenticates nobody should fail
     # here rather than serve every tenant's rows to whoever asks.
     check_auth_configuration(settings)
+    # And before it, whether the keys involved are real. Outside development this raises
+    # on a placeholder; inside it, it logs the field names and lets the stack come up.
+    check_secret_posture(settings)
     app.state.engine = create_async_engine(settings.database_url, pool_pre_ping=True)
     app.state.sessionmaker = async_sessionmaker(app.state.engine, expire_on_commit=False)
     app.state.redis = aioredis.from_url(settings.redis_url, decode_responses=True)

@@ -123,6 +123,10 @@ $$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public;
 # is a corpus query, and rows that belong to nobody are readable by everybody.
 TENANT_PREDICATES: dict[str, str] = {
     "tenants": "tenant_id = app_current_tenant()",
+    # The filing identity: EIN, CR number, IBAN. Scoped like any other tenant table —
+    # a refund destination account is the single most useful row here to a reader who
+    # should not have it.
+    "tenant_profiles": "tenant_id = app_current_tenant()",
     "documents": "tenant_id = app_current_tenant()",
     "entry_lines": "tenant_id = app_current_tenant()",
     "export_lines": "tenant_id = app_current_tenant()",

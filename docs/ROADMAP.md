@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 12 |
+| Current week | 13 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | **The caller** — Authentik-shaped identity, traced writes, pilot corpora |
+| Current milestone | **The pilot** — both corpora through the pipeline, identity in the database, secrets out of the environment |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -742,32 +742,225 @@ literal five-year corpus behind `--time-barred` — because week 13 will need to
 customer *why* their older entries are gone, and a rejection nobody can reproduce is an
 assertion. Both corpora print their caveats rather than carrying them in a comment.
 
-## Week 13 entry checklist
+## Week 13 task breakdown
 
-1. **Run a pilot corpus end to end.** `make pilot-seed` writes both trigger payloads and
-   nothing has yet pushed one through the pipeline. This is the week's own scaffolding, and
-   the first thing to spend.
-2. **An Authentik blueprint** — provider, application, and a property mapping that emits
-   `tenant_id` — plus one real RS256 round trip against the API. The API side is done; the
-   identity provider side is not configured at all.
-3. **Secrets out of the environment.** The last third of the week 11–12 milestone.
-4. **Full-volume corpus load** — the ~19,000-line USITC schedule and the CROSS body. Carried
-   from weeks 9, 10, 11 and 12; the oldest open item, and it gates (5).
-5. **Re-run the tariff benchmark against that corpus.** `vector_ceiling` 0.68 and
-   `CONFIRMATION_LEXICAL_FLOOR` 0.20 were both measured against twenty-four lines.
-6. **Tenant profiles** — EIN, CR number, broker code, IBAN. Carried from weeks 9–12, and
-   now concrete: two pilot tenants exist and neither has any of these, so the packager still
-   cannot address a second claimant.
-7. **A *Bayan* header-block template.** Partially blocked on **B3**.
-8. **Import the workflows into n8n and run one for real.** Carried from weeks 9, 10 and 11.
-   The HTTP nodes now send `DRAWBRIDGE_SERVICE_TOKEN`, which is asserted and not observed.
-9. **A live agent run against real queue rows.** Carried from week 8.
-10. **A retention job**: `verify_chain` on a schedule, and an answer to where the ledger is
-    replicated. Carried from weeks 10 and 11.
-11. **Propagate `traceparent` across the MCP transport**, so an analyst tool call joins the
-    trace of the request that prompted it.
-12. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text, **B3** a real
-    scanned *Bayan* corpus.
+- [x] `packages/schemas/tenant.py` + `tenant_profiles` — EIN, CR number, broker code, IBAN
+- [x] `services/api/src/profiles.py` — the packager addresses a filing from the database
+- [x] `services/api/src/secrets.py` — secrets out of `.env`, with a provider seam
+- [x] `scripts/manage_secrets.py`, `make secrets-init` / `secrets-show` / `secrets-check`
+- [x] Full USITC load: 28,899 published lines, ingested and embedded
+- [x] `scripts/pilot_run.py` — both corpora through the deployed API, both asserted
+- [x] `search_text` (migration f2b90d47ac13) — embed the leaf, not the chapter heading
+- [x] `scripts/calibrate_thresholds.py` — what the thresholds look like at volume
+- [x] `tests/integration/test_trace_propagation.py` — the MCP trace join, pinned
+
+### The pilot ran, and the KSA corpus could not have
+
+`make pilot-run` pushes three corpora through the deployed API with a real bearer token.
+The US lane reaches a rendered CBP 7551, transmittable, with no open citations, addressed
+entirely from the database. The time-barred KSA lane is refused with GCC Art. 174 named in
+the rejection. Both refunds reproduce **to the cent** — USD 128,597.24 and SAR 54,687.50 —
+which is the assertion that matters, because a pilot that only checks for a non-zero
+refund passes just as happily on a wrong number.
+
+Running it found that week 12's KSA corpus asserted a refund no filing date could produce.
+Its dates were literals; by the time anything ran them, the clean re-export sat 461 days
+behind the filing date and Art. 16 §3(b)'s six-month window had closed on it. The GCC lane
+cannot hold fixed dates — six months from re-export to filing means a literal corpus
+expires within two quarters of being written, and expires silently. Every KSA date is now
+an offset from the filing date, with the three gates and the room each offset leaves
+written down beside them.
+
+The US corpus was wrong in the other direction: `expected_base` counted the Section 301
+duty and omitted the merchandise processing fee, which is refundable on a drawback claim.
+The matcher had been right all along and the corpus had been under-stating the claim by
+the one component a client is least likely to have counted themselves. Neither error was
+detectable in week 12, because week 12 wrote both numbers and ran neither.
+
+### The filing identity is a row now
+
+`POST /packaging/build` used to take the claimant in the request body — the caller told
+the packager what to print on a form addressed to CBP. `claimant` is now optional and the
+default comes from `tenant_profiles`, which is what makes "a second tenant with zero code
+change" true rather than aspirational: the pilot's request body names a claim id and
+nothing else, and the EIN, filer code, name and city land on the 7551.
+
+The table is separate from `tenants` because the two rows have opposite lifetimes. A
+`tenants` row is a tombstone that outlives the relationship by years, because
+`audit_ledger.tenant_id` is RESTRICT and §163 says so. This row holds precisely what a
+departing tenant is entitled to have erased, and `ON DELETE CASCADE` erases it without
+disturbing the tombstone.
+
+The IBAN is the only field validated by checksum rather than by shape, because it is the
+only one whose error moves money to a stranger. A transposed pair of digits is still a
+perfectly well-formed IBAN; ISO 13616 mod-97 is what catches it. That validation proves
+the number was not mistyped and nothing more — not that the account exists, not that it
+belongs to the tenant — and the field docs say so, because a caller who reads "validated"
+as "verified" will skip the confirmation that actually matters.
+
+### Secrets, and what moving them actually buys
+
+`DRAWBRIDGE_JWT_SECRET`, the service token and the app role's password are no longer in
+`.env`. They resolve from a gitignored `.secrets.json` through
+`services/api/src/secrets.py`, with the environment as a deliberate override for an
+orchestrator that injects.
+
+This does not make them secret from anyone who can read the file, and the module says so
+in its first paragraph. What it removes is specific: they are no longer printed by
+`docker inspect` or `docker compose config`, no longer inherited by every child process
+this container spawns, no longer in `/proc/<pid>/environ`, and no longer in the
+environment blocks that crash reporters collect. What it adds is one place to rotate and a
+`SecretProvider` seam — `AwsSecretsManagerProvider` is written as a working shape whose
+`load` refuses and names what it would need, rather than a stub that returns empty and
+lets a deployment start with nothing configured.
+
+Two things the generator deliberately will not mint. An Anthropic key is issued by
+Anthropic. A service token is a JWT signed with `jwt_secret`, so it cannot exist before
+that key does and is not random in any case. Generating either would report a configured
+credential and move the failure from startup to the first request that used it.
+
+Rolling it out found the ordering bug the design predicts: `.env` still carried the old
+values, compose loads `.env` into the container environment, and environment beats the
+file by design — so the API resolved `dev-only-change-me` from a file it was reading
+correctly. They are removed from `.env` rather than blanked, because an empty variable is
+still a variable and would win the same way.
+
+### Trace propagation was already there
+
+Week 12 recorded that nothing propagated `traceparent` across the MCP transport. Going to
+write it found the SDK does both halves: the client dispatcher injects W3C context into
+the JSON-RPC `_meta` under SEP-414, and `OpenTelemetryMiddleware` is installed by default,
+outermost, on every server. Verified against the running stack — a tool call made under a
+client span produced `drawbridge-mcp-hts` spans in Jaeger carrying the client's trace id.
+
+So there is no propagation code in this repository, and the deliverable is
+`tests/integration/test_trace_propagation.py` instead. A property nobody wrote is a
+property nobody notices losing: an SDK upgrade that drops the default middleware, or one
+server built with `middleware=[]`, would return the codebase to week 12's position
+silently.
+
+### The corpus is loaded, and loading it broke classification
+
+28,899 published lines, up from nine. Two things surfaced immediately.
+
+The duty rate columns did not fit. `varchar(64)` was sized against a fixture where every
+rate read "Free" or "2.5%"; the published schedule carries rates up to 439 characters —
+the sugar lines reciting general note 15, the tobacco lines reciting an entire in-lieu-of
+formula — and 105 rows overflowed. They are `Text` now, because the column was not
+truncating for want of a bigger number but for want of any right one.
+
+The serious one: **semantic retrieval collapsed.** Against the full schedule the benchmark
+retrieved 1 of 10 correct subheadings in its top 10 — against the nine-line corpus it had
+retrieved everything — and the nearest neighbours for "ruggedised field laptop computer"
+were five machine-tool subheadings. The cause is
+`description_en`, which is the ancestor chain root-first because a line whose own text
+reads "Other" is meaningless without it. For 8471.30.01.00 that chain is 240 characters of
+which the first 190 are the chapter heading, shared verbatim by every line under heading
+8471. The model mean-pools over tokens, so the twenty characters that distinguish a laptop
+from a mainframe are averaged into nothing and every sibling embeds to almost the same
+point. Twenty-four flat hand-written descriptions could never have shown this.
+
+`search_text` (migration f2b90d47ac13) holds the same chain leaf-first and capped at 200
+characters, and is what gets embedded; `description_en` stays the readable one and is
+still what an analyst sees and what a citation prints. The cap is a measurement, not a
+taste: at 120 the immediate parent of 8471.41.01.50 is five characters too long to fit
+beside a leaf reading "Other", so that line embeds as the word "Other" and sits 0.868 from
+a plain-language query; at 200 the parent fits and the distance is 0.592.
+
+Re-embedding all 28,899 lines against it moved recall at hs6 from **1 of 10 to 5 of 10**
+in the top ten, and from 0 to 4 at rank 1. Median top-hit distance fell from 0.361 to
+0.292 and the worst from 0.720 to 0.475. That is a large improvement and it is not a
+working classifier: five of ten is not a number to put in front of a customer, and the
+next suspect is the representation rather than the text — 384 dimensions of multilingual
+MiniLM over 29,000 near-identical legal phrases is thin. Week 14 starts there.
+
+The same run produced the sharpest evidence yet that the ceiling is not the control people
+assume it is. Correct answers now reach out to 0.475; the one query that is not a good at
+all — marine cargo insurance brokerage — sits at 0.492. Seventeen thousandths separate the
+worst correct answer from pure noise, so **no value of `vector_ceiling` separates them**.
+The fixture said as much in week 8 as a prediction; this is the measurement. Precision is
+decided by `needs_analyst_confirmation`, and the ceiling only decides how much noise a
+human has to look at.
+
+### Recalibration measured the fixture, so the fixture was the thing that changed
+
+The instruction was to re-run the benchmark and recalibrate `vector_ceiling` and
+`CONFIRMATION_LEXICAL_FLOOR` against production volume. Neither constant changed, and the
+reason is that the benchmark cannot support the measurement in the form it was in.
+
+Nine of its ten negatives are negatives only relative to its own 24-line corpus. Live
+cattle, cut roses, raw sugar, printed books and wooden pencils are all real headings in
+the published HTSA — against the full schedule they are positives whose answer the fixture
+never recorded. A threshold tuned by counting how many of them cross it would be measuring
+the fixture going stale and reporting it as precision. One negative survives at any
+volume: marine cargo insurance brokerage, which is not a good.
+
+Five of its ten positives named ten-digit codes that do not exist in the published
+schedule at all. The real HTSA splits 0901.21 eight ways on organic certification, Arabica
+versus Robusta and container size — none of which appears in "roasted cofee beans, not
+decafinated". So each positive now carries `expects_hs6`, and
+`scripts/calibrate_thresholds.py` scores at six digits: the level a goods description
+actually supports, and the level that is harmonised internationally. `expects` stays for
+`tests/integration/test_tariff_benchmark.py`, which measures against the fixture's own
+corpus where those exact codes do exist.
+
+Changing a threshold on top of a broken embedding text would have been fixing the
+instrument to flatter the reading.
+
+### Running the suite logs you out of your own stack
+
+`tests/integration/conftest.py` calls `ensure_app_role` with the suite's password, so a
+full `pytest` against the same Postgres the compose stack uses rotates `drawbridge_app`
+out from under the running API. Every request then fails with `password authentication
+failed`, several minutes after the thing that caused it, and the API looks broken rather
+than locked out.
+
+Recorded rather than fixed, because both plausible fixes are worse than the note. Giving
+the suite its own role would mean the tests no longer exercise the role the deployment
+uses, which is the entire point of testing against a real role rather than a mock. Having
+the suite restore the previous password would need it to know one it is deliberately not
+given. The recovery is one command:
+
+    make rls-bootstrap   # reads the password from .secrets.json, then restart the API
+
+### What week 13 deliberately did not do
+
+- **Configure Authentik.** Unchanged from week 12: the containers are in compose behind an
+  `identity` profile, the API verifies RS256 against a JWKS URL, and no provider,
+  application or property mapping is scripted. No RS256 token has ever reached this API.
+- **Load CROSS.** The tariff schedule loaded; the ruling corpus did not. CBP publishes
+  CROSS through a search interface with no bulk export, and `tariff_rulings` is still
+  empty, so `find_rulings` has nothing to cite.
+- **Encrypt a secret.** `.secrets.json` is plaintext on disk. The seam for a real manager
+  exists and is unimplemented, deliberately and loudly.
+- **Run n8n for real.** The HTTP nodes carry `DRAWBRIDGE_SERVICE_TOKEN` and `make up`
+  bridges it from the secrets file into the container environment, which is asserted and
+  still not observed.
+- **File anything.** Both corpora are fiction; every figure carries a `pilot-fixture`
+  box that traces to no document, and `assert_not_evidence` runs before the seeder and
+  again before the pilot.
+
+## Week 14 entry checklist
+
+1. **Retrieval is at 5 of 10 and needs to be much better.** The leaf-first text bought
+   the jump from 1; the remaining gap is the representation. Try a larger or
+   English-specialised embedding model, or a two-stage retrieve-then-rerank, and measure
+   with `scripts/calibrate_thresholds.py` rather than by impression.
+2. **Leave `vector_ceiling` alone until retrieval is fixed.** Week 13 measured 0.475 for
+   the worst correct answer and 0.492 for noise; no threshold lives in that gap. Both
+   constants are still the week 8 numbers and still labelled as such in the source.
+3. **CROSS.** Carried from weeks 9–13. No bulk export exists; this needs a decision about
+   scraping, purchasing, or narrowing the claim `find_rulings` makes.
+4. **An Authentik blueprint** and one real RS256 round trip. Carried from week 12.
+5. **A real secrets manager behind `SecretProvider`.** The seam is written and refuses.
+6. **A *Bayan* header-block template.** Partially blocked on **B3**.
+7. **Import the workflows into n8n and run one for real.** Carried from weeks 9–12.
+8. **A live agent run against real queue rows.** Carried from week 8.
+9. **A retention job**: `verify_chain` on a schedule, and where the ledger is replicated.
+   Carried from weeks 10–13.
+10. **Broker white-label packaging and `.onprem.yml`** — the week 14 milestone itself.
+11. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text, **B3** a
+    real scanned *Bayan* corpus.
 
 ## Sequencing rationale
 
@@ -831,3 +1024,11 @@ supply the value that goes into `tenant.id` — and the enforcement underneath i
 been proven against a second tenant. The evidence that the ordering was right is how small
 the week 12 diff is at the point where the two meet: one function, called at seven route
 entry points, and nothing in the policies changed at all.
+
+The pilot (wk 13) after the corpus load rather than before it, which cost a week and was
+worth it. A pilot run against nine tariff lines would have passed: the matcher does not
+consult the schedule to allocate duty, so both corpora reach a packet either way. What the
+full corpus produced was the discovery that classification does not work at volume — which
+a green pilot on a toy corpus would have hidden behind a green pilot. The ordering that
+matters here is not pilot-then-corpus or corpus-then-pilot; it is that both ran in the same
+week, so the one that passes could be checked against the one that does not.

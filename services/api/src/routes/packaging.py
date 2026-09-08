@@ -22,7 +22,9 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from services.api.src import packaging
+from drawbridge_schemas.jurisdiction import Jurisdiction
+from services.api.src import packaging, profiles
+from services.api.src.models import Claim
 from services.api.src.sync_db import in_thread_for_claim
 from services.api.src.tenancy import TenantScopeError
 from services.packager.src.packet import Claimant
@@ -31,7 +33,12 @@ router = APIRouter(prefix="/packaging", tags=["packaging"])
 
 
 class ClaimantIn(BaseModel):
-    """Filing identity, supplied per request until tenant profiles exist.
+    """Filing identity, overriding the tenant's stored profile.
+
+    Optional since week 13. Omit it and the claimant is read from `tenant_profiles`, which
+    is the path that removes the opportunity to mistype an EIN into a filing. Supply it
+    when a broker files for a client, or when an address has changed and the profile has
+    not caught up yet.
 
     Every field is printed on a document addressed to a customs authority, so nothing here
     has a default that could stand in for a real value.
@@ -58,11 +65,15 @@ class BuildRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     claim_id: UUID
-    claimant: ClaimantIn
+    claimant: ClaimantIn | None = None
+    """Omit to use the tenant's filing profile. A 422 names what the profile lacks."""
+
     manufacturer: ClaimantIn | None = None
     prepared_on: date | None = None
     port_code: str = ""
     refund_account_iban: str = ""
+    """Omit to use the profile's IBAN. KSA only; a US packet prints no bank account."""
+
     notes: str = ""
     include_artifacts: bool = True
     """False returns the manifest alone. A workflow that only needs to know whether the
@@ -79,14 +90,34 @@ async def build(body: BuildRequest) -> dict[str, Any]:
     """
 
     def _work(session: Any) -> dict[str, Any]:
+        # Resolved inside the scoped session, so the profile read goes through the same
+        # row-level policy as the claim it addresses. Reading it in the route would read
+        # it unscoped.
+        claim = session.get(Claim, body.claim_id)
+        if claim is None:
+            msg = f"no claim {body.claim_id}"
+            raise packaging.PackagingError(msg)
+        jurisdiction = Jurisdiction(claim.jurisdiction)
+
+        claimant = (
+            body.claimant.to_claimant()
+            if body.claimant is not None
+            else profiles.claimant_for(session, claim.tenant_id, jurisdiction)
+        )
+        iban = body.refund_account_iban or (
+            profiles.refund_account(session, claim.tenant_id)
+            if jurisdiction is Jurisdiction.KSA
+            else ""
+        )
+
         packet = packaging.build(
             session,
             claim_id=body.claim_id,
-            claimant=body.claimant.to_claimant(),
+            claimant=claimant,
             prepared_on=body.prepared_on,
             manufacturer=body.manufacturer.to_claimant() if body.manufacturer else None,
             port_code=body.port_code,
-            refund_account_iban=body.refund_account_iban,
+            refund_account_iban=iban,
             notes=body.notes,
         )
         result: dict[str, Any] = {
@@ -114,6 +145,14 @@ async def build(body: BuildRequest) -> dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"error": "not_found", "claim_id": str(body.claim_id)},
+        ) from exc
+    except profiles.ProfileError as exc:
+        # 422 and not 409: the claim is fine, the request is under-specified. The caller
+        # can fix it by completing the profile or by passing a claimant, and the message
+        # names which fields are missing so they do not have to guess.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "incomplete_filing_profile", "detail": str(exc)},
         ) from exc
     except packaging.PackagingError as exc:
         raise HTTPException(

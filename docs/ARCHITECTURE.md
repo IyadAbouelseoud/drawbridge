@@ -430,7 +430,8 @@ drawbridge/
 ├── packages/schemas/             # shared contracts incl. jurisdiction.py profiles
 ├── scripts/                      # ingest_tariff.py · embed_corpus.py · e2e_pipeline_test.py
 │                                 # rls_bootstrap.py · tenant_offboard.py (operator, owner DSN)
-│                                 # mint_token.py · pilot_us.py / pilot_ksa.py (wk 13 corpora)
+│                                 # mint_token.py · pilot_us.py / pilot_ksa.py / pilot_run.py
+│                                 # manage_secrets.py · calibrate_thresholds.py (wk 13)
 ├── tests/                        # unit · golden-claim fixtures · property-based rules
 │   └── fixtures/                 # tariff_benchmark.json · bayan.py (synthetic RTL table)
 └── infra/
@@ -1326,3 +1327,149 @@ Not yet propagated across the MCP transport: an analyst tool call is its own tra
   tenant can do everything to that tenant. An analyst and a read-only auditor are the same
   caller.
 - **Revoke or rotate.** Tokens expire and nothing refreshes or revokes them.
+- **Say who the caller *is* to a customs authority.** The token names a tenant; nothing
+  named the claimant. Week 13 supplies it — see §18.1.
+
+---
+
+## 18. The claimant, the secret and the corpus (week 13)
+
+### 18.1 Filing identity is a row, not a request field
+
+`POST /packaging/build` took the claimant in its body until week 13: the caller told the
+packager what to print on a document addressed to CBP or ZATCA. `claimant` is now optional
+and resolves from `tenant_profiles` — four identifiers, each load-bearing in a different
+way.
+
+| | Jurisdiction | What it decides | Validated by |
+|---|---|---|---|
+| `ein` | US | claimant of record on a 7551 | format, stored without its hyphen |
+| `broker_code` | US | the licensed filer who transmits | three alphanumerics |
+| `cr_number` | KSA | the establishment ZATCA holds responsible | ten digits |
+| `iban` | KSA | **where the money lands** | ISO 13616 mod-97 |
+
+The IBAN is the only one checksummed, because it is the only one whose error moves cash to
+a stranger: a transposed pair of digits is still a well-formed IBAN and only mod-97 sees
+it. None of these checks is authoritative. Mod-97 proves the number was not mistyped, not
+that the account exists or belongs to this tenant; the field docs say so, because a caller
+reading "validated" as "verified" skips the confirmation that matters.
+
+An EIN is stored as nine digits and printed as `95-4417293`. Two spellings of one
+identifier is how a tenant acquires two identities.
+
+**Sufficiency is per jurisdiction and decided at build time.** `require_for` runs when a
+packet is being rendered — the first moment the answer is both knowable and actionable. A
+US-only tenant is never asked for a CR number, and `broker_code` is never required at all,
+because a self-filer has none and a placeholder there names a broker who does not exist.
+Missing fields come back as one 422 listing all of them; one round trip per missing field
+is how onboarding takes a week.
+
+**A separate table from `tenants`, because the lifetimes are opposite.** §16.6's tombstone
+outlives the commercial relationship by years. This row is what a departing tenant is
+entitled to have erased, and `ON DELETE CASCADE` erases it without touching the tombstone.
+It carries the same RLS policy as every other tenant table — added to `TENANT_PREDICATES`,
+not to a second list.
+
+### 18.2 Secrets: what moved, and what that is worth
+
+`services/api/src/secrets.py`. Resolution order is init > environment > `.secrets.json` >
+`.env`. Environment beats the file so an orchestrator can override a stale one; the file
+beats `.env` because that is the migration the module exists to perform.
+
+It does not make a secret secret from anyone who can read the file. What it removes is
+enumerable: `docker inspect` and `docker compose config` no longer print them, child
+processes no longer inherit them, `/proc/<pid>/environ` no longer carries them, and
+crash-reporter environment blocks no longer collect them. What it adds is one place to
+rotate and a `SecretProvider` seam. `AwsSecretsManagerProvider` is written as a working
+shape whose `load` refuses and names what it would need — not a stub returning empty,
+which would let a deployment start with nothing configured and fail at the first request
+instead of at startup.
+
+`check_secret_posture` runs beside `check_auth_configuration` in the lifespan and
+**refuses** outside development when a known placeholder is load-bearing, including one
+left inline in the DSN. Inside development it logs the field names. Same posture as
+`rls_bootstrap` toward a bypassing role: a control that is present and inert is worse than
+one that is absent, because it looks finished.
+
+Two secrets the generator will not mint. An Anthropic key is issued by Anthropic; a
+service token is a JWT signed with `jwt_secret` and cannot precede it. Minting either
+would report a configured credential and move the failure to first use.
+
+n8n, Authentik and MinIO read credentials from the environment and cannot be taught to
+read a file, so `make up` bridges exactly those into the compose invocation's own
+environment. `manage_secrets.py env` refuses a terminal; a pipe is the only correct use.
+
+### 18.3 What gets embedded is not what gets read
+
+`description_en` is the ancestor chain root-first, because a line whose own text reads
+"Other" means nothing alone. That is the right string for a person and the wrong one for
+an embedding, and only the real schedule could show it: for 8471.30.01.00 the chain is 240
+characters of which the first 190 are the chapter heading, shared verbatim by every line
+under heading 8471. Mean pooling averages the twenty distinguishing characters into
+nothing, so siblings collapse onto each other. Measured: 1 of 10 benchmark subheadings
+retrieved in the top 10, with machine-tool lines as the nearest neighbours for "ruggedised
+field laptop computer".
+
+`search_text` (migration f2b90d47ac13) holds the same chain leaf-first, trailing colons
+stripped, capped at 200 characters, and is what `embed_corpus` embeds. Null falls back to
+the description, which is correct for ZATCA: one leaf per row, no hierarchy, nothing to
+dilute.
+
+```
+description_en   Automatic data processing machines and units thereof; magnetic or
+                 optical readers, ... , Portable automatic data processing machines,
+                 weighing not more than 10 kg      <- what an analyst reads
+search_text      Portable automatic data processing machines, weighing not more than
+                 10 kg, consisting of at least ...  <- what the model sees
+```
+
+The cap is a measurement. At 120 the immediate parent of 8471.41.01.50 is five characters
+too long to sit beside a leaf reading "Other", so the line embeds as the word "Other" and
+sits 0.868 from a plain-language query; at 200 the parent fits and it is 0.592.
+
+Re-embedding all 28,899 lines against it took recall at hs6 from 1 of 10 to 5 of 10 in the
+top ten, and from 0 to 4 at rank 1. Better, and not yet a working classifier.
+
+### 18.4 Six digits is what a description can decide
+
+`scripts/calibrate_thresholds.py` scores retrieval at hs6, not at the ten-digit line. The
+published schedule splits 0901.21 eight ways on organic certification, variety and
+container size — facts absent from "roasted cofee beans, not decafinated". Scoring a
+plain-language query against a statistical suffix measures the model on information the
+query does not contain. Six digits is also the internationally harmonised level, which is
+why `tariff_lines.hs6` is the cross-jurisdiction join key (§5).
+
+Neither `vector_ceiling` nor `CONFIRMATION_LEXICAL_FLOOR` changed in week 13, and the
+measurement is why. After the re-embed the worst correct answer sits at distance 0.475 and
+the one query that is not a good at all sits at 0.492. **No ceiling lives in seventeen
+thousandths.** §8 said a threshold could not separate adjacent subheadings; this is the
+same conclusion reached from the other direction, against real data. Precision is decided
+by `needs_analyst_confirmation`; the ceiling only bounds how much noise a human reads.
+
+Both constants are still the week 8 numbers, measured against twenty-four lines, and both
+are still labelled as such in the source.
+
+### 18.5 Trace context across MCP
+
+Nothing in this repository propagates it, and nothing needs to. The SDK's client
+dispatcher injects W3C context into the JSON-RPC `_meta` (SEP-414) and
+`OpenTelemetryMiddleware` — installed by default and outermost on every server — extracts
+it. Verified live: a tool call under a client span produced `drawbridge-mcp-hts` spans
+carrying the client's trace id.
+
+`tests/integration/test_trace_propagation.py` pins it, because a property nobody wrote is
+a property nobody notices losing. What is still ours is configuring a provider in each
+server's `main()`: without one the middleware runs and its spans are dropped, which looks
+exactly like working instrumentation until somebody reads Jaeger — the same failure
+§17.6 records from week 12.
+
+### 18.6 What this does not do
+
+- **Authenticate against Authentik.** Unchanged from §17.7. No RS256 token has reached
+  this API.
+- **Encrypt a secret.** `.secrets.json` is plaintext; the manager seam is unimplemented.
+- **Carry the ruling corpus.** `tariff_rulings` is empty. CBP publishes CROSS through a
+  search interface with no bulk export, so `find_rulings` has nothing to cite.
+- **File anything.** Both pilot corpora are fiction. Every figure carries a
+  `pilot-fixture` box tracing to no document, and `assert_not_evidence` refuses to act on
+  one.

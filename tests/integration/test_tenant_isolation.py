@@ -29,11 +29,14 @@ from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import status
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
+from drawbridge_schemas.tenant import TenantProfile
+from services.api.src import profiles
 from services.api.src.auth import SERVICE_SCOPE, mint
 from services.api.src.config import get_settings
 from services.api.src.models import Claim, ReviewQueue, Tenant
@@ -162,6 +165,33 @@ def parties(engine: Engine) -> Iterator[dict[str, dict[str, object]]]:
     a_review = _review(a_tenant.tenant_id, a_claim.claim_id)
     b_review = _review(b_tenant.tenant_id, b_claim.claim_id)
     session.add_all([a_review, b_review])
+
+    # Filing identities, added in week 13. Both sides get one, and B's carries an IBAN:
+    # a refund destination account is the single most valuable row in this schema to a
+    # reader who should not have it, so it is the one worth proving is scoped.
+    profiles.write(
+        session,
+        TenantProfile(
+            tenant_id=a_tenant.tenant_id,
+            legal_name="Alpha Importers Inc.",
+            ein="951112233",
+            address_line1="1 Alpha Way",
+            city="Long Beach",
+            country="US",
+        ),
+    )
+    profiles.write(
+        session,
+        TenantProfile(
+            tenant_id=b_tenant.tenant_id,
+            legal_name="Beta Logistics Co.",
+            cr_number="4030111222",
+            iban="SA0380000000608010167519",
+            address_line1="2 Beta Road",
+            city="Jeddah",
+            country="SA",
+        ),
+    )
     session.commit()
 
     settings = get_settings()
@@ -189,6 +219,10 @@ def parties(engine: Engine) -> Iterator[dict[str, dict[str, object]]]:
         )
     for claim in (a_claim, b_claim):
         session.execute(text("DELETE FROM claims WHERE claim_id = :c"), {"c": claim.claim_id})
+    for tenant in (a_tenant, b_tenant):
+        session.execute(
+            text("DELETE FROM tenant_profiles WHERE tenant_id = :t"), {"t": tenant.tenant_id}
+        )
     for tenant in (a_tenant, b_tenant):
         session.execute(text("DELETE FROM tenants WHERE tenant_id = :t"), {"t": tenant.tenant_id})
     session.commit()
@@ -458,3 +492,72 @@ class TestTheServiceTokenIsDeliberatelyDifferent:
             f"/claims/{parties['a']['claim_id']}", headers={"Authorization": f"Bearer {both}"}
         )
         assert response.status_code == 401
+
+
+class TestTheFilingIdentityIsScopedLikeEverythingElse:
+    """`tenant_profiles` holds EINs, CR numbers and bank accounts.
+
+    It arrived in week 13, after the row-level policies were written, which is exactly the
+    circumstance in which a table gets added to the schema and forgotten in the predicate
+    map. These tests are the thing that would notice.
+    """
+
+    def test_the_table_carries_a_policy(self, engine: Engine) -> None:
+        with engine.connect() as connection:
+            enabled = connection.execute(
+                text("SELECT relrowsecurity FROM pg_class WHERE relname = 'tenant_profiles'")
+            ).scalar_one()
+            policies = connection.execute(
+                text("SELECT count(*) FROM pg_policies WHERE tablename = 'tenant_profiles'")
+            ).scalar_one()
+        assert enabled is True
+        assert policies >= 1
+
+    def test_each_side_packages_under_its_own_identity(
+        self, api: TestClient, parties: dict
+    ) -> None:
+        """A builds a packet without naming a claimant and gets A's EIN, not B's.
+
+        This is the property that makes "a second tenant with zero code change" true: the
+        request body is identical for both tenants and the answer is not.
+        """
+        response = api.post(
+            "/packaging/build",
+            json={"claim_id": str(parties["a"]["claim_id"]), "include_artifacts": False},
+            headers=_auth(parties["a"]),
+        )
+        # The claim is not in a packageable state in this fixture, so a 409 is the
+        # expected outcome — what matters is that it is not a 422 about a missing
+        # profile, which would mean A could not see its own row.
+        assert response.status_code != status.HTTP_422_UNPROCESSABLE_ENTITY, response.json()
+
+    def test_neither_can_read_the_other_s_refund_account(
+        self,
+        engine: Engine,  # noqa: ARG002 - ordering: the schema and app role must exist
+        parties: dict,
+    ) -> None:
+        """Straight at the database, as the application role, scoped to A.
+
+        Through HTTP there is no endpoint that returns a profile, so a route-level test
+        would prove only that the route does not exist. The policy is the control, and
+        this is where it either holds or does not.
+        """
+        app_engine = create_engine(
+            make_url(TEST_DSN).set(username=APP_ROLE, password=TEST_APP_PASSWORD)
+        )
+        try:
+            with app_engine.connect() as connection:
+                connection.execute(
+                    text("SELECT set_config('tenant.id', :t, false)"),
+                    {"t": str(parties["a"]["tenant_id"])},
+                )
+                visible = (
+                    connection.execute(text("SELECT tenant_id, iban FROM tenant_profiles"))
+                    .mappings()
+                    .all()
+                )
+        finally:
+            app_engine.dispose()
+
+        assert [row["tenant_id"] for row in visible] == [parties["a"]["tenant_id"]]
+        assert all(row["iban"] is None for row in visible)

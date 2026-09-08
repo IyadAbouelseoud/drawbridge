@@ -23,7 +23,12 @@ from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from services.ingest.src.tariff import TariffRecord, normalise_code, resolve_hierarchy
+from services.ingest.src.tariff import (
+    TariffRecord,
+    hierarchy_parts,
+    normalise_code,
+    retrieval_text,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
@@ -76,7 +81,10 @@ def parse_rows(
     the description its children inherit.
     """
     hierarchy = [(_indent_of(row), _text(row, _DESCRIPTION) or "") for row in rows]
-    full = dict(resolve_hierarchy(hierarchy))
+    # The chain, not the joined string: the description a human reads is root-first and
+    # the text an embedding wants is leaf-first. See `tariff.retrieval_text`.
+    chains = dict(hierarchy_parts(hierarchy))
+    full = {index: ", ".join(parts) for index, parts in chains.items()}
 
     for index, row in enumerate(rows):
         code = normalise_code(_text(row, _HTSNO))
@@ -92,6 +100,7 @@ def parse_rows(
             source=SOURCE,
             code=code,
             description_en=description,
+            search_text=retrieval_text(chains.get(index, [])),
             unit_of_quantity=_text(row, _UNITS),
             duty_rate_general=_text(row, _GENERAL),
             duty_rate_special=_text(row, _SPECIAL),

@@ -18,12 +18,15 @@
 x-python-base: &python-base
   env_file: [.env]
   environment:
-    DRAWBRIDGE_DATABASE_URL: postgresql+asyncpg://drawbridge_app:${DRAWBRIDGE_APP_DB_PASSWORD:-drawbridge-app-local}@postgres:5432/drawbridge
+    # No password in this DSN. `app_db_password` is read from the mounted .secrets.json
+    # and injected by services/api/src/secrets.py, which keeps it out of `docker inspect`
+    # and out of every child process this container spawns.
+    DRAWBRIDGE_DATABASE_URL: postgresql+asyncpg://drawbridge_app@postgres:5432/drawbridge
     DRAWBRIDGE_OWNER_DATABASE_URL: postgresql+psycopg://drawbridge:drawbridge@postgres:5432/drawbridge
     DRAWBRIDGE_REDIS_URL: redis://redis:6379/0
+    DRAWBRIDGE_SECRETS_FILE: /run/secrets/drawbridge.json
     DRAWBRIDGE_S3_ENDPOINT_URL: http://minio:9000
     DRAWBRIDGE_S3_ACCESS_KEY: drawbridge
-    DRAWBRIDGE_S3_SECRET_KEY: drawbridge
     DRAWBRIDGE_S3_BUCKET_DOCUMENTS: drawbridge-documents
     DRAWBRIDGE_S3_BUCKET_ARCHIVE: drawbridge-archive
     # Spans go to Jaeger's OTLP/HTTP receiver. Empty would still be a working stack —
@@ -33,7 +36,6 @@ x-python-base: &python-base
     # Authentik (profile `identity` below) to verify RS256 tokens instead, at which point
     # the secret stops being consulted and nothing here can issue a token.
     DRAWBRIDGE_AUTH_REQUIRED: "${DRAWBRIDGE_AUTH_REQUIRED:-true}"
-    DRAWBRIDGE_JWT_SECRET: ${DRAWBRIDGE_JWT_SECRET:-dev-only-change-me}
     DRAWBRIDGE_JWT_ISSUER: drawbridge
     DRAWBRIDGE_JWT_AUDIENCE: drawbridge-api
     DRAWBRIDGE_OIDC_JWKS_URL: ${DRAWBRIDGE_OIDC_JWKS_URL:-}
@@ -41,6 +43,10 @@ x-python-base: &python-base
     - ./services:/app/services:ro
     - ./mcp_servers:/app/mcp_servers:ro
     - ./packages:/app/packages:ro
+    # Read-only, and at a path outside the source mounts so an editor watching ./services
+    # never sees it. Generate with `make secrets-init`; the stack will not start without
+    # it once DRAWBRIDGE_AUTH_REQUIRED is true.
+    - ./.secrets.json:/run/secrets/drawbridge.json:ro
   depends_on:
     postgres: { condition: service_healthy }
     redis: { condition: service_healthy }

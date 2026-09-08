@@ -47,7 +47,10 @@ DEFAULT_DSN = "postgresql+psycopg://drawbridge:drawbridge@localhost:5432/drawbri
 # concurrently without either blocking on the other's batch or double-writing a row.
 _PENDING_LINES = text("""
     SELECT tariff_line_id AS id, code,
-           coalesce(nullif(description_en, ''), description_ar, '') AS body
+           -- search_text first: the same ancestor chain, leaf-first and truncated, which
+           -- is what survives mean pooling. Null for ZATCA and for anything ingested
+           -- before f2b90d47ac13, so the description remains the fallback.
+           coalesce(nullif(search_text, ''), nullif(description_en, ''), description_ar, '') AS body
     FROM tariff_lines
     WHERE embedding IS NULL
       AND (CAST(:jurisdiction AS text) IS NULL OR jurisdiction = CAST(:jurisdiction AS text))

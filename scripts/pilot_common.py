@@ -46,7 +46,9 @@ from drawbridge_schemas.provenance import (
     ProvenanceSpan,
     Span,
 )
+from drawbridge_schemas.tenant import TenantProfile
 from drawbridge_schemas.trade import EntryLine, ExportLine
+from services.api.src import profiles
 from services.api.src.config import get_settings
 from services.api.src.models import EntryLine as EntryLineRow
 from services.api.src.models import ExportLine as ExportLineRow
@@ -88,6 +90,11 @@ class PilotTenant:
     slug: str
     name: str
     jurisdiction: str
+    #: The filing identity. Fictional like everything else here, and structurally valid
+    #: so that the packager exercises the real path: the EIN matches CBP's format and the
+    #: IBAN passes mod-97, because a corpus whose identifiers fail validation would test
+    #: the validator instead of the pipeline.
+    profile: TenantProfile | None = None
 
     @property
     def tenant_id(self) -> UUID:
@@ -193,6 +200,13 @@ def _ensure_tenant(session: Session, tenant: PilotTenant) -> Tenant:
         # application and this keeps it unreachable through the seeder.
         msg = f"tenant {tenant.slug} is offboarded; it cannot be reseeded"
         raise PilotError(msg)
+
+    if tenant.profile is not None:
+        # Written every run rather than only on creation. The profile is what the packager
+        # addresses a filing with, and a seeder that skipped it on an existing tenant
+        # would leave an edited corpus filing under the previous corpus's identity.
+        profiles.write(session, tenant.profile)
+        session.flush()
     return row
 
 

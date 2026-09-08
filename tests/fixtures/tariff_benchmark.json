@@ -4,59 +4,219 @@
     "why": "Week 8 set the ceiling to 0.75 from nine tariff lines. Nine is enough to show that 0.55 was wrong and not enough to show that 0.75 is right. A threshold is a claim about the separation between what the corpus can answer and what it cannot, and that claim needs labelled negatives.",
     "shape": "A corpus of published tariff text, ten queries the corpus does answer, and ten it does not. The negatives are the load-bearing half: any ceiling retrieves the positives if it is loose enough, and vector search always returns something.",
     "embedded_text": "'{code} {description_en}' — identical to scripts/embed_corpus.py, so a benchmark distance is the same number production would see.",
-    "negatives_are_absent_goods_not_adjacent_codes": "A hard negative here is a good the corpus does not carry, phrased like one it does. Deliberately NOT an adjacent 8-digit subheading of a line that is present: 8482.10 ball bearings and 8482.20 roller bearings are semantically near-identical, and no distance threshold separates them. That case is real, and it is handled by TariffHit.needs_analyst_confirmation rather than by a ceiling. Asserting a threshold could do it would be asserting something false."
+    "negatives_are_absent_goods_not_adjacent_codes": "A hard negative here is a good the corpus does not carry, phrased like one it does. Deliberately NOT an adjacent 8-digit subheading of a line that is present: 8482.10 ball bearings and 8482.20 roller bearings are semantically near-identical, and no distance threshold separates them. That case is real, and it is handled by TariffHit.needs_analyst_confirmation rather than by a ceiling. Asserting a threshold could do it would be asserting something false.",
+    "expects_vs_expects_hs6": "`expects` is the exact line in THIS fixture's 24-line corpus, which is what tests/integration/test_tariff_benchmark.py measures against. `expects_hs6` is the six-digit subheading, and it is what scripts/calibrate_thresholds.py measures against the published schedule. The two differ because the real HTSA subdivides each subheading into statistical suffixes that a goods description cannot determine: 0901.21 splits eight ways on organic certification, Arabica versus Robusta, and container size, none of which appears in 'roasted cofee beans, not decafinated'. Scoring a plain-language query against a ten-digit code would be scoring the model on facts the query does not contain. Six digits is the level a description supports, and it is also the level that is harmonised internationally, which is why tariff_lines.hs6 exists as the cross-jurisdiction join key.",
+    "negatives_against_the_full_schedule": "Nine of the ten negatives below are negatives only relative to this fixture's 24-line corpus. Live cattle, cut roses, raw sugar, printed books and wooden pencils are all real headings in the published HTSA, so against the full schedule they are positives whose answer was never recorded here. Only 'marine cargo insurance brokerage' stays a negative at any volume, because it is not a good. scripts/calibrate_thresholds.py scores that one and says plainly that it is ignoring the rest; counting them would measure this fixture going stale and report it as precision."
   },
-
   "corpus": [
-    {"code": "8471300100", "description_en": "Portable automatic data processing machines weighing not more than 10 kg, consisting of at least a central processing unit, a keyboard and a display"},
-    {"code": "8471410150", "description_en": "Automatic data processing machines comprising in the same housing at least a central processing unit and an input and output unit, whether or not combined"},
-    {"code": "8473301180", "description_en": "Parts and accessories of the automatic data processing machines of heading 8471, printed circuit assemblies"},
-    {"code": "8482101000", "description_en": "Ball bearings, single row, deep groove type, having an outside diameter not exceeding 30 mm"},
-    {"code": "8483409000", "description_en": "Gears and gearing, other than toothed wheels, chain sprockets and other transmission elements presented separately"},
-    {"code": "8544422000", "description_en": "Insulated electric conductors for a voltage not exceeding 1,000 V, fitted with connectors, of a kind used for telecommunications"},
-    {"code": "7207200000", "description_en": "Semi-finished products of iron or non-alloy steel containing by weight 0.25 percent or more of carbon"},
-    {"code": "7318159080", "description_en": "Threaded screws and bolts of iron or steel, with hexagon heads, other than cap screws"},
-    {"code": "0901210000", "description_en": "Coffee, roasted, not decaffeinated"},
-    {"code": "0902300000", "description_en": "Black fermented tea in immediate packings of a content not exceeding 3 kg"},
-    {"code": "3004902000", "description_en": "Medicaments consisting of mixed or unmixed products for therapeutic uses, put up in measured doses or in forms or packings for retail sale"},
-    {"code": "3902100000", "description_en": "Polypropylene in primary forms"},
-    {"code": "3926909989", "description_en": "Other articles of plastics and articles of other materials of headings 3901 to 3914"},
-    {"code": "6109100012", "description_en": "T-shirts, singlets and other vests, knitted or crocheted, of cotton, men's or boys'"},
-    {"code": "6403996000", "description_en": "Footwear with outer soles of rubber or plastics and uppers of leather, covering the ankle"},
-    {"code": "8703231590", "description_en": "Motor cars principally designed for the transport of persons, with spark-ignition internal combustion reciprocating piston engine of a cylinder capacity exceeding 1,500 cc but not exceeding 3,000 cc"},
-    {"code": "8708299150", "description_en": "Parts and accessories of bodies for motor vehicles, other than stampings"},
-    {"code": "9018390050", "description_en": "Syringes, needles, catheters, cannulae and the like, used in medical, surgical, dental or veterinary sciences"},
-    {"code": "2710192590", "description_en": "Petroleum oils and oils obtained from bituminous minerals, lubricating oils, not containing biodiesel"},
-    {"code": "2523290000", "description_en": "Portland cement, other than white cement, whether or not artificially coloured"},
-    {"code": "9403300000", "description_en": "Wooden furniture of a kind used in offices"},
-    {"code": "8418102000", "description_en": "Combined refrigerator-freezers, fitted with separate external doors, household type"},
-    {"code": "8517130000", "description_en": "Smartphones for cellular networks or for other wireless networks"},
-    {"code": "4011100000", "description_en": "New pneumatic tyres of rubber, of a kind used on motor cars, including station wagons and racing cars"}
+    {
+      "code": "8471300100",
+      "description_en": "Portable automatic data processing machines weighing not more than 10 kg, consisting of at least a central processing unit, a keyboard and a display"
+    },
+    {
+      "code": "8471410150",
+      "description_en": "Automatic data processing machines comprising in the same housing at least a central processing unit and an input and output unit, whether or not combined"
+    },
+    {
+      "code": "8473301180",
+      "description_en": "Parts and accessories of the automatic data processing machines of heading 8471, printed circuit assemblies"
+    },
+    {
+      "code": "8482101000",
+      "description_en": "Ball bearings, single row, deep groove type, having an outside diameter not exceeding 30 mm"
+    },
+    {
+      "code": "8483409000",
+      "description_en": "Gears and gearing, other than toothed wheels, chain sprockets and other transmission elements presented separately"
+    },
+    {
+      "code": "8544422000",
+      "description_en": "Insulated electric conductors for a voltage not exceeding 1,000 V, fitted with connectors, of a kind used for telecommunications"
+    },
+    {
+      "code": "7207200000",
+      "description_en": "Semi-finished products of iron or non-alloy steel containing by weight 0.25 percent or more of carbon"
+    },
+    {
+      "code": "7318159080",
+      "description_en": "Threaded screws and bolts of iron or steel, with hexagon heads, other than cap screws"
+    },
+    {
+      "code": "0901210000",
+      "description_en": "Coffee, roasted, not decaffeinated"
+    },
+    {
+      "code": "0902300000",
+      "description_en": "Black fermented tea in immediate packings of a content not exceeding 3 kg"
+    },
+    {
+      "code": "3004902000",
+      "description_en": "Medicaments consisting of mixed or unmixed products for therapeutic uses, put up in measured doses or in forms or packings for retail sale"
+    },
+    {
+      "code": "3902100000",
+      "description_en": "Polypropylene in primary forms"
+    },
+    {
+      "code": "3926909989",
+      "description_en": "Other articles of plastics and articles of other materials of headings 3901 to 3914"
+    },
+    {
+      "code": "6109100012",
+      "description_en": "T-shirts, singlets and other vests, knitted or crocheted, of cotton, men's or boys'"
+    },
+    {
+      "code": "6403996000",
+      "description_en": "Footwear with outer soles of rubber or plastics and uppers of leather, covering the ankle"
+    },
+    {
+      "code": "8703231590",
+      "description_en": "Motor cars principally designed for the transport of persons, with spark-ignition internal combustion reciprocating piston engine of a cylinder capacity exceeding 1,500 cc but not exceeding 3,000 cc"
+    },
+    {
+      "code": "8708299150",
+      "description_en": "Parts and accessories of bodies for motor vehicles, other than stampings"
+    },
+    {
+      "code": "9018390050",
+      "description_en": "Syringes, needles, catheters, cannulae and the like, used in medical, surgical, dental or veterinary sciences"
+    },
+    {
+      "code": "2710192590",
+      "description_en": "Petroleum oils and oils obtained from bituminous minerals, lubricating oils, not containing biodiesel"
+    },
+    {
+      "code": "2523290000",
+      "description_en": "Portland cement, other than white cement, whether or not artificially coloured"
+    },
+    {
+      "code": "9403300000",
+      "description_en": "Wooden furniture of a kind used in offices"
+    },
+    {
+      "code": "8418102000",
+      "description_en": "Combined refrigerator-freezers, fitted with separate external doors, household type"
+    },
+    {
+      "code": "8517130000",
+      "description_en": "Smartphones for cellular networks or for other wireless networks"
+    },
+    {
+      "code": "4011100000",
+      "description_en": "New pneumatic tyres of rubber, of a kind used on motor cars, including station wagons and racing cars"
+    }
   ],
-
   "positives": [
-    {"query": "ruggedised field laptop computer", "expects": "8471300100", "kind": "paraphrase", "note": "The week 8 query. Shares no token with the heading text."},
-    {"query": "desktop tower PC sold with its monitor and keyboard in one unit", "expects": "8471410150", "kind": "paraphrase"},
-    {"query": "ball baering single row deep grove 25 mm bore", "expects": "8482101000", "kind": "typo", "note": "Two misspellings, as a commercial invoice line carries them."},
-    {"query": "roasted cofee beans, not decafinated", "expects": "0901210000", "kind": "typo"},
-    {"query": "hex head steel bolts used to assemble machinery frames", "expects": "7318159080", "kind": "paraphrase"},
-    {"query": "هاتف ذكي يعمل على الشبكات الخلوية", "expects": "8517130000", "kind": "multilingual", "note": "Arabic query, English corpus line — the cross-lingual property the dual-jurisdiction design needs."},
-    {"query": "أسمنت بورتلاندي رمادي للبناء", "expects": "2523290000", "kind": "multilingual"},
-    {"query": "men's cotton tee shirts, knitted", "expects": "6109100012", "kind": "paraphrase"},
-    {"query": "household fridge freezer with two separate doors", "expects": "8418102000", "kind": "paraphrase"},
-    {"query": "wooden desks and filing cabinets for an office fit-out", "expects": "9403300000", "kind": "paraphrase"}
+    {
+      "query": "ruggedised field laptop computer",
+      "expects": "8471300100",
+      "kind": "paraphrase",
+      "note": "The week 8 query. Shares no token with the heading text.",
+      "expects_hs6": "847130"
+    },
+    {
+      "query": "desktop tower PC sold with its monitor and keyboard in one unit",
+      "expects": "8471410150",
+      "kind": "paraphrase",
+      "expects_hs6": "847141"
+    },
+    {
+      "query": "ball baering single row deep grove 25 mm bore",
+      "expects": "8482101000",
+      "kind": "typo",
+      "note": "Two misspellings, as a commercial invoice line carries them.",
+      "expects_hs6": "848210"
+    },
+    {
+      "query": "roasted cofee beans, not decafinated",
+      "expects": "0901210000",
+      "kind": "typo",
+      "expects_hs6": "090121"
+    },
+    {
+      "query": "hex head steel bolts used to assemble machinery frames",
+      "expects": "7318159080",
+      "kind": "paraphrase",
+      "expects_hs6": "731815"
+    },
+    {
+      "query": "هاتف ذكي يعمل على الشبكات الخلوية",
+      "expects": "8517130000",
+      "kind": "multilingual",
+      "note": "Arabic query, English corpus line — the cross-lingual property the dual-jurisdiction design needs.",
+      "expects_hs6": "851713"
+    },
+    {
+      "query": "أسمنت بورتلاندي رمادي للبناء",
+      "expects": "2523290000",
+      "kind": "multilingual",
+      "expects_hs6": "252329"
+    },
+    {
+      "query": "men's cotton tee shirts, knitted",
+      "expects": "6109100012",
+      "kind": "paraphrase",
+      "expects_hs6": "610910"
+    },
+    {
+      "query": "household fridge freezer with two separate doors",
+      "expects": "8418102000",
+      "kind": "paraphrase",
+      "expects_hs6": "841810"
+    },
+    {
+      "query": "wooden desks and filing cabinets for an office fit-out",
+      "expects": "9403300000",
+      "kind": "paraphrase",
+      "expects_hs6": "940330"
+    }
   ],
-
   "negatives": [
-    {"query": "portable cordless electric hand drill with a lithium-ion battery", "confusable_with": "8471300100", "note": "Portable, powered, hand-carried — every adjective the ADP heading uses. Chapter 84 tools, absent from the corpus."},
-    {"query": "unwrought aluminium in ingot form for remelting", "confusable_with": "7207200000", "note": "Reads as semi-finished base metal; chapter 76, absent."},
-    {"query": "live pure-bred breeding cattle for dairy herds", "confusable_with": null},
-    {"query": "fresh cut roses and flower buds for bouquets", "confusable_with": null},
-    {"query": "raw cane sugar in solid form for refining", "confusable_with": null},
-    {"query": "mechanical wristwatches with gold cases and jewelled movements", "confusable_with": "8483409000", "note": "Toothed gearing is what a mechanical movement is; chapter 91, absent."},
-    {"query": "liquefied natural gas carried in bulk", "confusable_with": "2710192590", "note": "Chapter 27 like the lubricating oils, different heading, absent."},
-    {"query": "printed books, brochures and similar printed matter, bound", "confusable_with": null},
-    {"query": "wooden lead pencils and coloured crayons", "confusable_with": "9403300000", "note": "Wooden articles, chapter 96, absent."},
-    {"query": "marine cargo insurance brokerage arranged for a shipper", "confusable_with": null, "note": "Not a good at all. If a tariff schedule answers this, the ceiling is not doing anything."}
+    {
+      "query": "portable cordless electric hand drill with a lithium-ion battery",
+      "confusable_with": "8471300100",
+      "note": "Portable, powered, hand-carried — every adjective the ADP heading uses. Chapter 84 tools, absent from the corpus."
+    },
+    {
+      "query": "unwrought aluminium in ingot form for remelting",
+      "confusable_with": "7207200000",
+      "note": "Reads as semi-finished base metal; chapter 76, absent."
+    },
+    {
+      "query": "live pure-bred breeding cattle for dairy herds",
+      "confusable_with": null
+    },
+    {
+      "query": "fresh cut roses and flower buds for bouquets",
+      "confusable_with": null
+    },
+    {
+      "query": "raw cane sugar in solid form for refining",
+      "confusable_with": null
+    },
+    {
+      "query": "mechanical wristwatches with gold cases and jewelled movements",
+      "confusable_with": "8483409000",
+      "note": "Toothed gearing is what a mechanical movement is; chapter 91, absent."
+    },
+    {
+      "query": "liquefied natural gas carried in bulk",
+      "confusable_with": "2710192590",
+      "note": "Chapter 27 like the lubricating oils, different heading, absent."
+    },
+    {
+      "query": "printed books, brochures and similar printed matter, bound",
+      "confusable_with": null
+    },
+    {
+      "query": "wooden lead pencils and coloured crayons",
+      "confusable_with": "9403300000",
+      "note": "Wooden articles, chapter 96, absent."
+    },
+    {
+      "query": "marine cargo insurance brokerage arranged for a shipper",
+      "confusable_with": null,
+      "note": "Not a good at all. If a tariff schedule answers this, the ceiling is not doing anything."
+    }
   ]
 }

@@ -84,6 +84,73 @@ class Tenant(Base):
     )
 
 
+class TenantProfile(Base):
+    """Filing identity — who the tenant is to a customs authority.
+
+    Separate from `tenants` rather than more columns on it, and the reason is offboarding.
+    A `tenants` row is a tombstone that outlives the commercial relationship by years
+    because `audit_ledger.tenant_id` is RESTRICT and §163 retention says so. This row is
+    the opposite: EIN, CR number and above all IBAN are exactly the identifiers a departing
+    tenant is entitled to have erased, and they are erasable here without touching the
+    tombstone the retention obligation needs.
+
+    Every identifier is nullable. A tenant is onboarded before its paperwork arrives, and
+    a schema that refused a partial profile would keep the missing number in somebody's
+    inbox instead of in the database. `TenantProfile.require_for` decides sufficiency at
+    packet build, where the answer is jurisdiction-specific and actionable.
+    """
+
+    __tablename__ = "tenant_profiles"
+
+    tenant_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.tenant_id", ondelete="CASCADE"), primary_key=True
+    )
+    legal_name: Mapped[str] = mapped_column(String(255))
+    """As registered. `tenants.name` is what an operator calls them; this is what prints."""
+
+    # ------------------------------------------------------------------ US
+    ein: Mapped[str | None] = mapped_column(String(16), doc="IRS EIN, optional CBP suffix")
+    broker_code: Mapped[str | None] = mapped_column(
+        String(3), doc="CBP filer code of the licensed transmitting broker; null for a self-filer"
+    )
+
+    # ------------------------------------------------------------------ KSA
+    cr_number: Mapped[str | None] = mapped_column(String(10), doc="Saudi commercial registration")
+    vat_number: Mapped[str | None] = mapped_column(String(15), doc="ZATCA VAT registration")
+    iban: Mapped[str | None] = mapped_column(
+        String(34), doc="Refund destination account. Validated by mod-97 before it is stored."
+    )
+
+    # ------------------------------------------------------------------ address
+    address_line1: Mapped[str] = mapped_column(String(255), default="")
+    address_line2: Mapped[str] = mapped_column(String(255), default="")
+    city: Mapped[str] = mapped_column(String(128), default="")
+    postal_code: Mapped[str] = mapped_column(String(16), default="")
+    country: Mapped[str] = mapped_column(String(2), default="")
+    contact_email: Mapped[str] = mapped_column(String(255), default="")
+    contact_phone: Mapped[str] = mapped_column(String(32), default="")
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        # Shape only. The application validates the IBAN checksum and the EIN format
+        # before it gets here; these constraints exist so a row written by psql or by a
+        # migration cannot be a shape the packager will later fail to print.
+        CheckConstraint("ein IS NULL OR ein ~ '^[0-9]{9}([A-Z0-9]{2})?$'", name="ck_profile_ein"),
+        CheckConstraint("cr_number IS NULL OR cr_number ~ '^[0-9]{10}$'", name="ck_profile_cr"),
+        CheckConstraint("vat_number IS NULL OR vat_number ~ '^[0-9]{15}$'", name="ck_profile_vat"),
+        CheckConstraint(
+            "broker_code IS NULL OR broker_code ~ '^[A-Z0-9]{3}$'", name="ck_profile_broker"
+        ),
+        CheckConstraint(
+            "iban IS NULL OR iban ~ '^[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}$'", name="ck_profile_iban"
+        ),
+        CheckConstraint("country = '' OR country ~ '^[A-Z]{2}$'", name="ck_profile_country"),
+    )
+
+
 class Document(Base):
     """Immutable, content-addressed source document.
 
