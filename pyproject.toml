@@ -100,7 +100,7 @@ ignore = [
 "services/api/src/migrations/versions/*.py" = ["E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["drawbridge_schemas", "services", "mcp_servers", "tests"]
+known-first-party = ["drawbridge_schemas", "services", "mcp_servers", "scripts", "tests"]
 
 [tool.mypy]
 python_version = "3.12"

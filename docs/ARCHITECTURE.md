@@ -424,6 +424,7 @@ drawbridge/
 │   ├── rules/                    # per-jurisdiction windows, thresholds, lane routing
 │   ├── packager/                 # 7551/7552, PSC, 1520(d) | ZATCA refund request
 │   └── agent/                    # Claude loop: narratives, exceptions, judgment calls
+│                                 #   worker.py — the drafting loop as a process (wk 14)
 ├── mcp_servers/            # named to avoid shadowing the `mcp` SDK package
 │   └── mcp_ace/ mcp_hts/ mcp_docs/ mcp_claims/ mcp_ledger/
 ├── n8n/workflows/                # exported JSON, version-controlled
@@ -432,13 +433,21 @@ drawbridge/
 │                                 # rls_bootstrap.py · tenant_offboard.py (operator, owner DSN)
 │                                 # mint_token.py · pilot_us.py / pilot_ksa.py / pilot_run.py
 │                                 # manage_secrets.py · calibrate_thresholds.py (wk 13)
+│                                 # ingest_cross.py — fetch a CROSS sample, then load it (wk 14)
 ├── tests/                        # unit · golden-claim fixtures · property-based rules
 │   └── fixtures/                 # tariff_benchmark.json · bayan.py (synthetic RTL table)
+├── secrets/                       # gitignored; the six files Postgres, MinIO and n8n read
 └── infra/
+    ├── authentik_bootstrap.py     # OIDC provider + tenant claim + RS256 round trip (wk 14)
+    ├── vault_bootstrap.py         # KV v2 mount, one-path policy, AppRole (wk 14)
+    ├── caddy/Caddyfile            # the only container that binds a port on-prem
+    ├── docker/                    # base.Dockerfile + the MCP Dockerfile generator
+    └── postgres/init.sql          # the n8n and authentik databases
 ```
 
-`scripts/` is type-checked under `mypy --strict` alongside the services. It builds customs
-payloads, which is not a lower standard of correctness than the code that consumes them.
+`scripts/` and `infra/` are type-checked under `mypy --strict` alongside the services. They
+build customs payloads and configure the identity provider, neither of which is a lower
+standard of correctness than the code that consumes them.
 
 ## 8. Claim state machine (Postgres-owned)
 
@@ -1466,10 +1475,193 @@ exactly like working instrumentation until somebody reads Jaeger — the same fa
 ### 18.6 What this does not do
 
 - **Authenticate against Authentik.** Unchanged from §17.7. No RS256 token has reached
-  this API.
+  this API. *Closed in week 14 — see §19.1.*
 - **Encrypt a secret.** `.secrets.json` is plaintext; the manager seam is unimplemented.
+  *Closed in week 14 — Vault and Secrets Manager are implemented, §19.2.*
 - **Carry the ruling corpus.** `tariff_rulings` is empty. CBP publishes CROSS through a
-  search interface with no bulk export, so `find_rulings` has nothing to cite.
+  search interface with no bulk export, so `find_rulings` has nothing to cite. *Partly
+  closed in week 14: a 120-ruling sample is loaded, and loading it showed that
+  `search_rulings` had never returned a row — §19.3.*
 - **File anything.** Both pilot corpora are fiction. Every figure carries a
   `pilot-fixture` box tracing to no document, and `assert_not_evidence` refuses to act on
   one.
+
+---
+
+## 19. The deployment (week 14)
+
+### 19.1 Identity is real now
+
+Weeks 12 and 13 both closed with the same sentence: no RS256 token has ever reached this
+API. `infra/authentik_bootstrap.py` closes it, declaratively — every step reads the current
+state and makes only the change that is missing, so a second run is a no-op and a run
+against a half-built configuration finishes it.
+
+| Built | Why it is the load-bearing part |
+|---|---|
+| RSA signing keypair | Under HS256 the verifier and the issuer share one secret, so the service that checks tokens can also forge them. RS256 means the API holds only a public key. |
+| Scope property mapping | Emits `tenant_id`. `tenancy.set_tenant` writes it into `tenant.id` and every RLS policy compares against it, so this mapping *is* the join between the directory and the database boundary. |
+| OAuth2 provider + application | `redirect_uris` empty. Client credentials has nowhere to redirect to, and a permissive URI on a provider that never uses one is an open redirect waiting for the code flow to be enabled. |
+| Service account with `tenant_id` | So the round trip needs no browser and exercises the machine-to-machine path n8n and the worker will use. |
+
+The mapping reads the claim from the user record rather than emitting a constant, because a
+constant would give every user in the directory the same tenant. A user without the
+attribute gets a token without the claim and `auth.decode` refuses it — correct: a caller
+whose tenant nobody has decided must fail at the door, not at a policy that would return
+zero rows and look like an empty account.
+
+Verification runs **through `services.api.src.auth.decode`**, the function every request
+runs. A bootstrap that re-verified with its own `jwt.decode` would prove PyJWT works.
+`--api-url` goes further and sends the token to the deployed API.
+
+**The negative half is the half that matters.** The same claims re-signed HS256 with the
+shared secret this service used until an OIDC URL was configured must come back 401. If
+they do not, the JWKS path was added *beside* the shared secret rather than in place of it,
+and every value in `.secrets.json` is still a token-minting key. Observed: `RS256 -> 200`,
+`HS256 -> 401 no verification key`.
+
+One compose defect surfaced: `DRAWBRIDGE_JWT_ISSUER` was hard-coded to `drawbridge`. That
+was fine while `make token` was the only issuer and wrong the instant a real one appeared —
+`iss` is the provider's own URL and the API has to be told what it will be.
+
+### 19.2 Three backends, and only one at a time
+
+`AwsSecretsManagerProvider` was a seam in week 13 whose `load` refused. It is implemented,
+and so is `VaultSecretProvider` — KV v2 over AppRole, through `httpx`, because the read is
+one GET and the login one POST and a client library for two endpoints is a supply-chain
+edge bought for nothing.
+
+```
+DRAWBRIDGE_SECRETS_PROVIDER = file | vault | aws
+default_providers() -> (EnvSecretProvider(), BACKENDS[name]())
+```
+
+**Exactly one backend, never a chain.** Naming Vault removes the file entirely. A fallback
+to disk when Vault is unreachable would start, work, and be running on whatever stale
+plaintext was last checked out — the failure this module exists to remove, reintroduced as
+a convenience. An unrecognised backend name is fatal for the same reason:
+`PROVIDER=valut` quietly reading the local file is a deployment that is not using the
+manager anyone believes it is using.
+
+AppRole rather than a token, because `VAULT_TOKEN` in an environment variable is `.env`
+with a better name. AppRole splits the credential: `role_id` is configuration and may sit
+in a compose file, `secret_id` is short-lived and injected at start, and what the process
+ends up holding is a token Vault issued with its own TTL and its own audit trail. The
+policy grants **read on one path** and withholds `list`, which reads as harmless and is
+not — a token that can enumerate a mount turns one leaked credential into a plan.
+
+Proved rather than asserted: the API container was restarted against Vault, logged in with
+the AppRole and resolved every secret from `secret/drawbridge`. The `.secrets.json` mount
+was still in the container and still unread — a value written only into Vault came back
+from `resolve()`.
+
+### 19.3 Ruling search had never returned a row
+
+`search_rulings` scored with `similarity(subject || ' ' || body, :q)`. `similarity` is
+set-symmetric — shared trigrams over the union of both sides — so a four-word query against
+a four-thousand-word ruling is dominated by the denominator. Against the loaded CROSS
+sample the best score any query reached was **0.127**, under a `LEXICAL_FLOOR` of 0.15:
+zero rows, for every query, since week 3. Three fixture rulings with two-sentence bodies
+hid it entirely.
+
+```
+score = greatest(
+    word_similarity(:q, subject),
+    0.6 * word_similarity(:q, left(body, 4000))
+)
+```
+
+`word_similarity` scores the query against the best-matching *extent* of the document
+rather than against the whole of it, which is the shape this problem actually has. Over
+subjects it separates cleanly: twelve goods queries each retrieved their own ruling at rank
+1, four non-goods queries topped out at 0.314. The body is scored because a CROSS subject
+is not always descriptive — a protest ruling is titled "Application for further review of
+protest number 1601-..." and names its goods only in the text — and it is discounted
+because a long document can always find some matching extent: the non-goods queries reach
+0.425 against bodies and 0.056 against subjects.
+
+`LEXICAL_FLOOR` did not move. Paraphrased goods queries land between 0.20 and 0.25 and the
+non-goods queries reach 0.314; the ranges overlap and no floor separates them. Same finding
+as §18.4 and the same response: `find_rulings` returns candidates for a person to read, and
+tuning the floor until the overlap disappeared would tune it until real matches did too.
+
+Second week running that real data broke something a fixture had been certifying — the
+embedding text last week, the lexical scorer this week. Both were sized against corpora too
+small for the defect to express itself.
+
+### 19.4 White label is a representation, not a logo
+
+The preparer notice on a 7551 says who produced the document and what they may do with it.
+Ours says *"Drawbridge is not a customs broker and does not transmit to CBP"*, which is
+true of us and is the sentence §5 turns on. It is false on a licensed broker's form.
+
+`services/packager/src/branding.py` composes the notice from what is true of the deployer
+rather than substituting a name into ours. `is_licensed_broker` selects the second
+sentence, and a deployment that sets it must supply the filer code that makes the claim
+checkable — `Preparer` refuses construction otherwise, because an unverifiable claim of
+licensure on a customs filing is worse than none. A deployment that renamed the preparer
+and kept our disclaimer would be worse than one that changed nothing, because it would read
+as deliberate.
+
+Not brandable: the certifications, the statutory citations, the form titles, and the "not a
+CBP-issued form" line. Those are the authority's words or facts about the document, and a
+deployment able to edit them could quietly weaken a declaration somebody signs.
+
+`preparer` rides on `PacketRequest`, not on configuration read inside the renderer, so a
+packet regenerated in four years reproduces the notice that was on it.
+
+### 19.5 The on-prem stack
+
+`docker-compose.onprem.yml` is **standalone**. An overlay would be shorter and would be a
+trap: `-f a.yml -f b.yml` merges rather than replaces, so every bind mount, published port
+and `--reload` survives, and forgetting one `-f` deploys development under a production
+name.
+
+| | Development | On-prem |
+|---|---|---|
+| Published ports | 11 services | one: Caddy, TLS |
+| Source | bind-mounted, `--reload` | baked into the image |
+| Secrets | `.secrets.json` | Vault, no fallback |
+| Identity | HS256 shared secret | Authentik RS256, no fallback |
+| Data plane egress | full | none — `internal: true` |
+| Migrations | by hand | a job the API waits on |
+| Capabilities | default | `cap_drop: [ALL]`, `no-new-privileges`, `read_only` |
+
+The `internal: true` network is the cheapest meaningful control here. Postgres, Redis,
+MinIO, Jaeger and all five MCP servers have no default gateway and cannot originate
+outbound traffic at all — none of them has any use for it, and the database cannot phone
+home.
+
+Six credentials still arrive as files under `./secrets`, because Postgres, MinIO and n8n
+read a `_FILE` variant and cannot be taught to call a manager. That is two copies of each
+secret. `secrets/README.md` says so and names the fix (a `vault agent` sidecar templating
+them at start), which is not built.
+
+### 19.6 The agent finally has a process
+
+`services/agent/src/queue.py` could draft memos from week 8. Nothing ran it — no
+entrypoint, which is why "a live agent run against real queue rows" sat on the roadmap for
+six weeks while the code that would do it was passing its own tests.
+`services/agent/src/worker.py` is a loop around `draft_pending` and nothing else.
+
+It polls, on purpose. `LISTEN`/`NOTIFY` is fewer wasted queries and one more thing to lose
+silently: a dropped notification is a memo that never appears and no evidence anything
+happened. The consumer is a person arriving minutes to hours later, so the interval is
+minutes and a poll that finds nothing is one indexed query.
+
+It runs unscoped — `tenant_id=None`, drafting across every tenant — which is the same
+posture as the service token n8n carries and for the same reason: one worker serves
+whichever tenants have queued work. It is therefore the second cross-tenant process in the
+deployment, and the on-prem stack gives it its own credential so the blast radius is
+something somebody can revoke.
+
+### 19.7 What this still does not do
+
+- **Back anything up.** `postgres-data` is a volume on one host. The retention obligation
+  is years and a volume is not a backup. The largest remaining hole.
+- **Classify.** 5 of 10 at hs6, unchanged. Nothing this week touched that path.
+- **Carry CROSS.** 120 rulings drawn round-robin across twelve terms. A sample is not the
+  corpus, and `scripts/ingest_cross.py` says so in its own docstring.
+- **Run n8n for real.** Carried from weeks 9–13.
+- **File anything.** Both corpora are fiction; `assert_not_evidence` refuses to act on a
+  `pilot-fixture` box.

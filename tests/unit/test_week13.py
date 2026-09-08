@@ -180,8 +180,14 @@ class TestWhereSecretsComeFrom:
 
     def test_the_aws_provider_refuses_instead_of_returning_nothing(self) -> None:
         """Returning empty would let a deployment start with every secret missing and
-        fail at the first request instead of at startup."""
-        with pytest.raises(SecretsError, match="seam, not an implementation"):
+        fail at the first request instead of at startup.
+
+        Week 13 asserted this against a provider that was a deliberate seam. Week 14
+        implemented it, and the assertion is unchanged in substance: with no region and no
+        credentials configured, botocore raises before it reaches the network, and what
+        comes out of this module is still a `SecretsError` and still not `{}`.
+        """
+        with pytest.raises(SecretsError, match="could not return"):
             AwsSecretsManagerProvider("drawbridge/prod").load()
 
 

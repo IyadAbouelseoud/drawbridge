@@ -1,9 +1,14 @@
 """Runtime configuration.
 
 Non-secret values come from the environment. Secrets do not: they are resolved by
-`services.api.src.secrets` from a gitignored file, with the environment as a deliberate
-override for orchestrators that inject. See that module for why the distinction is worth
-the extra source.
+`services.api.src.secrets` from whichever backend `DRAWBRIDGE_SECRETS_PROVIDER` names —
+a local file, HashiCorp Vault, or AWS Secrets Manager — with the environment as a
+deliberate override for orchestrators that inject.
+
+`Settings` does not know which backend answered, and that is the point of the seam: the
+only thing this module does with the choice is express *where it sits in precedence*,
+once, in `settings_customise_sources`. Adding a fourth manager changes a dict in
+`secrets.py` and nothing here.
 """
 
 from __future__ import annotations
@@ -20,13 +25,18 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 
-class SecretsFileSource(PydanticBaseSettingsSource):
+class SecretsSource(PydanticBaseSettingsSource):
     """Feeds resolved secrets into `Settings` as one more settings source.
 
-    A source rather than a `__init__` argument so that precedence is expressed once, in
+    A source rather than an `__init__` argument so that precedence is expressed once, in
     `settings_customise_sources`, instead of being re-derived at every construction site —
     and so the test suite can build a `Settings` with explicit keyword arguments and have
     them win, which is what every test in the suite relies on.
+
+    Resolution happens once per `Settings` instance and is cached on the source. A Vault
+    read is a network round trip and pydantic-settings consults a source once per field;
+    without the cache, constructing `Settings` would be twenty round trips and a manager
+    outage mid-construction would produce a half-configured object rather than an error.
     """
 
     def __init__(self, settings_cls: type[BaseSettings]) -> None:
@@ -103,6 +113,22 @@ class Settings(BaseSettings):
     n8n_encryption_key: str | None = None
     authentik_secret_key: str | None = None
 
+    # ----------------------------------------------------------------- white label
+    # Who this deployment says prepared a packet. A broker running Drawbridge inside
+    # their own network prepares filings under their own licence, and the preparer notice
+    # on a CBP form is a representation to a customs authority rather than a logo — see
+    # services/packager/src/branding.py for why the wording is composed rather than
+    # substituted, and for what stays unbrandable.
+    #
+    # `preparer_is_licensed_broker` changes what the document claims about the party that
+    # produced it. It is off by default because the safe default for an unconfigured
+    # deployment is the narrower claim, and `Preparer` refuses to be constructed with it
+    # on and no filer code.
+    preparer_name: str = "Drawbridge"
+    preparer_is_licensed_broker: bool = False
+    preparer_filer_code: str = ""
+    preparer_contact: str = ""
+
     # --------------------------------------------------------------- observability
     # Empty means spans are created and dropped. See services/api/src/telemetry.py: the
     # trace id reaches `audit_ledger` either way, so recordkeeping does not depend on a
@@ -139,17 +165,17 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """init > environment > secrets file > `.env`.
+        """init > environment > secrets backend > `.env`.
 
-        The environment beats the secrets file because an orchestrator that injects a
-        value is making a deliberate statement and must be able to override a stale file.
-        The secrets file beats `.env` because moving secrets out of `.env` is the entire
-        point: with both present, the file is what takes effect.
+        The environment beats the backend because an orchestrator that injects a value is
+        making a deliberate statement and must be able to override a stale one. The
+        backend beats `.env` because moving secrets out of `.env` is the entire point:
+        with both present, the manager is what takes effect.
         """
         return (
             init_settings,
             env_settings,
-            SecretsFileSource(settings_cls),
+            SecretsSource(settings_cls),
             dotenv_settings,
             file_secret_settings,
         )

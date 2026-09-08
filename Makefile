@@ -1,4 +1,6 @@
-.PHONY: help up down logs ps build lint fmt type test check clean rls-bootstrap \n	token token-service pilot-seed
+.PHONY: help up down logs ps build lint fmt type test check clean rls-bootstrap \
+	token token-service pilot-seed pilot-run secrets-init secrets-show secrets-check \
+	secrets-push vault-up identity-up cross-ingest onprem-config
 
 help:
 	@echo "up      - bring the stack up"
@@ -17,6 +19,11 @@ help:
 	@echo "secrets-init  - generate .secrets.json; additive, add --force to rotate"
 	@echo "secrets-show  - secret names, sources and redactions; never values"
 	@echo "secrets-check - what a production start would refuse on"
+	@echo "secrets-push  - promote the local file into the configured manager"
+	@echo "vault-up      - dev-mode Vault, then configure it and verify the read path"
+	@echo "identity-up   - Authentik, then provider + application + one RS256 round trip"
+	@echo "cross-ingest  - fetch a CROSS ruling sample, load it and embed it"
+	@echo "onprem-config - render and validate docker-compose.onprem.yml"
 
 # n8n, Authentik and MinIO read credentials from the environment and cannot be taught to
 # read .secrets.json, so the file is bridged into this one invocation's environment. The
@@ -45,7 +52,7 @@ fmt:
 	uv run ruff format . && uv run ruff check --fix .
 
 type:
-	uv run mypy services mcp_servers packages/schemas/src scripts
+	uv run mypy services mcp_servers packages/schemas/src scripts infra
 
 test:
 	uv run pytest
@@ -70,6 +77,47 @@ secrets-show:
 
 secrets-check:
 	@uv run python scripts/manage_secrets.py check
+
+secrets-push:
+	@uv run python scripts/manage_secrets.py push
+
+# Dev-mode Vault, then the mount, the read-only policy, the AppRole and the secrets. The
+# script verifies by reading them back through the provider the API itself uses, which is
+# the only verification worth printing.
+vault-up:
+	docker compose --profile secrets up -d vault
+	VAULT_ADDR=http://localhost:8200 VAULT_TOKEN=$${VAULT_DEV_ROOT_TOKEN_ID:-drawbridge-dev-root} \
+		uv run python infra/vault_bootstrap.py
+
+# Authentik, then the OIDC provider, application, tenant property mapping and a service
+# account — ending in one real RS256 token verified through services/api/src/auth.py.
+# TENANT is the tenant the round-trip service account acts for.
+#
+# The authentik database is created by infra/postgres/init.sql, which only runs when the
+# Postgres volume is first initialised. On a cluster that predates it, this creates it.
+identity-up:
+	@test -n "$(TENANT)" || (echo 'usage: make identity-up TENANT=<uuid>' && exit 2)
+	docker compose exec -T postgres psql -U drawbridge -d postgres -tAc \
+		"SELECT 1 FROM pg_database WHERE datname='authentik'" | grep -q 1 || \
+		docker compose exec -T postgres psql -U drawbridge -d postgres -c \
+		"CREATE DATABASE authentik OWNER drawbridge"
+	set -a; . <(uv run python scripts/manage_secrets.py env); set +a; \
+		docker compose --profile identity up -d authentik-server authentik-worker
+	uv run python infra/authentik_bootstrap.py --tenant $(TENANT) --api-url http://localhost:8000
+
+# A term-drawn sample, not the corpus. CBP publishes no bulk export; see the script.
+cross-ingest:
+	uv run python -m scripts.ingest_cross fetch --limit $${LIMIT:-120} --load
+	uv run python scripts/embed_corpus.py --table rulings
+
+# Renders the on-prem stack with placeholder values and validates it. Catches a broken
+# anchor or a missing required variable without needing a deployment to try it on.
+onprem-config:
+	DRAWBRIDGE_VERSION=0.0.0-check VAULT_ADDR=http://vault:8200 \
+	DRAWBRIDGE_VAULT_ROLE_ID=check DRAWBRIDGE_VAULT_SECRET_ID=check \
+	DRAWBRIDGE_OIDC_JWKS_URL=http://check/jwks DRAWBRIDGE_JWT_ISSUER=http://check/ \
+	DRAWBRIDGE_PREPARER_NAME=check DRAWBRIDGE_PUBLIC_HOST=check.example \
+		docker compose -f docker-compose.onprem.yml config -q && echo 'onprem stack is valid'
 
 token:
 	@test -n "$(TENANT)" || (echo 'usage: make token TENANT=<uuid>' && exit 2)

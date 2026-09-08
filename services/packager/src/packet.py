@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from drawbridge_schemas.claim import RecoveryLane
 from drawbridge_schemas.jurisdiction import Currency, Jurisdiction
+from services.packager.src.branding import DEFAULT_PREPARER, Preparer
 from services.packager.src.citations import Citation, open_citations
 
 if TYPE_CHECKING:
@@ -123,6 +124,16 @@ class PacketRequest:
 
     refund_account_iban: str = ""
     """KSA only. ZATCA settles an approved refund to a registered bank account."""
+
+    preparer: Preparer = DEFAULT_PREPARER
+    """Who prepared this packet, and whether they may transmit it.
+
+    Carried on the request rather than read from configuration inside the renderer, for
+    the reason in this class's own docstring: the packager renders from stored input and
+    nothing else, so a packet regenerated in four years reproduces the notice that was on
+    it rather than the notice the deployment happens to be configured with today. See
+    `services/packager/src/branding.py` for why the wording is composed rather than
+    substituted."""
 
     notes: str = ""
 

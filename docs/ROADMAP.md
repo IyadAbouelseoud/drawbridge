@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 13 |
+| Current week | 14 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | **The pilot** — both corpora through the pipeline, identity in the database, secrets out of the environment |
+| Current milestone | **The deployment** — real identity, a real secrets manager, a hardened on-prem stack that carries the deployer's name |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -940,26 +940,184 @@ given. The recovery is one command:
   box that traces to no document, and `assert_not_evidence` runs before the seeder and
   again before the pilot.
 
-## Week 14 entry checklist
+## Week 14 task breakdown
 
-1. **Retrieval is at 5 of 10 and needs to be much better.** The leaf-first text bought
-   the jump from 1; the remaining gap is the representation. Try a larger or
-   English-specialised embedding model, or a two-stage retrieve-then-rerank, and measure
-   with `scripts/calibrate_thresholds.py` rather than by impression.
-2. **Leave `vector_ceiling` alone until retrieval is fixed.** Week 13 measured 0.475 for
-   the worst correct answer and 0.492 for noise; no threshold lives in that gap. Both
-   constants are still the week 8 numbers and still labelled as such in the source.
-3. **CROSS.** Carried from weeks 9–13. No bulk export exists; this needs a decision about
-   scraping, purchasing, or narrowing the claim `find_rulings` makes.
-4. **An Authentik blueprint** and one real RS256 round trip. Carried from week 12.
-5. **A real secrets manager behind `SecretProvider`.** The seam is written and refuses.
-6. **A *Bayan* header-block template.** Partially blocked on **B3**.
-7. **Import the workflows into n8n and run one for real.** Carried from weeks 9–12.
-8. **A live agent run against real queue rows.** Carried from week 8.
-9. **A retention job**: `verify_chain` on a schedule, and where the ledger is replicated.
-   Carried from weeks 10–13.
-10. **Broker white-label packaging and `.onprem.yml`** — the week 14 milestone itself.
-11. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text, **B3** a
+- [x] `infra/authentik_bootstrap.py` — provider, application, `tenant_id` mapping, RS256
+      round trip against the running API
+- [x] `VaultSecretProvider` and a real `AwsSecretsManagerProvider`; `.secrets.json` is now
+      one backend of three and no longer the only one
+- [x] `infra/vault_bootstrap.py` — KV v2 mount, one-path policy, AppRole, verified read
+- [x] `scripts/ingest_cross.py` — CROSS is loaded; `tariff_rulings` is not empty
+- [x] `services/classifier/src/search.py` — the ruling scorer, which had never returned
+      a row against a real body
+- [x] `services/packager/src/branding.py` — white label as a compliance surface
+- [x] `services/agent/src/worker.py` — the drafting loop finally has a process
+- [x] `docker-compose.onprem.yml`, `infra/caddy/Caddyfile`, `.env.onprem.example`
+- [x] `README.md` — the dual-jurisdiction summary
+
+### The debt cleared first, and what each one turned out to be
+
+**Authentik.** Weeks 12 and 13 both recorded the same sentence: no RS256 token has ever
+reached this API. `infra/authentik_bootstrap.py` creates the signing keypair, the scope
+property mapping that emits `tenant_id`, the OAuth2 provider, the application and a service
+account, then mints a token and verifies it *through `services.api.src.auth.decode`* — the
+function every request runs, rather than a second `jwt.decode` that would only prove PyJWT
+works. With `--api-url` it also sends the token to the deployed API over HTTP.
+
+Two things came out of doing it rather than describing it. The provider needs
+`redirect_uris` present even though the client-credentials grant has nowhere to redirect
+to; it is set empty, because a permissive redirect URI on a provider that never uses one is
+an open redirect waiting for somebody to enable the code flow. And `DRAWBRIDGE_JWT_ISSUER`
+was hard-coded to `drawbridge` in the compose file, which was fine while `make token` was
+the only issuer and wrong the moment a real one appeared: `iss` is the provider's own URL
+and the API has to be told what it will be.
+
+The negative half of the round trip is the half worth keeping. The same claims, re-signed
+HS256 with the shared secret this service used until an OIDC URL was configured, must come
+back 401. If they do not, the JWKS path was added *beside* the shared secret rather than in
+place of it — and every value in `.secrets.json` is still a token-minting key. Observed:
+`RS256 -> HTTP 200`, `HS256 -> HTTP 401 no verification key`.
+
+**Secrets.** `AwsSecretsManagerProvider` was written in week 13 as a seam whose `load`
+refused. It is implemented now, and so is `VaultSecretProvider` — KV v2 over AppRole,
+through `httpx`, because the read is one GET and the login is one POST and a client library
+for two endpoints is a supply-chain edge bought for nothing.
+
+The design decision that matters is not which manager: it is that `default_providers`
+returns the environment and **exactly one** backend. Naming Vault removes the file from the
+chain entirely. A chain that fell back to disk when Vault was unreachable would start,
+work, and be running on whatever stale plaintext was last checked out — which is the
+failure the whole exercise exists to remove, reintroduced as a convenience.
+
+Proved end to end rather than asserted: the API container was restarted with
+`DRAWBRIDGE_SECRETS_PROVIDER=vault`, logged in with the AppRole, and resolved every secret
+from `secret/drawbridge`. The `.secrets.json` mount was still present in the container and
+still not consulted — a value written into Vault and absent from the file came back from
+`resolve()`.
+
+**CROSS.** Carried since week 9 on the grounds that CBP publishes no bulk export, which is
+true. The search interface is a single-page application backed by a public JSON API, and
+120 rulings drawn round-robin across twelve terms now sit in `tariff_rulings`, embedded.
+Round-robin and not term-by-term: draining the first term before starting the second
+produced a sample from four chapters under a docstring claiming twelve, which is how a
+corpus quietly becomes a corpus about laptops. `BeautifulSoup` is not used, because the
+endpoint returns plain text — thirty bodies sampled across six chapters carried no markup
+at all, and a parser for tags that do not exist is dead weight with a supply chain.
+
+### Loading the rulings found that ruling search had never worked
+
+`search_rulings` scored with `similarity(subject || ' ' || body, :q)`. `similarity` is
+set-symmetric — shared trigrams over the union of both sides — so a four-word query against
+a four-thousand-word ruling is dominated by the denominator. Against the loaded corpus the
+best score any query achieved was **0.127**, and `LEXICAL_FLOOR` is 0.15. The function
+returned zero rows for every query, and had done since week 3. Three hand-written fixture
+rulings with two-sentence bodies hid it completely.
+
+`word_similarity(query, document)` is the operator for this shape: it scores the query
+against the best-matching extent rather than against the whole. Over subjects it separates
+cleanly — twelve goods queries each retrieved their own ruling at rank 1, and four
+non-goods queries topped out at 0.314. The body is scored too, at 0.6 weight, because a
+CROSS subject is not always descriptive: a protest ruling is titled "Application for
+further review of protest number 1601-..." and the goods appear only in the text. The
+discount is there because a long document can always find *some* matching extent — the
+non-goods queries score 0.425 against bodies and 0.056 against subjects.
+
+`LEXICAL_FLOOR` did not move, for the same reason `vector_ceiling` did not move last week.
+Paraphrased goods queries — what an analyst types, as against the term CBP indexed on —
+land between 0.20 and 0.25, and the non-goods queries reach 0.314. The ranges overlap and
+no floor separates them. `find_rulings` returns a list for a person to read against the
+article in front of them, and tuning the floor until the overlap disappeared would tune it
+until the real matches disappeared too.
+
+This is the second week running that real data broke something a fixture had been
+certifying. Week 13 it was the embedding text; this week it is the lexical scorer. Both
+were sized against corpora small enough that the defect could not express itself.
+
+### White label is a compliance surface, not a logo
+
+Every 7551 since week 4 has carried: *"Prepared by Drawbridge for filing by a licensed
+customs broker. Drawbridge is not a customs broker and does not transmit to CBP."* Both
+halves are true of us and load-bearing — §5 of the architecture turns on the second.
+Neither is true of a licensed broker preparing their own client's claim.
+
+So the notice is **composed** rather than substituted. `Preparer.is_licensed_broker`
+selects which second sentence is true, and a deployment that sets it must supply the filer
+code that makes the claim checkable — `Preparer` refuses to be constructed otherwise,
+because an unverifiable claim of licensure on a customs filing is worse than no claim. A
+deployment that renamed the preparer and kept our disclaimer would be worse than one that
+changed nothing, because it would read as deliberate.
+
+The certifications, the statutory citations, the form titles and the "not a CBP-issued
+form" line are not brandable. They are the authority's words or facts about the document,
+and a deployment able to edit them could quietly weaken a declaration somebody signs.
+
+`preparer` rides on `PacketRequest` rather than being read from configuration inside the
+renderer, so a packet regenerated in four years reproduces the notice that was on it rather
+than the notice the deployment happens to carry that day.
+
+### The on-prem stack, and why it is standalone
+
+`docker-compose.onprem.yml` is not an overlay. An overlay would be shorter and would be a
+trap: `-f a.yml -f b.yml` merges rather than replaces, so every bind mount, published port
+and `--reload` in the development file survives into the deployment, and forgetting one
+`-f` deploys development under a production name.
+
+What actually changes:
+
+- **One container binds a port.** Development publishes Postgres, MinIO, Jaeger and five
+  MCP servers — convenient on a laptop, and nine unauthenticated services on a broker's
+  LAN. Here Caddy terminates TLS and everything else is reachable only inside the network.
+- **The data plane has no default gateway.** `drawbridge-data` is `internal: true`, so
+  Postgres, Redis, MinIO, Jaeger and the five MCP servers cannot originate outbound traffic
+  at all. It is the cheapest meaningful control in the file: the database cannot phone home.
+- **Secrets from Vault with nothing behind them**, identity from Authentik with no
+  shared-secret fallback, and `DRAWBRIDGE_ENVIRONMENT=production` so `check_secret_posture`
+  refuses a placeholder rather than warning about it.
+- **Migrations are a job the API waits on**, not something four uvicorn workers race.
+- `cap_drop: [ALL]`, `no-new-privileges`, `read_only` with a tmpfs `/tmp` on every image we
+  build, resource limits, and log rotation in the daemon rather than in a cron job nobody
+  wrote.
+
+Six credentials still reach containers as files under `./secrets`, because Postgres, MinIO
+and n8n read a `_FILE` variant and cannot be taught to call a manager. That is two copies
+of each secret and it is stated in `secrets/README.md` rather than glossed: the fix is a
+`vault agent` sidecar templating them at start, and it is not built.
+
+### What week 14 deliberately did not do
+
+- **Back anything up.** `postgres-data` is a volume on one host. The retention obligation
+  runs for years and a volume is not a backup. Carried, and now the most conspicuous gap.
+- **Fix classification.** Still 5 of 10 at hs6 against the full schedule. Nothing this week
+  touched it; the ruling scorer is a different code path.
+- **Pin digests.** The on-prem file pins tags. A deployment that has been through change
+  control should carry digests, and the file says so.
+- **Run n8n for real.** Carried from weeks 9–13. The service token reaches the container;
+  no workflow has been imported and executed.
+- **File anything.** Both corpora are fiction and `assert_not_evidence` refuses to act on
+  a `pilot-fixture` provenance box.
+
+## Week 15 entry checklist
+
+1. **Retrieval.** 5 of 10 at hs6 is the oldest unfixed number in this file. The text is no
+   longer the suspect — the model is. A 384-dimension multilingual MiniLM over 29,000
+   near-identical legal phrases is a thin representation; try an English-specialised model
+   or retrieve-then-rerank, and measure with `scripts/calibrate_thresholds.py`.
+2. **Then the thresholds.** `vector_ceiling` and `CONFIRMATION_LEXICAL_FLOOR` are still
+   week 8's numbers, measured on twenty-four lines. `LEXICAL_FLOOR` is now also known to
+   sit inside an overlap for rulings. None of the three moves until retrieval does.
+3. **Backups and retention.** `verify_chain` on a schedule, where `postgres-data` is
+   replicated, and what an offboarded tenant's archive bucket lifecycle is. Carried from
+   weeks 10–14 and now the largest hole in a stack that claims a four-year obligation.
+4. **A `vault agent` sidecar** for Postgres, MinIO and n8n, removing the six files under
+   `./secrets` and the second copy of each secret.
+5. **Import the workflows into n8n and run one for real.** Carried from weeks 9–14.
+6. **A live agent run against real queue rows.** The worker exists now; it has never
+   drafted a memo in a deployment.
+7. **More of CROSS.** 120 rulings is a sample. Decide whether the answer is a larger
+   sample, a purchased corpus, or narrowing what `find_rulings` claims to cover.
+8. **A *Bayan* header-block template.** Partially blocked on **B3**.
+9. **Digest-pinned images** and a signed release, so "what is deployed" has one answer.
+10. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text, **B3** a
     real scanned *Bayan* corpus.
 
 ## Sequencing rationale
@@ -1032,3 +1190,11 @@ full corpus produced was the discovery that classification does not work at volu
 a green pilot on a toy corpus would have hidden behind a green pilot. The ordering that
 matters here is not pilot-then-corpus or corpus-then-pilot; it is that both ran in the same
 week, so the one that passes could be checked against the one that does not.
+
+The debt before the milestone (wk 14), which is the reverse of every other week here and
+was right. The three carried items — Authentik, a real secrets manager, CROSS — are exactly
+the three things an on-prem deployment cannot be honest without: a stack that shipped with
+a shared-secret fallback, a plaintext file and an empty ruling table would have been a
+hardened deployment of a development configuration. Clearing them first also produced the
+week's most useful finding, because loading CROSS is what showed that ruling search had
+never returned a row. A milestone built on top of unpaid debt tends to certify the debt.

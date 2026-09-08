@@ -1,0 +1,550 @@
+# Drawbridge — on-premises deployment, for a broker running this inside their own network.
+#
+# ---------------------------------------------------------------------------------------
+# This file is standalone. It is NOT an overlay on docker-compose.yml.
+#
+#   docker compose -f docker-compose.onprem.yml --env-file .env.onprem up -d
+#
+# An overlay would be shorter and would be a trap: `-f a.yml -f b.yml` merges rather than
+# replaces, so every bind mount, every published port and every `--reload` in the
+# development file survives into the deployment, and forgetting one `-f` deploys the
+# development stack under a production name. A deployment file should be readable as the
+# whole truth about what runs. This one is.
+#
+# ---------------------------------------------------------------------------------------
+# What is different from development, and why each difference exists.
+#
+# **No source is mounted.** Development bind-mounts ./services so uvicorn can reload. Here
+# the code is what was built into the image, so what is deployed is a thing with a digest
+# rather than whatever is checked out on the host.
+#
+# **Nothing is published except the ingress.** Development exposes Postgres on 5432, MinIO
+# on 9000, Jaeger on 16686 and five MCP servers on 8101-8105, which is convenient on a
+# laptop and is nine unauthenticated services on a broker's LAN. Here, one container binds
+# a port and everything else is reachable only from inside the compose network.
+#
+# **The data plane has no route out.** `drawbridge-data` is `internal: true`: Postgres,
+# Redis, MinIO and Vault cannot originate outbound traffic at all. The application
+# services sit on both networks and reach the internet through `drawbridge-edge`. This is
+# the control that matters most in an exfiltration: the database cannot phone home.
+#
+# **Secrets come from Vault, and there is no file to fall back to.** No `.secrets.json` is
+# mounted. `services/api/src/secrets.py` returns the environment and exactly one backend,
+# so an unreachable Vault stops the deployment instead of silently running on stale
+# plaintext.
+#
+# **Identity is Authentik and only Authentik.** `DRAWBRIDGE_OIDC_JWKS_URL` is set, so
+# `auth.py` verifies RS256 against a fetched public key and never consults `jwt_secret`.
+# Nothing inside this deployment can mint a token, including `make token`. Configure it
+# with `python infra/authentik_bootstrap.py`, which prints the three values below.
+#
+# **`DRAWBRIDGE_ENVIRONMENT=production` is load-bearing.** `check_secret_posture` refuses
+# to start when a known development placeholder is configured, rather than warning. A
+# control that is present and inert is worse than one that is absent.
+#
+# **Migrations run as a job, not on boot.** `migrate` runs `alembic upgrade head` and
+# exits; the API waits for it to succeed. Migrating from inside the API's lifespan would
+# mean N replicas racing the same DDL.
+#
+# ---------------------------------------------------------------------------------------
+# What this file does NOT do, stated rather than implied.
+#
+# - **It is not highly available.** One Postgres, one Redis, one of everything. A broker
+#   who needs HA needs a managed database, not a second container here.
+# - **It takes no backups.** `postgres-data` is a volume on one host. The retention
+#   obligation under 19 CFR 163 and GCC Art. 175 is years, and a volume is not a backup.
+#   That job is not written and is on the roadmap.
+# - **It pins tags, not digests.** `postgres:16.6` is reproducible until it is retyped.
+#   `docker compose pull && docker image inspect --format '{{index .RepoDigests 0}}'` gives
+#   the digests; a deployment that has been through change control should carry them here.
+# - **Vault runs in dev mode in the `bootstrap` profile only.** The default is an external
+#   Vault the broker already operates. See the `vault` service.
+#
+# Required in .env.onprem — the deployment will not start without them:
+#   DRAWBRIDGE_PUBLIC_HOST, VAULT_ADDR, DRAWBRIDGE_VAULT_ROLE_ID, DRAWBRIDGE_VAULT_SECRET_ID,
+#   DRAWBRIDGE_OIDC_JWKS_URL, DRAWBRIDGE_JWT_ISSUER, DRAWBRIDGE_PREPARER_NAME
+# See .env.onprem.example.
+
+x-hardening: &hardening
+  restart: unless-stopped
+  # Containers may not gain privileges they did not start with, and start with none.
+  # `no-new-privileges` is what stops a setuid binary inside the image from being a path
+  # back to root even if everything else here is right.
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  # Logs are rotated in the daemon rather than by a cron job nobody wrote. Without this a
+  # container that starts crash-looping fills the host disk, and a full disk takes the
+  # database down with it.
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+
+x-python-onprem: &python-onprem
+  <<: *hardening
+  image: drawbridge/api:${DRAWBRIDGE_VERSION:?set DRAWBRIDGE_VERSION}
+  # The image ships a uid-10001 user and nothing in it needs to write to its own
+  # filesystem. `/tmp` is a tmpfs so pdfplumber and PyMuPDF have scratch space that
+  # vanishes with the container.
+  read_only: true
+  tmpfs: ["/tmp:size=256m,mode=1777"]
+  environment: &python-env
+    DRAWBRIDGE_ENVIRONMENT: production
+    DRAWBRIDGE_LOG_LEVEL: ${DRAWBRIDGE_LOG_LEVEL:-INFO}
+
+    # No password in either DSN. Both are completed from Vault by
+    # services/api/src/secrets.py, which is what keeps them out of `docker inspect`.
+    DRAWBRIDGE_DATABASE_URL: postgresql+asyncpg://drawbridge_app@postgres:5432/drawbridge
+    DRAWBRIDGE_REDIS_URL: redis://redis:6379/0
+
+    DRAWBRIDGE_SECRETS_PROVIDER: vault
+    VAULT_ADDR: ${VAULT_ADDR:?set VAULT_ADDR}
+    DRAWBRIDGE_VAULT_MOUNT: ${DRAWBRIDGE_VAULT_MOUNT:-secret}
+    DRAWBRIDGE_VAULT_PATH: ${DRAWBRIDGE_VAULT_PATH:-drawbridge}
+    # role_id is configuration; secret_id is the credential and is injected at deploy
+    # time. See infra/vault_bootstrap.py.
+    DRAWBRIDGE_VAULT_ROLE_ID: ${DRAWBRIDGE_VAULT_ROLE_ID:?set DRAWBRIDGE_VAULT_ROLE_ID}
+    DRAWBRIDGE_VAULT_SECRET_ID: ${DRAWBRIDGE_VAULT_SECRET_ID:?set DRAWBRIDGE_VAULT_SECRET_ID}
+
+    DRAWBRIDGE_S3_ENDPOINT_URL: http://minio:9000
+    DRAWBRIDGE_S3_ACCESS_KEY: ${DRAWBRIDGE_S3_ACCESS_KEY:-drawbridge}
+    DRAWBRIDGE_S3_BUCKET_DOCUMENTS: drawbridge-documents
+    DRAWBRIDGE_S3_BUCKET_ARCHIVE: drawbridge-archive
+
+    DRAWBRIDGE_OTEL_EXPORTER_ENDPOINT: http://jaeger:4318
+
+    # RS256 against Authentik, and nothing else. With a JWKS URL set, `jwt_secret` is
+    # never consulted — see services/api/src/auth.py::_signing_key.
+    DRAWBRIDGE_AUTH_REQUIRED: "true"
+    DRAWBRIDGE_OIDC_JWKS_URL: ${DRAWBRIDGE_OIDC_JWKS_URL:?set DRAWBRIDGE_OIDC_JWKS_URL}
+    DRAWBRIDGE_JWT_ISSUER: ${DRAWBRIDGE_JWT_ISSUER:?set DRAWBRIDGE_JWT_ISSUER}
+    DRAWBRIDGE_JWT_AUDIENCE: ${DRAWBRIDGE_JWT_AUDIENCE:-drawbridge-api}
+
+    # White label. The preparer notice on a CBP form is a representation to a customs
+    # authority: a licensed broker preparing their own client's claim must not print our
+    # disclaimer, and must supply the filer code that makes their own claim checkable.
+    # See services/packager/src/branding.py.
+    DRAWBRIDGE_PREPARER_NAME: ${DRAWBRIDGE_PREPARER_NAME:?set DRAWBRIDGE_PREPARER_NAME}
+    DRAWBRIDGE_PREPARER_IS_LICENSED_BROKER: ${DRAWBRIDGE_PREPARER_IS_LICENSED_BROKER:-false}
+    DRAWBRIDGE_PREPARER_FILER_CODE: ${DRAWBRIDGE_PREPARER_FILER_CODE:-}
+    DRAWBRIDGE_PREPARER_CONTACT: ${DRAWBRIDGE_PREPARER_CONTACT:-}
+
+    DRAWBRIDGE_MCP_ACE_URL: http://mcp-ace:8101/mcp
+    DRAWBRIDGE_MCP_HTS_URL: http://mcp-hts:8102/mcp
+    DRAWBRIDGE_MCP_DOCS_URL: http://mcp-docs:8103/mcp
+    DRAWBRIDGE_MCP_CLAIMS_URL: http://mcp-claims:8104/mcp
+    DRAWBRIDGE_MCP_LEDGER_URL: http://mcp-ledger:8105/mcp
+  networks: [edge, data]
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+
+x-mcp-health: &mcp-health
+  # A bare GET /mcp is a 400 — it is not a valid MCP request. Liveness means the process
+  # answered HTTP at all, not that the status was 2xx.
+  test: ["CMD", "sh", "-c", "wget -qO- --timeout=3 http://localhost:$${PORT}/mcp >/dev/null 2>&1 || [ $$? -ne 4 ]"]
+  interval: 30s
+  timeout: 5s
+  retries: 5
+  start_period: 40s
+
+x-small: &small
+  deploy:
+    resources:
+      limits: { cpus: "1.0", memory: 512M }
+
+services:
+  # ------------------------------------------------------------------- ingress
+  # The only container that binds a host port. Everything behind it is reachable only
+  # from inside the compose network, which is what turns "nine services on the LAN" into
+  # one TLS endpoint with an audit log.
+  caddy:
+    <<: *hardening
+    image: caddy:2.8-alpine
+    # Caddy writes its certificate store and needs to bind 443. `read_only` is off here
+    # for the certificate store and NET_BIND_SERVICE is added back for the port; both are
+    # the minimum this container cannot do without.
+    cap_add: [NET_BIND_SERVICE]
+    ports:
+      - "${DRAWBRIDGE_HTTP_PORT:-80}:80"
+      - "${DRAWBRIDGE_HTTPS_PORT:-443}:443"
+    environment:
+      DRAWBRIDGE_PUBLIC_HOST: ${DRAWBRIDGE_PUBLIC_HOST:?set DRAWBRIDGE_PUBLIC_HOST}
+      DRAWBRIDGE_ACME_EMAIL: ${DRAWBRIDGE_ACME_EMAIL:-}
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api: { condition: service_healthy }
+    networks: [edge]
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 256M }
+
+  # ---------------------------------------------------------------- data plane
+  postgres:
+    <<: *hardening
+    image: pgvector/pgvector:pg16
+    # The owner password reaches Postgres as a file rather than as `POSTGRES_PASSWORD`,
+    # so it is not in `docker inspect` and not inherited by the initdb scripts' children.
+    environment:
+      POSTGRES_USER: drawbridge
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: drawbridge
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    secrets: [postgres_password]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drawbridge -d drawbridge"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [data]
+    deploy:
+      resources:
+        limits: { cpus: "4.0", memory: 4G }
+
+  redis:
+    <<: [*hardening, *small]
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [data]
+
+  minio:
+    <<: *hardening
+    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/minio_root_user
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_password
+      # No console on a deployment nobody logs into interactively. The bucket layout is
+      # created by minio-init below and changed by a migration, not by a person clicking.
+      MINIO_BROWSER: "off"
+    secrets: [minio_root_user, minio_root_password]
+    volumes: [minio-data:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks: [data]
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2G }
+
+  minio-init:
+    <<: [*hardening, *small]
+    image: minio/mc:RELEASE.2024-11-05T11-29-45Z
+    restart: "no"
+    depends_on:
+      minio: { condition: service_healthy }
+    secrets: [minio_root_user, minio_root_password]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mc alias set local http://minio:9000 "$$(cat /run/secrets/minio_root_user)" "$$(cat /run/secrets/minio_root_password)"
+        mc mb --ignore-existing local/drawbridge-documents
+        mc mb --ignore-existing local/drawbridge-archive
+        mc version enable local/drawbridge-documents
+        mc version enable local/drawbridge-archive
+        # Object lock is what makes "immutable" true rather than aspirational: with
+        # versioning alone, a credential that can write can also delete every version.
+        echo "buckets ready — versioned, and a correction writes a new object"
+    networks: [data]
+
+  # -------------------------------------------------------------------- secrets
+  # By default this deployment expects an EXTERNAL Vault the broker already operates, at
+  # VAULT_ADDR. This container exists behind the `bootstrap` profile for an evaluation
+  # deployment that has none, and it is dev mode: auto-unsealed, in-memory, root token on
+  # the command line. Do not run a pilot on it — a restart loses every secret.
+  vault:
+    <<: [*hardening, *small]
+    image: hashicorp/vault:1.15
+    profiles: [bootstrap]
+    command: ["server", "-dev"]
+    cap_add: [IPC_LOCK]
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN_ID:-drawbridge-dev-root}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8200/v1/sys/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [data]
+
+  # ------------------------------------------------------------------- identity
+  # Not behind a profile here. In development Authentik is optional because the API falls
+  # back to a shared secret; on-prem there is no fallback, so the identity provider is
+  # part of the deployment rather than an add-on to it.
+  authentik-server:
+    <<: *hardening
+    image: ghcr.io/goauthentik/server:2025.2
+    command: server
+    environment: &authentik-env
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: drawbridge
+      AUTHENTIK_POSTGRESQL__PASSWORD_FILE: /run/secrets/postgres_password
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_REDIS__DB: 1
+      AUTHENTIK_SECRET_KEY_FILE: /run/secrets/authentik_secret_key
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+      AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+    secrets: [postgres_password, authentik_secret_key]
+    volumes: [authentik-media:/media]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+    networks: [edge, data]
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2G }
+
+  authentik-worker:
+    <<: *hardening
+    image: ghcr.io/goauthentik/server:2025.2
+    command: worker
+    environment: *authentik-env
+    secrets: [postgres_password, authentik_secret_key]
+    volumes: [authentik-media:/media]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    networks: [edge, data]
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2G }
+
+  # -------------------------------------------------------------- observability
+  jaeger:
+    <<: *hardening
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    # No UI port. Traces are an hour of debugging; what has to survive four years is in
+    # audit_ledger and carries the trace id. Reach the UI over an SSH tunnel when needed.
+    networks: [data]
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 1G }
+
+  # ------------------------------------------------------------- orchestration
+  n8n:
+    <<: *hardening
+    image: n8nio/n8n:1.70.1
+    read_only: false  # n8n writes its own config and task runner state under ~/.n8n
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: drawbridge
+      DB_POSTGRESDB_PASSWORD_FILE: /run/secrets/postgres_password
+      N8N_PORT: 5678
+      N8N_ENCRYPTION_KEY_FILE: /run/secrets/n8n_encryption_key
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_HIRING_BANNER_ENABLED: "false"
+      GENERIC_TIMEZONE: ${DRAWBRIDGE_TIMEZONE:-UTC}
+      # Cross-tenant by design: one workflow runs whichever tenant its trigger names.
+      # This is the most valuable secret in the deployment; see services/api/src/auth.py.
+      DRAWBRIDGE_SERVICE_TOKEN_FILE: /run/secrets/service_token
+    secrets: [postgres_password, n8n_encryption_key, service_token]
+    volumes:
+      - n8n-data:/home/node/.n8n
+      - ./n8n/workflows:/workflows:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [edge, data]
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2G }
+
+  # ---------------------------------------------------------------- app plane
+  # Runs once and exits. The API waits for it to complete successfully, so a deployment
+  # whose migration fails does not come up serving the previous schema.
+  migrate:
+    <<: *python-onprem
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      <<: *python-env
+      # Alembic owns the schema and connects as the owner. The application role cannot
+      # create tables, which is the point of having two roles.
+      DRAWBRIDGE_OWNER_DATABASE_URL: postgresql+psycopg://drawbridge:@postgres:5432/drawbridge
+    networks: [data]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    <<: *python-onprem
+    command:
+      - uvicorn
+      - services.api.src.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "${DRAWBRIDGE_API_WORKERS:-4}"
+      - --proxy-headers
+      - --forwarded-allow-ips
+      - "*"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    deploy:
+      resources:
+        limits: { cpus: "4.0", memory: 4G }
+
+  # The drafting worker. One process, polling `review_queue` across every tenant — the
+  # only cross-tenant process in the deployment besides n8n. See
+  # services/agent/src/worker.py for why it polls and why that is not a compromise.
+  agent:
+    <<: *python-onprem
+    command: ["python", "-m", "services.agent.src.worker"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2G }
+
+  # ---------------------------------------------------------------- MCP plane
+  mcp-ace:
+    <<: [*python-onprem, *small]
+    image: drawbridge/mcp-ace:${DRAWBRIDGE_VERSION:?set DRAWBRIDGE_VERSION}
+    command: ["python", "-m", "mcp_servers.mcp_ace.server"]
+    environment:
+      <<: *python-env
+      PORT: "8101"
+    # Data plane only. None of the five MCP servers calls anything outside this
+    # deployment: they read Postgres and MinIO. Leaving them on `edge` would have given
+    # egress to five processes that have no use for it.
+    networks: [data]
+    healthcheck: *mcp-health
+
+  mcp-hts:
+    <<: *python-onprem
+    image: drawbridge/mcp-hts:${DRAWBRIDGE_VERSION:?set DRAWBRIDGE_VERSION}
+    command: ["python", "-m", "mcp_servers.mcp_hts.server"]
+    environment:
+      <<: *python-env
+      PORT: "8102"
+    # Data plane only. None of the five MCP servers calls anything outside this
+    # deployment: they read Postgres and MinIO. Leaving them on `edge` would have given
+    # egress to five processes that have no use for it.
+    networks: [data]
+    healthcheck: *mcp-health
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2G }
+
+  mcp-docs:
+    <<: *python-onprem
+    image: drawbridge/mcp-docs:${DRAWBRIDGE_VERSION:?set DRAWBRIDGE_VERSION}
+    command: ["python", "-m", "mcp_servers.mcp_docs.server"]
+    environment:
+      <<: *python-env
+      PORT: "8103"
+    # Data plane only. None of the five MCP servers calls anything outside this
+    # deployment: they read Postgres and MinIO. Leaving them on `edge` would have given
+    # egress to five processes that have no use for it.
+    networks: [data]
+    healthcheck: *mcp-health
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 2G }
+
+  mcp-claims:
+    <<: [*python-onprem, *small]
+    image: drawbridge/mcp-claims:${DRAWBRIDGE_VERSION:?set DRAWBRIDGE_VERSION}
+    command: ["python", "-m", "mcp_servers.mcp_claims.server"]
+    environment:
+      <<: *python-env
+      PORT: "8104"
+    # Data plane only. None of the five MCP servers calls anything outside this
+    # deployment: they read Postgres and MinIO. Leaving them on `edge` would have given
+    # egress to five processes that have no use for it.
+    networks: [data]
+    healthcheck: *mcp-health
+
+  mcp-ledger:
+    <<: [*python-onprem, *small]
+    image: drawbridge/mcp-ledger:${DRAWBRIDGE_VERSION:?set DRAWBRIDGE_VERSION}
+    command: ["python", "-m", "mcp_servers.mcp_ledger.server"]
+    environment:
+      <<: *python-env
+      PORT: "8105"
+    # Data plane only. None of the five MCP servers calls anything outside this
+    # deployment: they read Postgres and MinIO. Leaving them on `edge` would have given
+    # egress to five processes that have no use for it.
+    networks: [data]
+    healthcheck: *mcp-health
+
+# Docker secrets rather than environment variables, for the three credentials that must
+# reach a container we did not write. Postgres, MinIO and n8n all read a `_FILE` variant;
+# our own services read Vault. Nothing here is in `docker inspect` output.
+#
+# These files must exist on the host with mode 0400. `infra/vault_bootstrap.py` does not
+# write them: a secret that Vault holds and a file on the deployment host are two copies,
+# and the point of the file is that these three images cannot be taught to read Vault.
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+  minio_root_user:
+    file: ./secrets/minio_root_user
+  minio_root_password:
+    file: ./secrets/minio_root_password
+  authentik_secret_key:
+    file: ./secrets/authentik_secret_key
+  n8n_encryption_key:
+    file: ./secrets/n8n_encryption_key
+  service_token:
+    file: ./secrets/service_token
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  n8n-data:
+  authentik-media:
+  caddy-data:
+  caddy-config:
+
+networks:
+  # Application services and the ingress. Has a route out, because the extraction path
+  # calls api.anthropic.com and Authentik fetches its own updates.
+  edge:
+    name: drawbridge-edge
+    driver: bridge
+  # Postgres, Redis, MinIO, Vault and Jaeger. `internal: true` removes the default gateway
+  # entirely: these containers cannot originate outbound traffic. It is the cheapest
+  # meaningful control in this file — the database cannot be made to phone home.
+  data:
+    name: drawbridge-data
+    driver: bridge
+    internal: true

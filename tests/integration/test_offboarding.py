@@ -21,6 +21,10 @@ from uuid import uuid4
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
 from scripts.tenant_offboard import (
     OffboardError,
     build_artifact,
@@ -30,10 +34,6 @@ from scripts.tenant_offboard import (
     tombstone,
     verify_artifact,
 )
-from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
-
 from services.api.src.ledger import record, verify_chain
 from services.api.src.models import Claim, Tenant
 

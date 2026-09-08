@@ -308,9 +308,9 @@ def render_psc_summary(request: PacketRequest, entry: PscEntry) -> bytes:
         "PSC is transmitted through ABI; this page is not the filing",
     )
     document.paragraph(
-        "Prepared by Drawbridge for transmission by a licensed customs broker. The "
-        "authoritative filing is the replacement entry summary in the accompanying JSON "
-        "payload; this summary exists for review and authorisation."
+        f"{request.preparer.notice} The authoritative filing is the replacement entry "
+        f"summary in the accompanying JSON payload; this summary exists for review and "
+        f"authorisation."
     )
 
     document.section(

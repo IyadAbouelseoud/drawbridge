@@ -25,6 +25,17 @@ x-python-base: &python-base
     DRAWBRIDGE_OWNER_DATABASE_URL: postgresql+psycopg://drawbridge:drawbridge@postgres:5432/drawbridge
     DRAWBRIDGE_REDIS_URL: redis://redis:6379/0
     DRAWBRIDGE_SECRETS_FILE: /run/secrets/drawbridge.json
+    # Which backend holds the secrets. `file` reads the mount below; `vault` reads the
+    # container in the `secrets` profile and ignores the file entirely. There is no
+    # fallback between them on purpose — see services/api/src/secrets.py.
+    DRAWBRIDGE_SECRETS_PROVIDER: ${DRAWBRIDGE_SECRETS_PROVIDER:-file}
+    VAULT_ADDR: ${VAULT_ADDR:-http://vault:8200}
+    DRAWBRIDGE_VAULT_MOUNT: ${DRAWBRIDGE_VAULT_MOUNT:-secret}
+    DRAWBRIDGE_VAULT_PATH: ${DRAWBRIDGE_VAULT_PATH:-drawbridge}
+    # AppRole. role_id is configuration and belongs in a compose file; secret_id is the
+    # credential and is injected at start by `infra/vault_bootstrap.py`'s output.
+    DRAWBRIDGE_VAULT_ROLE_ID: ${DRAWBRIDGE_VAULT_ROLE_ID:-}
+    DRAWBRIDGE_VAULT_SECRET_ID: ${DRAWBRIDGE_VAULT_SECRET_ID:-}
     DRAWBRIDGE_S3_ENDPOINT_URL: http://minio:9000
     DRAWBRIDGE_S3_ACCESS_KEY: drawbridge
     DRAWBRIDGE_S3_BUCKET_DOCUMENTS: drawbridge-documents
@@ -36,8 +47,12 @@ x-python-base: &python-base
     # Authentik (profile `identity` below) to verify RS256 tokens instead, at which point
     # the secret stops being consulted and nothing here can issue a token.
     DRAWBRIDGE_AUTH_REQUIRED: "${DRAWBRIDGE_AUTH_REQUIRED:-true}"
-    DRAWBRIDGE_JWT_ISSUER: drawbridge
-    DRAWBRIDGE_JWT_AUDIENCE: drawbridge-api
+    # Overridable, because with Authentik issuing the tokens neither of these is ours to
+    # choose: `iss` is the provider's own URL and the API has to be told what it will be.
+    # Hard-coding them was fine while `make token` was the only issuer and wrong the
+    # moment a real one appeared. `infra/authentik_bootstrap.py` prints both.
+    DRAWBRIDGE_JWT_ISSUER: ${DRAWBRIDGE_JWT_ISSUER:-drawbridge}
+    DRAWBRIDGE_JWT_AUDIENCE: ${DRAWBRIDGE_JWT_AUDIENCE:-drawbridge-api}
     DRAWBRIDGE_OIDC_JWKS_URL: ${DRAWBRIDGE_OIDC_JWKS_URL:-}
   volumes:
     - ./services:/app/services:ro
@@ -167,6 +182,38 @@ services:
     restart: unless-stopped
     networks: [drawbridge]
 
+  # ------------------------------------------------------------------- secrets
+  # Behind a profile: `docker compose --profile secrets up -d vault`, then
+  # `python infra/vault_bootstrap.py`. Dev mode — auto-unsealed, in-memory storage, a
+  # root token on the command line. Every one of those is wrong for production and all
+  # three are stated rather than papered over: what this container proves is that the
+  # *application* reads its secrets from a manager over AppRole, which is the half of the
+  # problem this repository owns. Operating a sealed, persisted Vault is the other half.
+  #
+  # Storage is in-memory, so a restart loses the secrets and `infra/vault_bootstrap.py`
+  # has to run again. That is a property of `-dev`, not of the integration.
+  vault:
+    image: hashicorp/vault:1.15
+    profiles: [secrets]
+    command: ["server", "-dev"]
+    # Vault locks its memory so the master key cannot be swapped to disk. Without this the
+    # container starts and warns; with it, the one page of memory holding key material
+    # never reaches a swap file.
+    cap_add: [IPC_LOCK]
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN_ID:-drawbridge-dev-root}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    ports: ["8200:8200"]
+    healthcheck:
+      # 200 means initialised, unsealed and active. A sealed Vault answers 503 here, which
+      # is why this is not a bare connectivity check.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8200/v1/sys/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks: [drawbridge]
+
   # ------------------------------------------------------------------ identity
   # Behind a profile: `docker compose --profile identity up -d`. Authentik is two
   # containers and wants a database and a cache of its own, which is a lot of stack to
@@ -189,6 +236,13 @@ services:
       AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:-dev-only-change-me}
       AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
       AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD:-drawbridge}
+      # Creates an API token for akadmin on first start. `infra/authentik_bootstrap.py`
+      # authenticates with it, which is what makes the provider, application and property
+      # mapping scripted rather than twelve screens of clicking.
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN:-}
+      # The API's JWKS URL must resolve to the same host Authentik puts in `iss`, or a
+      # token verifies against a key set fetched from an issuer the token does not name.
+      AUTHENTIK_HOST: ${AUTHENTIK_HOST:-http://localhost:9443}
     volumes:
       - authentik-media:/media
     ports: ["9443:9000"]

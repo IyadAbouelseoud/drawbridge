@@ -1,9 +1,10 @@
-"""Create, inspect and check the secrets file.
+"""Create, inspect, check and promote the deployment's secrets.
 
     python scripts/manage_secrets.py init          # generate what is missing
     python scripts/manage_secrets.py init --force  # rotate everything
     python scripts/manage_secrets.py show          # names and redactions, never values
     python scripts/manage_secrets.py check         # what a deployment would refuse on
+    python scripts/manage_secrets.py push          # local file -> the configured manager
 
 `init` is additive by default and that is the important property: run twice, and the
 second run leaves every existing value alone and fills in only what is absent. Rotation
@@ -13,6 +14,14 @@ invalidate every issued token as a side effect of running a setup command twice.
 `show` prints names and redactions. There is no subcommand that prints a secret to a
 terminal: the file is right there for anyone entitled to read it, and a command that echoes
 credentials to stdout is a command whose output ends up in a screen recording.
+
+`push` is the migration off the file, and it runs in exactly one direction. It reads
+`.secrets.json` and writes every value into whichever manager
+`DRAWBRIDGE_SECRETS_PROVIDER` names, so that promoting a working local configuration into
+Vault or Secrets Manager is one command rather than a session of copy-paste through a
+clipboard. There is deliberately no `pull`: a command that wrote production secrets onto a
+laptop's disk would undo the entire point of having put them in a manager, and it would be
+the most convenient command in this file.
 
 `env` is the one exception and it exists for a specific, narrow reason. n8n, Authentik and
 MinIO are third-party images that read credentials from the environment and cannot be
@@ -30,12 +39,24 @@ import stat
 import sys
 from pathlib import Path
 
+import httpx
+
 from services.api.src.config import get_settings
 from services.api.src.secrets import (
+    AWS_SECRET_ID_ENV,
+    DEFAULT_VAULT_MOUNT,
+    DEFAULT_VAULT_PATH,
     SECRET_FIELDS,
     SUPPLIED_FIELDS,
+    VAULT_ADDR_ENV,
+    VAULT_MOUNT_ENV,
+    VAULT_PATH_ENV,
+    VAULT_TOKEN_ENV,
+    AwsSecretsManagerProvider,
     SecretsError,
+    backend_name,
     check_secret_posture,
+    default_providers,
     generate,
     is_placeholder,
     redact,
@@ -114,8 +135,19 @@ def _init(path: Path, *, force: bool) -> int:
 
 
 def _show(path: Path) -> int:
+    """Every secret, where it came from, and what it looks like from four characters away.
+
+    The source column reports the *resolved* origin rather than the configured backend,
+    because those differ precisely when something is wrong: a value showing `environment`
+    on a deployment that believes it reads Vault is a stale injected variable winning by
+    design, and that is the finding this table exists to make visible.
+    """
+    backend = backend_name()
     resolved = resolve()
-    print(f"secrets file  {path}{'' if path.is_file() else '  (absent)'}")
+    describes = [provider.describe for provider in default_providers()]
+    print(f"backend       {backend}  ({' then '.join(describes)})")
+    if backend == "file":
+        print(f"secrets file  {path}{'' if path.is_file() else '  (absent)'}")
     print(f"{'name':<24} {'value':<28} source")
     for field in sorted(SECRET_FIELDS):
         value = resolved.get(field)
@@ -123,7 +155,7 @@ def _show(path: Path) -> int:
         if os.environ.get(env_key):
             source = "environment"
         elif value:
-            source = "secrets file"
+            source = backend
         else:
             source = "-"
         flag = "  PLACEHOLDER" if is_placeholder(value) else ""
@@ -131,12 +163,105 @@ def _show(path: Path) -> int:
     return 0
 
 
+def _push_vault(payload: dict[str, str]) -> int:
+    """Write the whole object to KV v2 in one call.
+
+    One write of one object, matching how `VaultSecretProvider` reads it. Writing field by
+    field would produce a version per field and a window in which the path holds half a
+    rotation — and KV v2's version history is what makes the rollback possible, so it is
+    worth keeping each version a complete, coherent configuration.
+    """
+    address = os.environ.get(VAULT_ADDR_ENV, "").strip()
+    token = os.environ.get(VAULT_TOKEN_ENV, "").strip()
+    if not address or not token:
+        print(
+            f"push to vault needs {VAULT_ADDR_ENV} and {VAULT_TOKEN_ENV}. "
+            f"Writing is an operator action, so it uses a token you hold rather than the "
+            f"AppRole the services read with.",
+            file=sys.stderr,
+        )
+        return 2
+    mount = os.environ.get(VAULT_MOUNT_ENV, DEFAULT_VAULT_MOUNT).strip("/")
+    path = os.environ.get(VAULT_PATH_ENV, DEFAULT_VAULT_PATH).strip("/")
+    response = httpx.post(
+        f"{address.rstrip('/')}/v1/{mount}/data/{path}",
+        headers={"X-Vault-Token": token},
+        json={"data": payload},
+        timeout=15.0,
+    )
+    if response.status_code >= httpx.codes.BAD_REQUEST:
+        print(f"vault refused the write with HTTP {response.status_code}", file=sys.stderr)
+        return 1
+    version = response.json().get("data", {}).get("version")
+    print(f"wrote {len(payload)} secret(s) to {mount}/{path} as version {version}")
+    return 0
+
+
+def _push_aws(payload: dict[str, str]) -> int:
+    """Put the object into the configured secret, creating it if it is not there yet.
+
+    `put_secret_value` on an existing secret rather than `update_secret`, because it keeps
+    the previous version staged under `AWSPREVIOUS` — which is what a rollback consists of
+    when a rotation turns out to have broken something.
+    """
+    secret_id = os.environ.get(AWS_SECRET_ID_ENV, "").strip()
+    if not secret_id:
+        print(f"push to aws needs {AWS_SECRET_ID_ENV}", file=sys.stderr)
+        return 2
+    provider = AwsSecretsManagerProvider(
+        secret_id,
+        region=os.environ.get("DRAWBRIDGE_AWS_REGION") or None,
+        endpoint_url=os.environ.get("DRAWBRIDGE_AWS_ENDPOINT_URL") or None,
+    )
+    client = provider.build_client()
+    body = json.dumps(payload, sort_keys=True)
+    try:
+        client.put_secret_value(SecretId=secret_id, SecretString=body)
+        action = "updated"
+    except client.exceptions.ResourceNotFoundException:
+        client.create_secret(Name=secret_id, SecretString=body)
+        action = "created"
+    print(f"{action} {secret_id} with {len(payload)} secret(s)")
+    return 0
+
+
+def _push(path: Path) -> int:
+    """Promote the local file into the configured manager.
+
+    Refuses when the backend is `file`, because the only thing that would accomplish is
+    overwriting the file with itself, and a command that appears to do something is worse
+    than one that says it will not.
+    """
+    backend = backend_name()
+    if backend == "file":
+        print(
+            "the configured backend is `file`, so there is nothing to push to. Set "
+            "DRAWBRIDGE_SECRETS_PROVIDER=vault or =aws and configure it first.",
+            file=sys.stderr,
+        )
+        return 2
+    payload = {k: v for k, v in _read(path).items() if not k.startswith("_") and v}
+    if not payload:
+        print(f"{path} holds no secrets to push", file=sys.stderr)
+        return 2
+    unknown = sorted(set(payload) - set(SECRET_FIELDS))
+    if unknown:
+        # The provider would refuse these on the way back out. Better to refuse before the
+        # write than to leave a manager holding a payload nothing can read.
+        print(f"refusing: {path} carries unknown secrets {', '.join(unknown)}", file=sys.stderr)
+        return 2
+    if backend == "vault":
+        return _push_vault(payload)
+    return _push_aws(payload)
+
+
 #: The secrets that must reach a container we did not write. Everything else stays in the
-#: file and is read by our own processes; these three exist in this list because n8n,
-#: Authentik and MinIO have no other input.
+#: file and is read by our own processes; these exist in this list because n8n, Authentik
+#: and MinIO have no other input.
 _ENV_BRIDGE: tuple[tuple[str, str], ...] = (
     ("N8N_ENCRYPTION_KEY", "n8n_encryption_key"),
     ("AUTHENTIK_SECRET_KEY", "authentik_secret_key"),
+    ("AUTHENTIK_BOOTSTRAP_TOKEN", "authentik_bootstrap_token"),
     ("DRAWBRIDGE_S3_SECRET_KEY", "s3_secret_key"),
     ("DRAWBRIDGE_APP_DB_PASSWORD", "app_db_password"),
     ("DRAWBRIDGE_SERVICE_TOKEN", "service_token"),
@@ -178,7 +303,7 @@ def _check() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Manage the local secrets file.")
-    parser.add_argument("command", choices=("init", "show", "check", "env"))
+    parser.add_argument("command", choices=("init", "show", "check", "env", "push"))
     parser.add_argument(
         "--force",
         action="store_true",
@@ -195,6 +320,8 @@ def main(argv: list[str] | None = None) -> int:
             return _show(path)
         if args.command == "env":
             return _env()
+        if args.command == "push":
+            return _push(path)
         return _check()
     except SecretsError as exc:
         print(f"refused: {exc}", file=sys.stderr)

@@ -27,8 +27,10 @@ from sqlalchemy import select
 
 from drawbridge_schemas.claim import RecoveryLane
 from drawbridge_schemas.jurisdiction import Currency, Jurisdiction
+from services.api.src.config import Settings, get_settings
 from services.api.src.ledger import record
 from services.api.src.models import Claim, EntryLine, ExportLine, RefundLine
+from services.packager.src.branding import DEFAULT_PREPARER, Preparer
 from services.packager.src.packet import Claimant, PacketLine, PacketRequest
 from services.packager.src.router import build_packet
 
@@ -100,6 +102,24 @@ def _lines(session: Session, claim_id: UUID) -> list[PacketLine]:
     ]
 
 
+def preparer_from_settings(settings: Settings) -> Preparer:
+    """The configured preparer, or the default.
+
+    Constructed per build rather than cached, so a `Preparer` that a deployment has
+    misconfigured — claiming a broker licence with no filer code — fails on the request
+    that would have printed it rather than at import time in a module nobody is looking
+    at. The failure surfaces as a 500 with the reason, which is the correct outcome: a
+    packet must not be produced with a preparer notice this deployment is not entitled
+    to make.
+    """
+    return Preparer(
+        name=settings.preparer_name,
+        is_licensed_broker=settings.preparer_is_licensed_broker,
+        filer_code=settings.preparer_filer_code,
+        contact=settings.preparer_contact,
+    )
+
+
 def build_request(
     session: Session,
     *,
@@ -110,6 +130,7 @@ def build_request(
     refund_account_iban: str = "",
     port_code: str = "",
     notes: str = "",
+    preparer: Preparer = DEFAULT_PREPARER,
 ) -> PacketRequest:
     """Read one claim back out as a packet request.
 
@@ -145,6 +166,7 @@ def build_request(
         manufacturer=manufacturer,
         refund_account_iban=refund_account_iban,
         notes=notes,
+        preparer=preparer,
     )
 
 
@@ -157,6 +179,7 @@ def build(
     **options: Any,
 ) -> FilingPacket:
     """Assemble and render. The one call the API route makes."""
+    options.setdefault("preparer", preparer_from_settings(get_settings()))
     request = build_request(
         session,
         claim_id=claim_id,

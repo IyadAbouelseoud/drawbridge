@@ -22,6 +22,7 @@ from pypdf import PdfReader
 
 from drawbridge_schemas.jurisdiction import Jurisdiction
 from services.packager.src import citations as cite
+from services.packager.src.branding import DEFAULT_PREPARER, TRANSCRIPTION_NOTICE
 from services.packager.src.packet import (
     FilingPacket,
     PacketArtifact,
@@ -33,12 +34,12 @@ from services.packager.src.pdf import Document, Field, Section
 
 PDF_MEDIA_TYPE = "application/pdf"
 
-PREPARER_NOTICE = (
-    "Prepared by Drawbridge for filing by a licensed customs broker. Drawbridge is not a "
-    "customs broker and does not transmit to CBP. Every figure below traces to a "
-    "source-document span retained under 19 CFR 163; the supporting schedule accompanies "
-    "this form."
-)
+# The preparer paragraph is composed per packet from `request.preparer`, because a
+# licensed broker running this on their own network prepares filings under their own
+# licence and our disclaimer is false on their form. See
+# `services/packager/src/branding.py`. This constant is what an unconfigured deployment
+# still prints, and it is what the golden fixtures reproduce.
+PREPARER_NOTICE = DEFAULT_PREPARER.notice
 
 CERTIFICATION_7551 = (
     "I declare that the merchandise described was imported and duty paid as stated, that "
@@ -119,10 +120,10 @@ def render_7551(request: PacketRequest) -> bytes:
     """CBP Form 7551 — Drawback Entry."""
     document = Document(
         "CBP Form 7551 - Drawback Entry",
-        f"Claim {request.claim_id} | prepared {request.prepared_on.isoformat()} | "
-        f"transcription for filing, not a CBP-issued form",
+        f"Claim {request.claim_id} | prepared {request.prepared_on.isoformat()} "
+        f"by {request.preparer.footer} | {TRANSCRIPTION_NOTICE}",
     )
-    document.paragraph(PREPARER_NOTICE)
+    document.paragraph(request.preparer.notice)
 
     document.section(_claimant_section(request, "cbp7551"))
 
@@ -292,10 +293,10 @@ def render_7552(request: PacketRequest) -> bytes:
     transferor = request.manufacturer or request.claimant
     document = Document(
         "CBP Form 7552 - Delivery Certificate for Purposes of Drawback",
-        f"Claim {request.claim_id} | prepared {request.prepared_on.isoformat()} | "
-        f"transcription for filing, not a CBP-issued form",
+        f"Claim {request.claim_id} | prepared {request.prepared_on.isoformat()} "
+        f"by {request.preparer.footer} | {TRANSCRIPTION_NOTICE}",
     )
-    document.paragraph(PREPARER_NOTICE)
+    document.paragraph(request.preparer.notice)
 
     document.section(
         Section(

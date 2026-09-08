@@ -24,6 +24,7 @@ from pypdf import PdfReader
 
 from drawbridge_schemas.jurisdiction import Currency, Jurisdiction
 from services.packager.src import citations as cite
+from services.packager.src.branding import Preparer
 from services.packager.src.cbp_forms import (
     build_us_packet,
     field_values,
@@ -117,7 +118,11 @@ def ksa_line(*, partial: bool = False) -> PacketLine:
     )
 
 
-def us_request(*lines: PacketLine, manufacturer: Claimant | None = None) -> PacketRequest:
+def us_request(
+    *lines: PacketLine,
+    manufacturer: Claimant | None = None,
+    preparer: Preparer | None = None,
+) -> PacketRequest:
     return PacketRequest(
         claim_id="clm-us-0001",
         tenant_id="tnt-0001",
@@ -131,6 +136,7 @@ def us_request(*lines: PacketLine, manufacturer: Claimant | None = None) -> Pack
         prepared_on=date(2026, 9, 7),
         port_code="1303",
         manufacturer=manufacturer,
+        **({"preparer": preparer} if preparer else {}),
     )
 
 
@@ -424,3 +430,62 @@ class TestRouting:
         packet = build_packet(us_request())
         with pytest.raises(KeyError, match="cbp7551"):
             packet.artifact("nonexistent.pdf")
+
+
+# ------------------------------------------------------------------------ white label
+
+
+BROKER = Preparer(
+    name="Harborline Customs Brokers, Inc.",
+    is_licensed_broker=True,
+    filer_code="J7K",
+    contact="trade@harborline.example",
+)
+
+
+class TestWhiteLabelling:
+    """A broker running this on their own network prepares filings under their own
+    licence. The preparer paragraph on a 7551 is a representation to CBP about who
+    produced the document and what they may do with it, so it is composed from what is
+    true of the deployer rather than having a name substituted into ours."""
+
+    def test_the_unconfigured_default_reproduces_the_notice_byte_for_byte(self) -> None:
+        """Every packet rendered since week 4 carries this paragraph. Branding must not
+        change a document that nobody asked to be branded."""
+        text = PdfReader(BytesIO(render_7551(us_request()))).pages[0].extract_text()
+        assert "Prepared by Drawbridge for filing by a licensed customs broker" in text
+        assert "Drawbridge is not a customs broker and does not transmit to CBP" in text
+
+    def test_a_broker_deployment_does_not_print_our_disclaimer(self) -> None:
+        """The failure this exists to prevent: a renamed preparer keeping "is not a
+        customs broker" would be a false statement about the filer's own licence, on a
+        form filed with a federal agency."""
+        text = PdfReader(BytesIO(render_7551(us_request(preparer=BROKER)))).pages[0].extract_text()
+        assert "Drawbridge" not in text
+        assert "is not a customs broker" not in text
+        assert "Harborline Customs Brokers, Inc. is a licensed customs broker" in text
+        assert "J7K" in text
+
+    def test_the_document_still_says_it_is_not_a_cbp_issued_form(self) -> None:
+        """Not brandable. It is a fact about the document rather than a claim about the
+        preparer, and a deployment able to remove it could present a transcription as the
+        authority's own form."""
+        for preparer in (None, BROKER):
+            page = PdfReader(BytesIO(render_7551(us_request(preparer=preparer)))).pages[0]
+            assert "not a CBP-issued form" in page.extract_text()
+
+    def test_the_certification_is_not_brandable(self) -> None:
+        """The declaration a person signs. Its wording is CBP's, not a deployment's."""
+        pages = PdfReader(BytesIO(render_7551(us_request(preparer=BROKER)))).pages
+        text = "\n".join(page.extract_text() for page in pages)
+        # A phrase short enough not to straddle a line wrap: the renderer breaks the
+        # certification across lines and pypdf reports the break as a newline.
+        assert "I declare that the merchandise described was imported and duty paid" in text
+        assert "has not been and will not be the subject of any" in text
+
+    def test_the_figures_are_untouched_by_branding(self) -> None:
+        """Reproduces to the cent regardless of whose name is on it."""
+        line = us_line(duty_allocated="62500.00", refund="61875.00")
+        plain = field_values(render_7551(us_request(line)))
+        branded = field_values(render_7551(us_request(line, preparer=BROKER)))
+        assert plain["cbp7551_total_claimed"] == branded["cbp7551_total_claimed"] == "61,875.00"

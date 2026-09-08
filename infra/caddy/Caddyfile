@@ -1,0 +1,76 @@
+# Drawbridge on-prem ingress.
+#
+# The only process in the deployment that binds a host port. Everything else answers on
+# the compose network, which is what turns nine services on a broker's LAN into one TLS
+# endpoint with an access log.
+#
+# Caddy obtains and renews a certificate automatically. On an internal hostname with no
+# public DNS, ACME cannot validate — set DRAWBRIDGE_ACME_EMAIL empty and Caddy falls back
+# to its own internal CA, whose root the broker installs on the machines that need it.
+# That is a real decision for whoever deploys this and is deliberately not made here.
+
+{
+	email {$DRAWBRIDGE_ACME_EMAIL}
+	# Admin API off. It can reconfigure the proxy at runtime and there is no reason for
+	# anything inside this deployment to be able to do that.
+	admin off
+}
+
+{$DRAWBRIDGE_PUBLIC_HOST} {
+	encode zstd gzip
+
+	# Headers that cost nothing and close the classes of bug a customs filing system
+	# should not have. HSTS is a year because this host serves an authenticated API and
+	# a downgrade is the whole attack.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Authentik owns /application/* and the login flows. Routed first, because the API is
+	# the catch-all and would otherwise swallow the OIDC endpoints — including the JWKS
+	# URL the API itself fetches.
+	handle /application/* {
+		reverse_proxy authentik-server:9000
+	}
+	handle /if/* {
+		reverse_proxy authentik-server:9000
+	}
+	handle /outpost.goauthentik.io/* {
+		reverse_proxy authentik-server:9000
+	}
+	handle /-/health/* {
+		reverse_proxy authentik-server:9000
+	}
+
+	# n8n's editor. Behind the same TLS endpoint rather than on its own port, so there is
+	# one place where access is granted and one access log to read.
+	handle /n8n/* {
+		uri strip_prefix /n8n
+		reverse_proxy n8n:5678
+	}
+
+	handle {
+		reverse_proxy api:8000 {
+			# The API is started with --proxy-headers, so it reads the client address
+			# from these rather than seeing every request as coming from Caddy.
+			header_up X-Real-IP {remote_host}
+			# A packaging build renders PDFs and can take longer than the default.
+			transport http {
+				read_timeout 300s
+			}
+		}
+	}
+
+	log {
+		output stdout
+		format json
+		# The Authorization header is a bearer token. Logging it would put a credential
+		# with tenant access into the log stream, which is the one place everybody agrees
+		# it is safe to copy around.
+		request>headers>Authorization delete
+	}
+}

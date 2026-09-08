@@ -164,14 +164,44 @@ _VECTOR_SQL = text("""
     LIMIT :limit
 """)
 
+# How much of a ruling body is scored, and how much a body match is discounted against a
+# subject match.
+#
+# Both constants exist because the previous scorer — `similarity(subject || ' ' || body,
+# :q)` — does not work on a real ruling. `similarity` is set-symmetric: it divides shared
+# trigrams by the union of both sides, so a four-word query against a four-thousand-word
+# ruling is dominated by the denominator. Measured against 117 loaded CROSS rulings, the
+# best score any query achieved was 0.127, against a `LEXICAL_FLOOR` of 0.15 — so
+# `search_rulings` returned nothing at all, for every query, and had done since week 3.
+# Three hand-written fixture rulings with two-sentence bodies had hidden it completely.
+#
+# `word_similarity(query, document)` is the operator for this shape: it scores the query
+# against the best-matching extent of the document rather than against the whole of it.
+# Over the subject alone it separates cleanly — twelve goods queries all retrieved their
+# ruling at rank 1, and four non-goods queries topped out at 0.314.
+#
+# The body still has to be searched, because a CROSS subject is not always descriptive:
+# protest and further-review rulings are titled "Application for further review of protest
+# number 1601-...", and the goods appear only in the text. So the body is scored too and
+# discounted, because a long document can always find *some* matching extent — the
+# non-goods queries score 0.425 against bodies and 0.056 against subjects.
+RULING_BODY_CHARS = 4000
+RULING_BODY_WEIGHT = 0.6
+
 _RULING_SQL = text("""
     SELECT ruling_number, ruling_date, classified_code, subject, url, superseded_by,
-           similarity(subject || ' ' || body, :q) AS lex
+           greatest(
+               word_similarity(:q, subject),
+               :body_weight * word_similarity(:q, left(body, :body_chars))
+           ) AS lex
     FROM tariff_rulings
     WHERE jurisdiction = :jurisdiction
       AND (CAST(:code AS text) IS NULL OR classified_code = CAST(:code AS text)
            OR hs6 = left(CAST(:code AS text), 6))
-      AND similarity(subject || ' ' || body, :q) > :floor
+      AND greatest(
+              word_similarity(:q, subject),
+              :body_weight * word_similarity(:q, left(body, :body_chars))
+          ) > :floor
     ORDER BY lex DESC
     LIMIT :limit
 """)
@@ -300,6 +330,14 @@ def search_rulings(
     Superseded rulings are returned but flagged rather than filtered out. A claim filed
     while a ruling was good law relied on it, so hiding the supersession would make the
     historical record harder to reconstruct, not easier.
+
+    `LEXICAL_FLOOR` is deliberately left where it is rather than raised to the gap this
+    scorer opens on literal queries. Paraphrased queries — what an analyst types, as
+    against the term CBP indexed on — land between 0.20 and 0.25, and the non-goods
+    queries reach 0.314, so the two ranges overlap and no floor separates them. What
+    comes back is a list for a person to read against the article in front of them, not
+    an automated citation; tuning the floor until the overlap disappeared would be tuning
+    it until real matches disappeared too.
     """
     rows = session.execute(
         _RULING_SQL,
@@ -308,6 +346,8 @@ def search_rulings(
             "jurisdiction": jurisdiction,
             "code": code,
             "floor": LEXICAL_FLOOR,
+            "body_weight": RULING_BODY_WEIGHT,
+            "body_chars": RULING_BODY_CHARS,
             "limit": limit,
         },
     ).mappings()

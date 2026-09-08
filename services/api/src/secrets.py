@@ -14,16 +14,33 @@ atmospheric:
 
 Reading them from a file at startup removes all five. It does **not** make them secret
 from anyone who can read the file, and this module does not pretend otherwise: a
-`.secrets.json` on a developer's laptop is exactly as exposed as that laptop. What it
-provides is one place to rotate, a narrower blast radius, and — the actual point — a seam.
-`SecretProvider` is the interface a real manager implements. `AwsSecretsManagerProvider`
-is written here as a working shape with an explicit refusal in place of a network call,
-so that adopting Secrets Manager or Vault is a provider swap rather than an edit to every
-call site.
+`.secrets.json` on a developer's laptop is exactly as exposed as that laptop. What the
+file buys is one place to rotate and a narrower blast radius. What it does not buy is
+anything a deployment can rely on, which is why it is no longer the only backend.
 
-**Precedence** is init > environment > secrets file > `.env`. Environment beats the file
+**Three backends, chosen by `DRAWBRIDGE_SECRETS_PROVIDER`.**
+
+| Value | Provider | What holds the secret |
+|---|---|---|
+| `file` (default) | `FileSecretProvider` | a gitignored JSON file. Local work only |
+| `vault` | `VaultSecretProvider` | HashiCorp Vault KV v2, over AppRole or a token |
+| `aws` | `AwsSecretsManagerProvider` | one Secrets Manager secret holding a JSON object |
+
+The two managers are implemented, not sketched. Both encrypt at rest, both audit every
+read, both can rotate without a redeploy, and neither leaves the plaintext anywhere on the
+host between the response and the process that asked for it. That is the difference the
+file cannot make up: `.secrets.json` is a durable plaintext artifact, and a manager's
+answer is a value in one process's heap.
+
+**Naming a manager disables the file.** `default_providers` returns the environment and
+*one* backend, never a manager with the file behind it. A chain that falls back to disk
+when Vault is unreachable is strictly worse than one that refuses: it starts, it works,
+and it is running on whatever stale secret was last checked out — which is the failure
+this module exists to remove, reintroduced as a convenience.
+
+**Precedence** is init > environment > backend > `.env`. Environment beats the backend
 because an orchestrator that injects a secret is making a deliberate statement and should
-win; `.env` loses to the file because that is the migration this module exists to perform.
+win; `.env` loses to everything because moving secrets out of it is the point.
 
 **A dev default in production is a startup failure.** `check_secret_posture` refuses,
 rather than warns, when `environment` is not development and a known placeholder is in
@@ -42,13 +59,38 @@ import stat
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+import httpx
+
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Callable, Iterable, Mapping
 
 logger = logging.getLogger(__name__)
 
 SECRETS_FILE_ENV = "DRAWBRIDGE_SECRETS_FILE"
 DEFAULT_SECRETS_FILE = ".secrets.json"
+
+#: Which backend holds the secrets. `file` is the default because the test suite and
+#: `make token` must work on a laptop with no manager running; every other value names
+#: something that has to be reachable, and startup fails loudly when it is not.
+SECRETS_PROVIDER_ENV = "DRAWBRIDGE_SECRETS_PROVIDER"
+DEFAULT_PROVIDER = "file"
+
+#: Vault. `VAULT_ADDR` and `VAULT_TOKEN` keep their conventional spellings so an operator
+#: who has already run `vault login` in this shell does not have to re-export anything.
+VAULT_ADDR_ENV = "VAULT_ADDR"
+VAULT_TOKEN_ENV = "VAULT_TOKEN"
+VAULT_MOUNT_ENV = "DRAWBRIDGE_VAULT_MOUNT"
+VAULT_PATH_ENV = "DRAWBRIDGE_VAULT_PATH"
+VAULT_ROLE_ID_ENV = "DRAWBRIDGE_VAULT_ROLE_ID"
+VAULT_SECRET_ID_ENV = "DRAWBRIDGE_VAULT_SECRET_ID"
+DEFAULT_VAULT_MOUNT = "secret"
+DEFAULT_VAULT_PATH = "drawbridge"
+
+#: AWS Secrets Manager. `DRAWBRIDGE_AWS_ENDPOINT_URL` exists so the same code path can be
+#: pointed at LocalStack — an integration nobody has run once is not an integration.
+AWS_SECRET_ID_ENV = "DRAWBRIDGE_AWS_SECRET_ID"
+AWS_REGION_ENV = "DRAWBRIDGE_AWS_REGION"
+AWS_ENDPOINT_ENV = "DRAWBRIDGE_AWS_ENDPOINT_URL"
 
 #: Symmetric secrets whose only requirement is that they be long and unpredictable. These
 #: are the ones `make secrets-init` can mint, because nothing outside this deployment has
@@ -60,6 +102,11 @@ GENERATED_FIELDS: frozenset[str] = frozenset(
         "s3_secret_key",
         "n8n_encryption_key",
         "authentik_secret_key",
+        # The API token Authentik mints for akadmin on first start, and the credential
+        # `infra/authentik_bootstrap.py` authenticates with. Generated here rather than
+        # left to Authentik's own default so the provider, application and property
+        # mapping can be created by a script instead of by twelve screens of clicking.
+        "authentik_bootstrap_token",
     }
 )
 
@@ -193,35 +240,244 @@ class EnvSecretProvider:
         return _normalise_keys(found, source="environment")
 
 
-class AwsSecretsManagerProvider:
-    """The shape a real manager plugs into, with the network call left out.
+class VaultSecretProvider:
+    """HashiCorp Vault, KV version 2.
 
-    This is not a stub that returns fake values — it refuses, loudly, naming what it would
-    need. A provider that quietly returned empty would let a deployment start with every
-    secret missing and only fail later at the first request, which is exactly the failure
-    mode this module exists to prevent.
+    One read of one path holding one JSON object, for the reason `SecretProvider.load`
+    gives: a provider queried per key turns startup into N round trips and makes a partial
+    outage indistinguishable from a partially configured deployment.
 
-    Implementing it is one `boto3` call to `get_secret_value(SecretId=self.secret_id)` and
-    a `json.loads` of the `SecretString`. It is deliberately not implemented here: there
-    is no AWS account behind this project yet, and an untested integration that has never
-    authenticated once is a liability dressed as progress.
+    **Authentication is AppRole by preference, a token only as a fallback.** A long-lived
+    root token in `VAULT_TOKEN` is the same problem as a secret in `.env`, moved one layer
+    along and given a better name. AppRole splits the credential in two: a `role_id` that
+    is deployment configuration and may sit in the compose file, and a `secret_id` that is
+    short-lived and delivered at start. What this process ends up holding is a token Vault
+    issued to it, with that token's own TTL and its own audit trail — so a leak is bounded
+    in time and visible after the fact, neither of which is true of a file.
+
+    Talks to Vault over `httpx` rather than through `hvac`. The KV v2 read is one GET and
+    the AppRole login is one POST, `httpx` is already a dependency, and a client library
+    for two endpoints is a supply-chain edge bought for nothing.
     """
 
-    def __init__(self, secret_id: str, *, region: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        address: str,
+        path: str = DEFAULT_VAULT_PATH,
+        mount: str = DEFAULT_VAULT_MOUNT,
+        token: str | None = None,
+        role_id: str | None = None,
+        secret_id: str | None = None,
+        timeout: float = 10.0,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self.address = address.rstrip("/")
+        self.path = path.strip("/")
+        self.mount = mount.strip("/")
+        self.token = token
+        self.role_id = role_id
         self.secret_id = secret_id
-        self.region = region
+        self.timeout = timeout
+        self._client = client
 
     @property
     def describe(self) -> str:
-        return f"aws-secrets-manager:{self.secret_id}"
+        auth = "approle" if self.role_id else "token"
+        return f"vault:{self.address}/{self.mount}/{self.path} ({auth})"
 
     def load(self) -> Mapping[str, str]:
-        msg = (
-            f"AWS Secrets Manager provider is a seam, not an implementation: "
-            f"resolving {self.secret_id!r} needs boto3, credentials and a region "
-            f"(got {self.region!r}). Use a secrets file until that exists."
+        client = self._client or httpx.Client(base_url=self.address, timeout=self.timeout)
+        try:
+            token = self._authenticate(client)
+            payload = self._read(client, token)
+        finally:
+            if self._client is None:
+                client.close()
+        return _normalise_keys(payload, source=self.describe)
+
+    def _authenticate(self, client: httpx.Client) -> str:
+        """An AppRole login, or the token we were handed.
+
+        AppRole wins when both are configured. Someone who set a `role_id` has done the
+        deliberate thing, and silently preferring a stale `VAULT_TOKEN` left over from an
+        operator's `vault login` would make the deployment depend on a human's shell.
+        """
+        if not (self.role_id and self.secret_id):
+            if not self.token:
+                msg = (
+                    f"vault at {self.address} needs credentials: set "
+                    f"{VAULT_ROLE_ID_ENV} and {VAULT_SECRET_ID_ENV} for AppRole, "
+                    f"or {VAULT_TOKEN_ENV} for a token."
+                )
+                raise SecretsError(msg)
+            return self.token
+
+        response = self._request(
+            client,
+            "POST",
+            "/v1/auth/approle/login",
+            json={"role_id": self.role_id, "secret_id": self.secret_id},
         )
-        raise SecretsError(msg)
+        auth = response.get("auth")
+        if not isinstance(auth, dict) or not isinstance(auth.get("client_token"), str):
+            msg = f"vault AppRole login at {self.address} returned no client_token"
+            raise SecretsError(msg)
+        return str(auth["client_token"])
+
+    def _read(self, client: httpx.Client, token: str) -> Mapping[str, Any]:
+        """The KV v2 payload at `mount/data/path`.
+
+        `data.data` rather than `data`: KV v2 wraps the secret in a version envelope, and
+        reading the outer object would produce a mapping whose keys are `data` and
+        `metadata` — both rejected by `_normalise_keys` as unknown secrets, which is the
+        right failure but an unhelpful one to have to diagnose.
+        """
+        body = self._request(
+            client,
+            "GET",
+            f"/v1/{self.mount}/data/{self.path}",
+            headers={"X-Vault-Token": token},
+        )
+        outer = body.get("data")
+        if not isinstance(outer, dict):
+            msg = f"vault path {self.mount}/{self.path} holds no data"
+            raise SecretsError(msg)
+        inner = outer.get("data")
+        if not isinstance(inner, dict):
+            msg = (
+                f"vault path {self.mount}/{self.path} is not a KV v2 secret "
+                f"(no data.data); check the mount is version 2"
+            )
+            raise SecretsError(msg)
+        return inner
+
+    def _request(
+        self,
+        client: httpx.Client,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        json: Any = None,
+    ) -> Mapping[str, Any]:
+        """One Vault call, with the response body kept out of the error message.
+
+        Vault echoes a good deal in its errors and a 403 body can name paths and policies.
+        The status and the URL are enough to act on, and neither is a secret.
+        """
+        try:
+            response = client.request(
+                method, url, headers=dict(headers or {}), json=json, timeout=self.timeout
+            )
+        except httpx.HTTPError as exc:
+            msg = f"vault at {self.address} is unreachable: {type(exc).__name__}"
+            raise SecretsError(msg) from exc
+        if response.status_code == httpx.codes.NOT_FOUND:
+            msg = f"vault has nothing at {url}; write the secret before starting"
+            raise SecretsError(msg)
+        if response.status_code >= httpx.codes.BAD_REQUEST:
+            msg = f"vault refused {method} {url} with HTTP {response.status_code}"
+            raise SecretsError(msg)
+        parsed = response.json()
+        if not isinstance(parsed, dict):
+            msg = f"vault returned a non-object body for {url}"
+            raise SecretsError(msg)
+        return parsed
+
+
+class AwsSecretsManagerProvider:
+    """AWS Secrets Manager — one secret holding a JSON object of every field.
+
+    One secret rather than one per field, and one `GetSecretValue` rather than N. Secrets
+    Manager bills per secret per month and per API call, but that is the smaller reason:
+    N calls at startup means a partial failure leaves the process holding a partially
+    configured deployment, which is precisely the state `check_secret_posture` exists to
+    make impossible.
+
+    `endpoint_url` is a first-class constructor argument so this exact code path can be
+    pointed at LocalStack and exercised. An integration that has never authenticated once
+    is a liability dressed as progress, and the way to stop it being one is to run it.
+
+    Credentials are boto3's own resolution chain — instance role, task role, profile,
+    environment — and deliberately not configured here. Putting an access key in this
+    file's own configuration would mean holding a secret in order to fetch secrets.
+    """
+
+    def __init__(
+        self,
+        secret_id: str,
+        *,
+        region: str | None = None,
+        endpoint_url: str | None = None,
+        client: Any = None,
+    ) -> None:
+        self.secret_id = secret_id
+        self.region = region
+        self.endpoint_url = endpoint_url
+        self._client = client
+
+    @property
+    def describe(self) -> str:
+        where = self.endpoint_url or self.region or "default region"
+        return f"aws-secrets-manager:{self.secret_id} ({where})"
+
+    def build_client(self) -> Any:
+        """The boto3 client this provider would use.
+
+        Public because `manage_secrets.py push` writes through the same client the reader
+        builds. Two places constructing a client from two readings of the same three
+        environment variables is how a push lands in a different account from the read.
+        """
+        try:
+            # Imported here rather than at module scope: the file and vault backends must
+            # not need the AWS SDK importable to start.
+            import boto3
+        except ImportError as exc:  # pragma: no cover - boto3 is a hard dependency
+            msg = "the aws secrets backend needs boto3 installed"
+            raise SecretsError(msg) from exc
+        return boto3.client(
+            "secretsmanager", region_name=self.region, endpoint_url=self.endpoint_url
+        )
+
+    def load(self) -> Mapping[str, str]:
+        try:
+            # Construction is inside the try because it is not free of failure:
+            # `boto3.client` raises `NoRegionError` before any network call when neither
+            # a region nor a profile is configured, and letting a botocore exception out
+            # of this module would break the one promise `SecretProvider` makes — that a
+            # failure to load is a `SecretsError` and never an empty mapping.
+            client = self._client if self._client is not None else self.build_client()
+            response = client.get_secret_value(SecretId=self.secret_id)
+        except SecretsError:
+            raise
+        except Exception as exc:
+            # Every botocore failure funnels here on purpose. `ResourceNotFoundException`,
+            # `AccessDeniedException` and an expired instance role are one situation from
+            # this module's point of view — the secret did not arrive — and the exception
+            # type is preserved in the chain for whoever reads the traceback.
+            msg = (
+                f"AWS Secrets Manager could not return {self.secret_id!r}: "
+                f"{type(exc).__name__}. Check the secret exists and the role may read it."
+            )
+            raise SecretsError(msg) from exc
+
+        payload = response.get("SecretString")
+        if not isinstance(payload, str):
+            # A binary secret is a deliberate choice by whoever wrote it, and guessing an
+            # encoding for it would be the kind of silent reinterpretation this module
+            # refuses everywhere else.
+            msg = f"secret {self.secret_id!r} holds binary, not a JSON object of secrets"
+            raise SecretsError(msg)
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            msg = f"secret {self.secret_id!r} is not valid JSON: {exc.msg}"
+            raise SecretsError(msg) from exc
+        if not isinstance(parsed, dict):
+            msg = f"secret {self.secret_id!r} must be a JSON object mapping names to strings"
+            raise SecretsError(msg)
+        return _normalise_keys(parsed, source=self.describe)
 
 
 def _strip_prefix(key: str) -> str:
@@ -258,14 +514,69 @@ def secrets_path() -> Path:
     return Path(os.environ.get(SECRETS_FILE_ENV, DEFAULT_SECRETS_FILE))
 
 
-def default_providers() -> tuple[SecretProvider, ...]:
-    """Environment first, then the file. Earlier wins.
+def _vault_provider() -> VaultSecretProvider:
+    address = os.environ.get(VAULT_ADDR_ENV, "").strip()
+    if not address:
+        msg = f"{SECRETS_PROVIDER_ENV}=vault but {VAULT_ADDR_ENV} is unset"
+        raise SecretsError(msg)
+    return VaultSecretProvider(
+        address=address,
+        mount=os.environ.get(VAULT_MOUNT_ENV, DEFAULT_VAULT_MOUNT),
+        path=os.environ.get(VAULT_PATH_ENV, DEFAULT_VAULT_PATH),
+        token=os.environ.get(VAULT_TOKEN_ENV) or None,
+        role_id=os.environ.get(VAULT_ROLE_ID_ENV) or None,
+        secret_id=os.environ.get(VAULT_SECRET_ID_ENV) or None,
+    )
 
-    An orchestrator injecting a value is making a deliberate statement; a file on disk is
-    the standing configuration. Reversing these would mean a deployment could not override
-    a stale checked-out secrets file, which is the situation people hit at 3am.
+
+def _aws_provider() -> AwsSecretsManagerProvider:
+    secret_id = os.environ.get(AWS_SECRET_ID_ENV, "").strip()
+    if not secret_id:
+        msg = f"{SECRETS_PROVIDER_ENV}=aws but {AWS_SECRET_ID_ENV} is unset"
+        raise SecretsError(msg)
+    return AwsSecretsManagerProvider(
+        secret_id,
+        region=os.environ.get(AWS_REGION_ENV) or None,
+        endpoint_url=os.environ.get(AWS_ENDPOINT_ENV) or None,
+    )
+
+
+#: Backend name to constructor. Adding one is a line here and a class above; nothing at a
+#: call site changes, which is what the `SecretProvider` protocol was for.
+BACKENDS: dict[str, Callable[[], SecretProvider]] = {
+    "file": lambda: FileSecretProvider(secrets_path()),
+    "vault": _vault_provider,
+    "aws": _aws_provider,
+}
+
+
+def backend_name() -> str:
+    """Which backend is configured, validated.
+
+    An unrecognised value is fatal rather than a fall back to `file`. `PROVIDER=valut` is
+    a typo, and quietly reading the local file instead would produce a deployment that
+    starts, works, and is not using the manager anyone believes it is using.
     """
-    return (EnvSecretProvider(), FileSecretProvider(secrets_path()))
+    name = os.environ.get(SECRETS_PROVIDER_ENV, DEFAULT_PROVIDER).strip().lower()
+    if name not in BACKENDS:
+        known = ", ".join(sorted(BACKENDS))
+        msg = f"unknown {SECRETS_PROVIDER_ENV}={name!r}; known backends are {known}"
+        raise SecretsError(msg)
+    return name
+
+
+def default_providers() -> tuple[SecretProvider, ...]:
+    """The environment, then exactly one backend. Earlier wins.
+
+    An orchestrator injecting a value is making a deliberate statement; the backend is the
+    standing configuration. Reversing them would mean a deployment could not override a
+    stale secret, which is the situation people hit at 3am.
+
+    There is deliberately no chain past the backend. `vault` does not fall back to the
+    file: a manager that is unreachable must stop the deployment, not hand it whatever
+    plaintext happens to be on the disk.
+    """
+    return (EnvSecretProvider(), BACKENDS[backend_name()]())
 
 
 def resolve(providers: Iterable[SecretProvider] | None = None) -> dict[str, str]:
