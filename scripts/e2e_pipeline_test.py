@@ -38,13 +38,20 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
+from services.api.src.config import get_settings
 
 DEFAULT_API = "http://localhost:8000"
 TIMEOUT = 120.0
@@ -596,14 +603,35 @@ def _ensure_tenant() -> None:
     from sqlalchemy.dialects.postgresql import insert
 
     from services.api.src.models import Tenant
-    from services.api.src.sync_db import sync_session
 
-    with sync_session() as session:
+    # Owner connection. Under row-level security the app role can only write rows for the
+    # tenant its session is scoped to, and a tenant cannot be scoped to itself before it
+    # exists — which is the correct shape for onboarding, not an obstacle to work around.
+    with _owner_session() as session:
         session.execute(
             insert(Tenant)
             .values(tenant_id=TENANT, name="Drawbridge E2E", default_jurisdiction="us")
             .on_conflict_do_nothing(index_elements=[Tenant.tenant_id])
         )
+
+
+@contextmanager
+def _owner_session() -> Iterator[Session]:
+    """A session as the table owner, for the two steps that are operator actions.
+
+    Onboarding a tenant and tearing one down are both outside the isolation boundary by
+    design — see `scripts/tenant_offboard.py`, which takes the same connection for the
+    same reason. Everything between them in this script goes through the API and the MCP
+    servers, which connect as `drawbridge_app` and are subject to the policies.
+    """
+    url = os.environ.get("DRAWBRIDGE_OWNER_DATABASE_URL") or get_settings().sync_database_url
+    engine = create_engine(url.replace("+asyncpg", "+psycopg"))
+    try:
+        with Session(engine) as session:
+            yield session
+            session.commit()
+    finally:
+        engine.dispose()
 
 
 def _cleanup(claim_ids: list[str]) -> None:
@@ -618,10 +646,11 @@ def _cleanup(claim_ids: list[str]) -> None:
         RefundLine,
         ReviewQueue,
     )
-    from services.api.src.sync_db import sync_session
 
     ids = [UUID(c) for c in claim_ids]
-    with sync_session() as session:
+    # Owner again: this deletes across the whole tenant, which is exactly what the app
+    # role's policies exist to prevent it doing.
+    with _owner_session() as session:
         session.execute(delete(ReviewQueue).where(ReviewQueue.tenant_id == TENANT))
         session.execute(delete(RefundLine).where(RefundLine.claim_id.in_(ids)))
         session.execute(delete(ClaimTransition).where(ClaimTransition.claim_id.in_(ids)))

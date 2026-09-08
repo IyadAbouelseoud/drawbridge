@@ -18,15 +18,21 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from services.api.src.models import Base, Claim, ReviewQueue, Tenant, install_ledger_guards
+from services.api.src.tenancy import APP_ROLE, ensure_app_role, install_rls
 
 TEST_DSN = os.environ.get(
     "DRAWBRIDGE_TEST_DATABASE_URL",
     "postgresql+psycopg://drawbridge:drawbridge@localhost:5432/drawbridge",
 )
+
+# The password the suite gives `drawbridge_app`. Local only, and it has to be a literal
+# somewhere: the point of the role is that it is unprivileged, so a leaked test password
+# grants exactly what an unscoped connection grants, which is nothing.
+TEST_APP_PASSWORD = os.environ.get("DRAWBRIDGE_TEST_APP_PASSWORD", "drawbridge-app-test")
 
 
 def _reachable(dsn: str) -> bool:
@@ -56,7 +62,26 @@ def engine() -> Engine:
     # cannot detect from the inside.
     with eng.begin() as connection:
         install_ledger_guards(connection)
+        # Same reasoning for the policies: `create_all` installs them through the metadata
+        # hook only for a schema it actually builds, and a developer database that predates
+        # this week would otherwise run the isolation tests against unprotected tables —
+        # which is the one failure those tests cannot detect from the inside.
+        install_rls(connection)
+        ensure_app_role(connection, TEST_APP_PASSWORD)
     return eng
+
+
+@pytest.fixture(scope="session")
+def app_engine(engine: Engine) -> Engine:  # noqa: ARG001 - depends on the schema, not the value
+    """The same database, seen through the unprivileged role the services connect as.
+
+    Every other fixture here connects as the owner, which is a superuser and therefore
+    bypasses every policy — convenient for building test data, useless for proving
+    isolation. `tests/integration/test_rls.py` is the only suite that uses this one, and
+    it is the only suite where RLS is in effect at all.
+    """
+    url = make_url(TEST_DSN).set(username=APP_ROLE, password=TEST_APP_PASSWORD)
+    return create_engine(url, pool_pre_ping=True)
 
 
 @pytest.fixture

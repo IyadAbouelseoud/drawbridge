@@ -24,7 +24,8 @@ from drawbridge_schemas.jurisdiction import Jurisdiction
 from drawbridge_schemas.trade import EntryLine, ExportLine, LineMatch
 from services.api.src.analyst import AnalystError, claim_history, claim_summary, transition_claim
 from services.api.src.persistence import PersistenceError, persist_claim
-from services.api.src.sync_db import in_thread
+from services.api.src.sync_db import in_thread, in_thread_for_claim
+from services.api.src.tenancy import TenantScopeError
 
 router = APIRouter(prefix="/claims", tags=["claims"])
 
@@ -93,7 +94,8 @@ async def persist(body: PersistRequest) -> dict[str, Any]:
                 total_refund=body.total_refund,
                 requires_review=body.requires_review,
                 actor=body.actor,
-            )
+            ),
+            body.tenant_id,
         )
     except PersistenceError as exc:
         raise HTTPException(
@@ -111,15 +113,23 @@ async def transition(body: TransitionRequest) -> dict[str, Any]:
     retries one and stops on the other.
     """
     try:
-        return await in_thread(
+        return await in_thread_for_claim(
+            body.claim_id,
             lambda session: transition_claim(
                 session,
                 claim_id=body.claim_id,
                 to_state=body.to_state,
                 actor=body.actor,
                 reason=body.reason,
-            )
+            ),
         )
+    except TenantScopeError as exc:
+        # No such claim, rather than a claim in the wrong state. A 409 here would tell
+        # n8n to stop and an operator to go looking for a state machine problem.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "not_found", "claim_id": str(body.claim_id)},
+        ) from exc
     except AnalystError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -130,8 +140,8 @@ async def transition(body: TransitionRequest) -> dict[str, Any]:
 @router.get("/{claim_id}", response_model=ClaimOut)
 async def get_claim(claim_id: UUID) -> Any:
     try:
-        return await in_thread(lambda session: claim_summary(session, claim_id))
-    except AnalystError as exc:
+        return await in_thread_for_claim(claim_id, lambda session: claim_summary(session, claim_id))
+    except (AnalystError, TenantScopeError) as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"error": "not_found", "claim_id": str(claim_id)},
@@ -143,5 +153,11 @@ async def get_history(
     claim_id: UUID, limit: Annotated[int, Field(ge=1, le=500)] = 100
 ) -> dict[str, Any]:
     """The append-only transition trail. What an audit reads instead of a workflow log."""
-    rows = await in_thread(lambda session: claim_history(session, claim_id))
+    try:
+        rows = await in_thread_for_claim(claim_id, lambda session: claim_history(session, claim_id))
+    except TenantScopeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "not_found", "claim_id": str(claim_id)},
+        ) from exc
     return {"claim_id": str(claim_id), "transitions": rows[:limit], "count": len(rows)}

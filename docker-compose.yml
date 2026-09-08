@@ -3,15 +3,29 @@
 # Week 1 exit gate: `docker compose up` brings every service green.
 # Production overlay: docker-compose.prod.yml. On-prem: docker-compose.onprem.yml.
 
+# Two database URLs, and the difference between them is the multi-tenancy boundary.
+#
+# The services connect as `drawbridge_app`: an unprivileged role with neither SUPERUSER nor
+# BYPASSRLS, so the row-level security policies from migration b1d6f2c93a47 actually apply
+# to it. `drawbridge` owns the tables and is a superuser, which means policies do not apply
+# to it at all — every query it makes crosses every tenant. Pointing the services back at
+# the owner would leave the policies installed and enforcing nothing, which is worse than
+# not having them, so the owner URL is separate and named for what it is.
+#
+# Run `make rls-bootstrap` once before `make up` on a fresh database: the role is created
+# from the environment rather than by a migration, because a migration that creates a login
+# role has to put its password in version control.
 x-python-base: &python-base
   env_file: [.env]
   environment:
-    DRAWBRIDGE_DATABASE_URL: postgresql+asyncpg://drawbridge:drawbridge@postgres:5432/drawbridge
+    DRAWBRIDGE_DATABASE_URL: postgresql+asyncpg://drawbridge_app:${DRAWBRIDGE_APP_DB_PASSWORD:-drawbridge-app-local}@postgres:5432/drawbridge
+    DRAWBRIDGE_OWNER_DATABASE_URL: postgresql+psycopg://drawbridge:drawbridge@postgres:5432/drawbridge
     DRAWBRIDGE_REDIS_URL: redis://redis:6379/0
     DRAWBRIDGE_S3_ENDPOINT_URL: http://minio:9000
     DRAWBRIDGE_S3_ACCESS_KEY: drawbridge
     DRAWBRIDGE_S3_SECRET_KEY: drawbridge
     DRAWBRIDGE_S3_BUCKET_DOCUMENTS: drawbridge-documents
+    DRAWBRIDGE_S3_BUCKET_ARCHIVE: drawbridge-archive
   volumes:
     - ./services:/app/services:ro
     - ./mcp_servers:/app/mcp_servers:ro

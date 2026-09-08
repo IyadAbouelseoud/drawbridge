@@ -28,6 +28,9 @@ dependencies = [
     "opentelemetry-instrumentation-fastapi>=0.50b0",
     "pgvector>=0.3.6",
     "psycopg[binary]>=3.2",
+    # Ed25519 signatures over the offboarding ledger export. Already present
+    # transitively; declared because scripts/tenant_offboard.py imports it directly.
+    "cryptography>=44.0",
 ]
 
 [project.optional-dependencies]

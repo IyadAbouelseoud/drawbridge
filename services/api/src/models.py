@@ -56,8 +56,31 @@ class Tenant(Base):
     default_jurisdiction: Mapped[str] = mapped_column(String(8), default="us")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    # Offboarding is a tombstone, not a delete. `audit_ledger.tenant_id` is RESTRICT and
+    # the retention obligation it enforces (19 CFR §163; GCC Art. 175) outlives the
+    # commercial relationship by years, so the row stays and stops being visible:
+    # `tenancy.app_current_tenant()` returns NULL once `offboarded_at` is set, which takes
+    # the tenant's documents, claims, ledger and queue out of every RLS-scoped query at
+    # once. See scripts/tenant_offboard.py.
+    offboarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    offboard_artifact_key: Mapped[str | None] = mapped_column(
+        String(512), doc="MinIO key of the signed ledger export taken at offboarding"
+    )
+    offboard_signature: Mapped[str | None] = mapped_column(
+        String(256), doc="Ed25519 signature over the export digest, hex"
+    )
+    offboard_public_key: Mapped[str | None] = mapped_column(
+        String(64), doc="Verifying key for the signature above, hex"
+    )
+
     __table_args__ = (
         CheckConstraint("default_jurisdiction IN ('us','ksa')", name="ck_tenant_jurisdiction"),
+        CheckConstraint(
+            "offboarded_at IS NULL OR "
+            "(offboard_artifact_key IS NOT NULL AND offboard_signature IS NOT NULL "
+            "AND offboard_public_key IS NOT NULL)",
+            name="ck_tenant_offboard_is_evidenced",
+        ),
     )
 
 

@@ -219,7 +219,7 @@ async def store_batch(body: BatchRequest) -> dict[str, Any]:
                 },
             )
 
-    await in_thread(_work)
+    await in_thread(_work, body.tenant_id)
 
     return {
         "tenant_id": str(body.tenant_id),
@@ -370,4 +370,4 @@ async def run_extraction(body: ExtractionRequest) -> dict[str, Any]:
             "confidences": [c.model_dump(mode="json") for c in confidences],
         }
 
-    return await in_thread(_work)
+    return await in_thread(_work, body.tenant_id)

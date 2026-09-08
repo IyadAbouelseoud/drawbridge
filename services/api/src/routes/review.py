@@ -18,6 +18,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import Session
 
 from services.api.src.models import ReviewQueue
+from services.api.src.tenancy import (
+    TenantScopeError,
+    scope_to_resume_token_async,
+    scope_to_review_async,
+    set_tenant_async,
+)
 from services.rules.src.triage import ReviewReason, Severity
 
 router = APIRouter(prefix="/review", tags=["review"])
@@ -87,6 +93,7 @@ async def suspend(body: SuspendRequest, request: Request) -> dict[str, Any]:
     """
     created: list[dict[str, Any]] = []
     async with _session(request) as session, session.begin():
+        await set_tenant_async(session, body.tenant_id)
         for item in body.items:
             row = ReviewQueue(
                 review_id=uuid4(),
@@ -132,6 +139,7 @@ async def list_queue(
     oldest item is the closest to it.
     """
     async with _session(request) as session:
+        await set_tenant_async(session, tenant_id)
         rows = (
             await session.execute(
                 select(ReviewQueue)
@@ -168,6 +176,13 @@ async def resolve(review_id: UUID, body: ResolveRequest, request: Request) -> di
     the queue cannot empty without a record of what was actually decided.
     """
     async with _session(request) as session, session.begin():
+        try:
+            await scope_to_review_async(session, review_id)
+        except TenantScopeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "not_found_or_already_resolved", "review_id": str(review_id)},
+            ) from exc
         result = await session.execute(
             update(ReviewQueue)
             .where(ReviewQueue.review_id == review_id, ReviewQueue.state != "resolved")
@@ -222,13 +237,19 @@ async def draft_memos(tenant_id: UUID, limit: int = 20) -> dict[str, Any]:
             "unavailable": report.unavailable,
         }
 
-    return await in_thread(_run)
+    return await in_thread(_run, tenant_id)
 
 
 @router.get("/pending/{resume_token}")
 async def poll(resume_token: str, request: Request) -> dict[str, Any]:
     """What n8n polls while suspended."""
     async with _session(request) as session:
+        try:
+            await scope_to_resume_token_async(session, resume_token)
+        except TenantScopeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="unknown token"
+            ) from exc
         row = (
             await session.execute(
                 select(ReviewQueue).where(ReviewQueue.resume_token == resume_token)

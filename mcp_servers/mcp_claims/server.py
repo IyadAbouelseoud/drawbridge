@@ -86,7 +86,7 @@ def list_review_queue(
     claim is a deadline, not a queue position.
     """
     try:
-        with session_scope() as session:
+        with session_scope(_uuid(tenant_id, "tenant_id") if tenant_id else None) as session:
             items = list_queue(
                 session,
                 tenant_id=_uuid(tenant_id, "tenant_id") if tenant_id else None,
@@ -116,7 +116,7 @@ def inspect_exception(
     is the part worth reading first.
     """
     try:
-        with session_scope() as session:
+        with session_scope(review_id=_uuid(review_id, "review_id")) as session:
             return {"ok": True, "exception": get_exception(session, _uuid(review_id, "review_id"))}
     except (AnalystError, ValueError) as exc:
         return _fail(exc)
@@ -141,7 +141,7 @@ def draft_exception_memo(
     would make that record unreconstructable.
     """
     try:
-        with session_scope() as session:
+        with session_scope(review_id=_uuid(review_id, "review_id")) as session:
             return {
                 "ok": True,
                 **draft_one(session, _uuid(review_id, "review_id"), overwrite=overwrite),
@@ -180,7 +180,7 @@ def resolve_review_exception(
     `deferred` does not resume: deferring is a decision to look again later.
     """
     try:
-        with session_scope() as session:
+        with session_scope(review_id=_uuid(review_id, "review_id")) as session:
             outcome = resolve_exception(
                 session,
                 review_id=_uuid(review_id, "review_id"),
@@ -241,7 +241,7 @@ def override_declared_valuation(
         return _fail(ValueError(f"corrected_value is not a decimal: {corrected_value!r}"))
 
     try:
-        with session_scope() as session:
+        with session_scope(review_id=_uuid(review_id, "review_id")) as session:
             outcome = override_valuation(
                 session,
                 review_id=_uuid(review_id, "review_id"),
@@ -269,7 +269,7 @@ def approve(
     complementary guard that review actually happened rather than merely being entered.
     """
     try:
-        with session_scope() as session:
+        with session_scope(claim_id=_uuid(claim_id, "claim_id")) as session:
             return {
                 "ok": True,
                 **approve_claim(
@@ -296,7 +296,7 @@ def transition(
     and the domain model cannot drift on what is reachable from where.
     """
     try:
-        with session_scope() as session:
+        with session_scope(claim_id=_uuid(claim_id, "claim_id")) as session:
             return {
                 "ok": True,
                 **transition_claim(
@@ -317,7 +317,7 @@ def describe_claim(
 ) -> dict[str, Any]:
     """A claim's current state, deadlines and outstanding exception count."""
     try:
-        with session_scope() as session:
+        with session_scope(claim_id=_uuid(claim_id, "claim_id")) as session:
             return {"ok": True, "claim": claim_summary(session, _uuid(claim_id, "claim_id"))}
     except (AnalystError, ValueError) as exc:
         return _fail(exc)
@@ -329,7 +329,7 @@ def claim_transitions(
 ) -> dict[str, Any]:
     """Every state transition on a claim, oldest first. Append-only."""
     try:
-        with session_scope() as session:
+        with session_scope(claim_id=_uuid(claim_id, "claim_id")) as session:
             history = claim_history(session, _uuid(claim_id, "claim_id"))
         return {"ok": True, "count": len(history), "transitions": history}
     except (AnalystError, ValueError) as exc:
@@ -348,7 +348,7 @@ def reopen(
     is materially different from "always open", and an auditor will want to see which.
     """
     try:
-        with session_scope() as session:
+        with session_scope(review_id=_uuid(review_id, "review_id")) as session:
             return {
                 "ok": True,
                 **reopen_exception(

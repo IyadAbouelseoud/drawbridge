@@ -429,6 +429,7 @@ drawbridge/
 ├── n8n/workflows/                # exported JSON, version-controlled
 ├── packages/schemas/             # shared contracts incl. jurisdiction.py profiles
 ├── scripts/                      # ingest_tariff.py · embed_corpus.py · e2e_pipeline_test.py
+│                                 # rls_bootstrap.py · tenant_offboard.py (operator, owner DSN)
 ├── tests/                        # unit · golden-claim fixtures · property-based rules
 │   └── fixtures/                 # tariff_benchmark.json · bayan.py (synthetic RTL table)
 └── infra/
@@ -1033,7 +1034,8 @@ value rather than one long token.
 
 **What this does not do** is decide which cell is which field. Column semantics come from a
 template or from the table header, supplied by the caller. Inferring them from position
-would put a layout heuristic between an Arabic table and a duty figure.
+would put a layout heuristic between an Arabic table and a duty figure. Week 11 supplies
+both halves — see §16.2.
 
 ### 15.7 Testing a document format with no font
 
@@ -1063,3 +1065,147 @@ fallback.
 
 Both cases then trace one figure back through `mcp-ledger` before finishing: Case A the
 Section 301 duty on the 7501, Case B the re-export value the Art. 16 §2 decision turned on.
+
+---
+
+## 16. The boundary (week 11)
+
+### 16.1 Three pieces
+
+```
+templates.py        geometry cells -> named fields, by heading first and index second
+RLS + tenancy.py    Postgres decides which rows a connection may see, not the WHERE clause
+tenant_offboard.py  sign the ledger, archive it, tombstone the tenant; delete nothing
+```
+
+### 16.2 Templates: what geometry deliberately left undone
+
+§15.6 ends by saying `extract_table` returns cells and does not decide which is the duty,
+because inferring that from position would put a layout heuristic between an Arabic table
+and a figure on a refund claim. `services/extraction/src/templates.py` supplies the
+decision rather than deriving it.
+
+A `ColumnSpec` carries three things: the index the column is expected at, the headings it
+is expected to carry, and the schema field it becomes. The last of those exists because the
+document and the schema speak different languages — a *Bayan* column headed الرسوم is
+`duty_amount` on the form and `duty_paid` on `EntryLine`, and collapsing them would hide a
+translation that a reader of either side needs to see.
+
+**The heading wins over the index.** `bind` locates each field among the header row's cells
+and returns the mapping it actually used. A form revision that inserts a column shifts every
+index after it; a template trusting its indices would keep parsing and report the quantity
+column as the value — a claim that is internally consistent, reconciles against itself, and
+is wrong. A declared field whose heading is nowhere on the page raises `TemplateError`.
+Where there is no header row at all, indices are all there is, and the caller has said so by
+setting `has_header_row=False`.
+
+**Coercion failures are collected, not raised.** `TemplateResult.issues` carries them and
+the row keeps its other fields. A dash struck through one duty cell is a review signal, and
+discarding four good columns for it would be worse than the problem.
+
+`spans_for` emits a `ProvenanceSpan` per numeric field, keyed by the schema name, measured
+from the cell's own box — which closes the loop opened in §15.2: an Arabic table cell can
+now reach `EntryLine` with the rectangle the validator demands.
+
+`BAYAN_LINE_TABLE` is labelled a mock and is one. Its column set comes from the
+declaration's published structure (`COMPLIANCE-GCC.md` §5), not from a measured form, and
+the clustering constants under it were tuned against a fixture this repository wrote. See
+the roadmap's **B3**.
+
+### 16.3 RLS: what the tenant column was not doing
+
+Every tenant-scoped table has carried `tenant_id` since week 2 and every query has filtered
+on it. That is not isolation. A filter is a thing a developer remembers, the first query
+that forgets is a data breach with a passing test suite, and nothing in the type system
+tells the two apart.
+
+Ten tables now carry one `FOR ALL` policy comparing against `app_current_tenant()`.
+`refund_lines` and `claim_transitions` have no `tenant_id` of their own and are reached
+through their claim; duplicating the column to simplify a policy would create a second place
+for the answer to be wrong. `classification_queries` allows NULL, because a corpus query
+belongs to nobody. `tariff_lines` and `tariff_rulings` stay outside: the same schedule for
+every tenant, and a policy there would cost a join and protect nothing.
+
+One `FOR ALL` policy rather than four per operation. Split policies let SELECT and INSERT
+drift apart, and a row a tenant can write but cannot read is a bug that only appears under a
+second tenant.
+
+### 16.4 The role is the control
+
+`drawbridge` owns these tables and is a superuser with `BYPASSRLS`. Policies do not apply to
+it, and `FORCE ROW LEVEL SECURITY` does not change that — FORCE binds an owner only where
+the owner is not a superuser.
+
+So the enforcement is not in the migration. It is in the DSN: the services connect as
+`drawbridge_app`, created by `scripts/rls_bootstrap.py` with `NOSUPERUSER NOBYPASSRLS` and
+granted exactly the table privileges they need. The bootstrap refuses to finish if the role
+it just created could bypass a policy, because a role in that state passes every functional
+test in the suite and isolates nothing.
+
+Deliberately outside the boundary, each for a stated reason:
+
+| Path | Connects as | Why |
+|---|---|---|
+| Alembic migrations | owner | DDL, and the policies themselves |
+| `scripts/ingest_tariff.py`, `embed_corpus.py` | owner | shared reference data, no tenant |
+| `scripts/tenant_offboard.py` | owner | reads a tenant it is about to make invisible |
+| e2e onboarding and teardown | owner | operator actions; a tenant cannot scope to itself before it exists |
+| Integration fixtures | owner | build cross-tenant data; `tests/integration/test_rls.py` is the one suite that uses the app role |
+
+### 16.5 Scoping a session
+
+`SET LOCAL "tenant.id"`, written through `set_config(..., is_local => true)` — transaction
+scoped, so it cannot survive into the next checkout of a pooled connection, and a bind
+parameter rather than interpolated SQL. Unset resolves to NULL, `tenant_id = NULL` is never
+true, and an unscoped connection therefore reads nothing. Falling open would be satisfied by
+exactly the set of paths that forgot, which is the set this exists to catch.
+
+Four entry points are addressed by an identifier and never see a tenant: `GET /claims/{id}`,
+`POST /packaging/build`, `POST /review/{id}/resolve`, `GET /review/pending/{token}` — and
+most `mcp-claims` and `mcp-ledger` tools. They resolve the owner first through a
+`SECURITY DEFINER` lookup (`app_tenant_of_claim`, `app_tenant_of_review`,
+`app_tenant_of_resume_token`), then scope the transaction to it.
+
+That is a hole, so it is worth stating its exact size. Each function returns one uuid and
+nothing else, and each pins `search_path` so the definer privilege cannot be aimed at
+another schema. What someone learns by guessing a claim UUID is which tenant owns it. The
+row stays invisible until the scope is set, and
+`test_the_lookup_returns_an_owner_and_nothing_else` pins both halves.
+
+### 16.6 Offboarding, and why RESTRICT was survivable after all
+
+§15.4 said a tenant with ledger rows cannot be deleted and left it there. The procedure is
+export, sign, tombstone.
+
+**In that order.** A failed upload leaves a live tenant and no artifact, which is fixed by
+running the script again. The reverse order leaves an invisible tenant whose ledger was
+never exported — the state the whole mechanism exists to prevent — so the database refuses
+it too: `ck_tenant_offboard_is_evidenced` rejects a tombstone lacking the artifact key, the
+signature and the public key.
+
+The artifact is the chain as JSON lines, every column including `prev_hash` and
+`entry_hash`, so an auditor can recompute it from the file without our database. The
+manifest carries the sequence range, the `verify_chain` verdict at the moment of export,
+and the SHA-256 of the body; the Ed25519 signature is over the manifest, which is what
+makes it cover the body too. A signature made after the relationship ended would prove
+much less, which is why this runs at offboarding rather than on request.
+
+The private key comes from `DRAWBRIDGE_OFFBOARD_SIGNING_KEY` and the script refuses to
+generate one. A key that existed for the duration of a single process produces artifacts
+that look signed and verify against nothing.
+
+**The tombstone is one predicate.** `app_current_tenant()` resolves the GUC through the
+`tenants` table and returns NULL once `offboarded_at` is set, so an offboarded tenant's
+documents, claims, ledger and queue leave every scoped query at once — without ten policies
+having to remember. The rows stay exactly where 19 CFR §163 and GCC Art. 175 require them.
+
+### 16.7 What this does not do
+
+- **Authenticate.** RLS answers which rows a connection may see. Nothing here answers who
+  the caller is; that is Authentik, and it is the other half of onboarding a second tenant.
+- **Protect against the owner.** Stated rather than mitigated — see 16.4. Anyone holding
+  the owner DSN reads every tenant, and the answer to that is secret management, not SQL.
+- **Verify an archived artifact from anywhere.** `verify_artifact` is written and tested and
+  is not exposed to an auditor.
+- **Assemble a declaration from a template.** Typed cells and their provenance, yes; a whole
+  `EntryLine` off a *Bayan*, not yet — that needs a header block and a real form.

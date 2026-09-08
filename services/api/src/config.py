@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     s3_access_key: str = "drawbridge"
     s3_secret_key: str = "drawbridge"
     s3_bucket_documents: str = "drawbridge-documents"
+    # Cold storage, separate from the documents bucket: an offboarded tenant's signed
+    # ledger has to outlive the relationship by five years and wants its own
+    # lifecycle rules. See scripts/tenant_offboard.py.
+    s3_bucket_archive: str = "drawbridge-archive"
 
     anthropic_api_key: str | None = None
     model_reasoning: str = "claude-opus-5"

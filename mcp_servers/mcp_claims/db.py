@@ -11,10 +11,13 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import lru_cache
+from uuid import UUID
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
+
+from services.api.src.tenancy import scope_to_claim, scope_to_review, set_tenant
 
 
 def database_url() -> str:
@@ -42,14 +45,32 @@ def _session_factory() -> sessionmaker[Session]:
 
 
 @contextmanager
-def session_scope() -> Iterator[Session]:
+def session_scope(
+    tenant_id: UUID | None = None,
+    *,
+    claim_id: UUID | None = None,
+    review_id: UUID | None = None,
+) -> Iterator[Session]:
     """A transaction that commits on success and rolls back on failure.
 
     Analyst decisions are the durable fact in this system, so they commit before any
     notification is attempted — see services/api/src/resume.py.
+
+    Scoping under row-level security takes whichever identifier the tool actually has.
+    Most MCP tools are addressed by claim or review id and never see a tenant, so
+    `claim_id` and `review_id` resolve the owner through a SECURITY DEFINER lookup and
+    scope the rest of the transaction to it — see `services/api/src/tenancy.py`. A tool
+    that supplies none of the three runs unscoped and, under the `drawbridge_app` role,
+    reads nothing.
     """
     session = _session_factory()()
     try:
+        if tenant_id is not None:
+            set_tenant(session, tenant_id)
+        elif claim_id is not None:
+            scope_to_claim(session, claim_id)
+        elif review_id is not None:
+            scope_to_review(session, review_id)
         yield session
         session.commit()
     except Exception:

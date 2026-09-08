@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 10 |
+| Current week | 11 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | **The record** — RTL geometry, mandatory figure provenance, append-only ledger |
+| Current milestone | **The boundary** — Bayan templates, tenant offboarding, row-level isolation |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -122,10 +122,16 @@ otherwise renders a transcription that says on its face that it is not a CBP-iss
 
 ## Blocked on external acquisition — off the automated critical path
 
-Two items cannot be closed by any amount of engineering. Both were carried as checklist
-entries through weeks 5 and 6 on the assumption that another routing attempt might work;
-that assumption is now retired. They move here, and the roadmap stops pretending a build
-step will reach them.
+Three items cannot be closed by any amount of engineering. Each was carried as a checklist
+entry for several weeks on the assumption that another routing attempt might work; that
+assumption is now retired for all three. They live here, and the roadmap stops pretending a
+build step will reach them.
+
+All three resolve through the same door. B1 needs a licensed Saudi broker's credentials, B3
+needs a licensed Saudi broker's documents, and B2 is working material that practice holds.
+One commercial relationship closes the KSA lane's remaining unknowns, and Drawbridge needs
+that relationship anyway — it never files, so a broker is a prerequisite rather than an
+extra cost.
 
 ### B1. Fasah sandbox credentials
 
@@ -168,6 +174,35 @@ blocks transmission, and the packet says why (`COMPLIANCE-GCC.md` §8.4.1). This
 stable resting state, not a temporary patch — the operative constants all come from the
 GCC Common Customs Law, which is transcribed and authoritative. Closing B2 is one edit to
 `services/packager/src/citations.py`.
+
+### B3. A real scanned *Bayan* corpus
+
+**Status: requires unredacted client documents, not a dataset.** Moved here in week 11
+from the entry checklist, where it had been carried since week 3 as though it were a
+build step. It is not one. There is no public corpus of Saudi customs declarations, and
+there will not be: a *Bayan* carries the importer's identity, commercial values and
+consignment references, so every copy in existence belongs to a trader or their broker.
+Synthetic pages cannot substitute — the whole point of the corpus is to find out what a
+real form does that this repository did not imagine.
+
+Acquisition routes, in the order worth trying:
+
+1. **The same broker relationship as B1.** A licensed broker holds thousands of these as
+   working material and is the only party who can share them lawfully, redacted or under
+   an engagement. This is why it is the same route: one relationship closes both.
+2. **A pilot client's own archive**, under the engagement letter that would exist anyway
+   before Drawbridge touched their filings.
+3. A logistics provider's document management system, as a sponsoring partner.
+
+**Until then:** `tests/fixtures/bayan.py` builds a *Bayan* at the PDF object level and the
+geometry and template suites run against it. What that establishes is real — the
+reconstruction is coordinate-driven and survives both storage orders — and what it cannot
+establish is equally real: `COLUMN_GAP_POINTS`, `ROW_OVERLAP_RATIO` and `WORD_GAP_WIDTHS`
+were chosen against a fixture this repository wrote, and `BAYAN_LINE_TABLE` is a mock whose
+column set comes from the declaration's published structure rather than from a measured
+form. Neither is calibrated. The template refuses rather than guesses when a heading is
+missing, which is the posture that makes an uncalibrated parser safe to ship, and the
+`ANALYST_REVIEW` route is where anything it will not read goes.
 
 ## Week 7 task breakdown
 
@@ -437,24 +472,154 @@ allocation. Hypothesis found it with three matches against a duty of one cent �
 quantization *is* the entire figure. The tolerance was the oversight; the solver was doing
 what it says it does.
 
-## Week 11 entry checklist
+## Week 11 task breakdown
+
+- [x] **Bayan template engine.** `services/extraction/src/templates.py` — a spatial
+      mapping from geometry cells to named fields, with a mock ZATCA declaration
+      (`BAYAN_LINE_TABLE`). Column semantics are supplied, not inferred: week 10 stopped
+      exactly here and said why.
+- [x] **Export-and-tombstone offboarding.** `scripts/tenant_offboard.py` signs a tenant's
+      whole ledger chain with Ed25519, archives it to MinIO cold storage as JSON lines,
+      and tombstones the tenant row. The ledger rows stay where the retention obligation
+      requires them and stop being reachable.
+- [x] **Row-level security.** Migration `b1d6f2c93a47` enables RLS on the ten tenant-scoped
+      tables; `services/api/src/tenancy.py` scopes every session with `SET LOCAL tenant.id`;
+      `scripts/rls_bootstrap.py` creates the unprivileged role that makes it bite.
+- [x] **Golden fixtures**: a geometric cell typed as `duty_amount`
+      (`tests/golden/test_bayan_template.py`), and a query for another tenant's claim id
+      returning nothing (`tests/integration/test_rls.py`).
+
+### The thing that would have made RLS decorative
+
+`drawbridge` — the role in every DSN in the stack until this week — owns these tables and
+is a Postgres superuser with `BYPASSRLS`. Policies do not apply to it. `FORCE ROW LEVEL
+SECURITY` would not have helped either: FORCE binds a table's owner only where the owner is
+not a superuser, which is precisely not this case.
+
+So a migration that enabled RLS and stopped there would have installed ten policies, passed
+every test written against the existing connection, and isolated nothing. That is a worse
+outcome than no policies at all, because the next person to read the schema would conclude
+the problem was solved.
+
+The isolation therefore comes from `drawbridge_app`, an unprivileged role, and week 11
+moved the stack onto it: `docker-compose.yml` points the services at `drawbridge_app` and
+keeps the owner URL under its own name for the things that genuinely cross tenants —
+migrations, the corpus loaders, `tenant_offboard.py`, and the two operator steps in the
+e2e. `scripts/rls_bootstrap.py` refuses to finish if the role it just created can bypass a
+policy, and `tests/integration/test_rls.py` asserts the same thing before any other test in
+the file relies on it.
+
+The e2e was then run end to end with every service connected as the app role. Both cases
+passed, which is the only evidence that matters here: a policy set that has never had a
+real pipeline run through it is a hypothesis.
+
+### Fail-closed, and what that cost
+
+`app_current_tenant()` returns NULL when nothing has set `tenant.id`, so an unscoped
+connection reads no tenant rows at all. The alternative — falling open when the variable is
+missing — would be satisfied by exactly the set of code paths this control exists to catch.
+
+The cost is that every entry point had to be given a tenant, and several never see one. A
+`GET /claims/{id}`, a packet build, `trace_figure`, an analyst clicking a resolve link:
+each has an identifier and nothing else. Those resolve the owner through a `SECURITY
+DEFINER` lookup — `app_tenant_of_claim`, `app_tenant_of_review`,
+`app_tenant_of_resume_token` — and then scope the rest of the transaction. Each returns one
+uuid and pins its `search_path`, so what someone learns by guessing a claim UUID is which
+tenant owns it, and the row itself stays invisible until the scope is set. That is a real
+hole, it is the smallest one that lets the routes work, and it is pinned by a test rather
+than described in a comment.
+
+`SET LOCAL` rather than `SET`, through `set_config(..., is_local => true)` rather than
+literal SQL. Connections are pooled: a scope that outlived its transaction would be
+inherited by whichever request checked the connection out next, which is a cross-tenant
+read with no bug anywhere in any query.
+
+### The tombstone is what makes RESTRICT survivable
+
+Week 10 left `audit_ledger.tenant_id` as RESTRICT and stated the consequence — a tenant with
+ledger rows cannot be deleted — without giving offboarding a procedure. The procedure is
+export, sign, tombstone, in that order, and the order is the interesting part: a failed
+upload leaves a live tenant and no artifact, which is fixed by running the script again,
+whereas the other order leaves an invisible tenant whose ledger was never exported. That
+second state is the one the whole mechanism exists to prevent, so the database refuses it
+too — `ck_tenant_offboard_is_evidenced` rejects a tombstone with no artifact key, signature
+and public key on the row.
+
+Ed25519 over the manifest, and the manifest commits to the SHA-256 of the body. Years
+later a customs authority is being shown records produced by the party it is auditing, and
+"this is what our database said" is a weaker statement than "this is what our database
+said, and here is a signature made before the relationship ended". The private key is read
+from the environment and the script refuses to invent one, because a signature made with a
+key that existed for the duration of a single process proves nothing.
+
+One predicate does the hiding. `app_current_tenant()` resolves the GUC *through* the
+`tenants` table and returns NULL once `offboarded_at` is set, so a tombstone takes the
+tenant's documents, claims, ledger and queue out of every scoped query at once rather than
+requiring ten policies to remember.
+
+### The heading is the authority, not the index
+
+The template declares both a column index and the headings that column carries. When a
+header row is present the heading wins and the binding actually used is reported back.
+
+This is not defensive programming. A form revision that inserts a column shifts every index
+after it, and a template trusting its own indices would keep parsing — reading the quantity
+column as the value, producing a claim that is arithmetically consistent, internally
+reconciled, and wrong. `test_a_reordered_form_binds_by_heading_rather_than_by_index` swaps
+value and duty on the page and pins the outcome. A field whose heading is nowhere on the
+page raises rather than falling back to position.
+
+Coercion failures behave differently: they are collected on `TemplateResult.issues` rather
+than raised, because a dash struck through one duty cell should not discard the four good
+columns beside it. That is what the review queue is for.
+
+### What week 11 deliberately did not do
+
+- **Assemble `EntryLine` objects from a template.** `spans_for` emits the provenance a
+  line needs and the typing is done, but nothing yet builds a declaration out of a *Bayan*
+  end to end. That wants a real form to build against (**B3**), and a header block —
+  declaration number, importer, dates — which is a different extraction problem from a
+  line table and gets its own week.
+- **Move `tariff_lines` and `tariff_rulings` under RLS.** They are the same schedule for
+  every tenant and carry nothing that identifies one. A policy there would cost a join per
+  classification query and protect nothing.
+- **Verify the chain on a schedule.** Still an operator action. Carried from week 10 and
+  now carried again, because it is a deployment question — where the ledger is replicated
+  and what alerts on a break — and answering it with a background task nobody watches
+  would be worse than leaving it open.
+- **Rotate the offboarding key, or verify an archived artifact from the CLI.**
+  `verify_artifact` exists and is tested; nothing exposes it to an auditor yet.
+
+### One thing found by wiring it up
+
+`ALTER ROLE ... PASSWORD` is a utility statement and takes no bind parameter, so the value
+has to reach Postgres as a literal. That is the only statement in `tenancy.py` where a
+placeholder is unavailable, and it is a password — so the character set is restricted to
+printable ASCII without backslashes first and the quote doubled second. Worth recording
+because the obvious code passes a bind parameter, and it fails at runtime rather than at
+type-check time.
+
+## Week 12 entry checklist
 
 1. **Full-volume corpus load** — the ~19,000-line USITC schedule and the CROSS body.
-   Carried from weeks 9 and 10. It gates (2).
+   Carried from weeks 9, 10 and 11. It gates (2), and it is now the oldest open item.
 2. **Re-run the tariff benchmark against that corpus.** `vector_ceiling` 0.68 and
    `CONFIRMATION_LEXICAL_FLOOR` 0.20 were both measured against twenty-four lines.
-3. **A real scanned *Bayan* corpus.** Now the most valuable missing input in the project:
-   it calibrates the OCR floor, and it is the only way to find out whether the cell
-   clustering constants — `COLUMN_GAP_POINTS`, `ROW_OVERLAP_RATIO`, `WORD_GAP_WIDTHS` —
-   survive contact with a real form. They were chosen against a fixture this repo wrote.
-4. **A *Bayan* field template**, so geometry cells become typed lines. Blocked on (3).
+3. **A *Bayan* header-block template**, so a declaration number and an importer come off
+   the form alongside the line table. Partially blocked on **B3**.
+4. **Tenant profiles** — EIN, CR number, broker code, IBAN. Carried from weeks 9, 10 and
+   11, and now the last thing between the packager and a second tenant.
 5. **A live agent run against real queue rows.** Carried from week 8.
-6. **Import the workflows into n8n and run one for real.** Carried from week 9; the Wait
-   node's resume path is still asserted rather than observed.
-7. **Tenant profiles** — EIN, CR number, broker code, IBAN. Carried from week 9.
-8. **A retention job**: `verify_chain` on a schedule, and an answer to where the ledger is
-   replicated. Both new this week and both deployment questions.
-9. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text.
+6. **Import the workflows into n8n and run one for real.** Carried from weeks 9 and 10;
+   the Wait node's resume path is still asserted rather than observed. Note that the
+   workflows now run against connections that must carry a tenant scope.
+7. **A retention job**: `verify_chain` on a schedule, and an answer to where the ledger is
+   replicated. Carried from week 10.
+8. **Authentik, secrets and OTel** — the rest of the week 11–12 milestone. RLS answers
+   "which rows may this connection see"; none of it answers "who is this caller", which is
+   the other half of onboarding a second tenant.
+9. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text, **B3** a
+   real scanned *Bayan* corpus.
 
 ## Sequencing rationale
 
@@ -498,3 +663,13 @@ require a bounding box on every figure when nothing yet produces figures, and th
 requirement means something only once there is a pipeline that has to satisfy it. The
 week 9 e2e had to grow a second document per case to comply, which is a real cost the
 week 2 version of this decision would have hidden.
+
+Multi-tenant hardening (wk 11–12) after the ledger rather than at the schema, and the same
+argument holds a third time. Every table has carried `tenant_id` since week 2 and every
+query has filtered on it, so RLS in week 2 would have looked like a formality — ten policies
+over a schema nobody had written a wrong query against yet. Built after ten weeks of query
+paths exist, it is a claim with something to check: the entry points that never see a tenant
+are enumerable, they turned out to be four, and each needed a decision rather than a policy.
+The one thing week 2 would have got right and week 11 nearly got wrong is the role: the
+control is worth nothing while the services connect as the owner, and that is not visible
+from the schema — only from the DSN.

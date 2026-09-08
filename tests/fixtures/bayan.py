@@ -92,7 +92,7 @@ def _placed(text: str, x_left: float, baseline: float) -> list[tuple[str, float,
 
 
 def cell_glyphs(
-    text: str, *, column: int, row: int, storage: Storage
+    text: str, *, column: int, row: int, storage: Storage, pitch: float = COLUMN_PITCH
 ) -> list[tuple[str, float, float]]:
     """One cell's glyphs in *emission* order — the order the content stream carries them.
 
@@ -102,7 +102,7 @@ def cell_glyphs(
     Positions are identical either way, which is the point: the coordinates decide, and
     the stream does not.
     """
-    right_edge = FIRST_COLUMN_RIGHT - column * COLUMN_PITCH
+    right_edge = FIRST_COLUMN_RIGHT - column * pitch
     width = len([c for c in text if not c.isspace()]) * ADVANCE
     placed = _placed(text, right_edge - width, FIRST_ROW_BASELINE - row * ROW_PITCH)
     if storage is Storage.VISUAL:
@@ -129,12 +129,24 @@ def cell_glyphs(
     return emission
 
 
-def bayan_pdf(rows: list[list[str]], *, storage: Storage = Storage.VISUAL) -> bytes:
-    """Render a table whose cells are given in reading order — column 0 is rightmost."""
+def bayan_pdf(
+    rows: list[list[str]],
+    *,
+    storage: Storage = Storage.VISUAL,
+    pitch: float = COLUMN_PITCH,
+) -> bytes:
+    """Render a table whose cells are given in reading order — column 0 is rightmost.
+
+    `pitch` narrows the columns so a wider table still fits the page. It stays well above
+    `geometry.COLUMN_GAP_POINTS` for every cell this module renders; a pitch that did not
+    would merge two columns into one and the failure would look like a geometry bug.
+    """
     glyphs: list[tuple[str, float, float]] = []
     for row_index, row in enumerate(rows):
         for column_index, text in enumerate(row):
-            glyphs.extend(cell_glyphs(text, column=column_index, row=row_index, storage=storage))
+            glyphs.extend(
+                cell_glyphs(text, column=column_index, row=row_index, storage=storage, pitch=pitch)
+            )
     return _pdf(glyphs)
 
 
@@ -217,4 +229,21 @@ BAYAN_TABLE: list[list[str]] = [
     ["حاسبات", "١٢٠٠", "٩٣٧٥٠٠٫٠٠", "٤٦٨٧٥٫٠٠"],
     ["طابعات", "٣٤٠", "٨٥٠٠٠٫٠٠", "٤٢٥٠٫٠٠"],
     ["شاشات", "٥٠٠", "١٢٥٠٠٠٫٠٠", "٦٢٥٠٫٠٠"],
+]
+
+
+# The six-column line table `services.extraction.src.templates.BAYAN_LINE_TABLE` reads.
+# Wider than BAYAN_TABLE, so it needs a tighter pitch to fit the page — the constant below
+# is what `templates`' tests pass to `bayan_pdf`.
+#
+#   البند   line number        الكمية  quantity
+#   الرمز   HS code            القيمة  value
+#   البيان  goods description  الرسوم  duty
+DECLARATION_PITCH = 90.0
+
+BAYAN_DECLARATION: list[list[str]] = [
+    ["البند", "الرمز", "البيان", "الكمية", "القيمة", "الرسوم"],
+    ["١", "٨٤٧١٣٠٠٠", "حاسبات", "١٢٠٠", "٩٣٧٥٠٠٫٠٠", "٤٦٨٧٥٫٠٠"],
+    ["٢", "٨٤٤٣٣١٠٠", "طابعات", "٣٤٠", "٨٥٠٠٠٫٠٠", "٤٢٥٠٫٠٠"],
+    ["٣", "٨٥٢٨٥٢٠٠", "شاشات", "٥٠٠", "١٢٥٠٠٠٫٠٠", "٦٢٥٠٫٠٠"],
 ]

@@ -47,7 +47,7 @@ def claim_audit_trail(
     they were required to supply at the time.
     """
     try:
-        with session_scope() as session:
+        with session_scope(claim_id=UUID(claim_id)) as session:
             claim_uuid = UUID(claim_id)
             summary = claim_summary(session, claim_uuid)
             history = claim_history(session, claim_uuid)
@@ -74,7 +74,8 @@ def decision_log(
     exactly what a customs authority asks about four years later.
     """
     try:
-        with session_scope() as session:
+        scope = UUID(tenant_id) if tenant_id else None
+        with session_scope(scope, claim_id=UUID(claim_id) if claim_id else None) as session:
             rows = (
                 session.execute(
                     text("""
@@ -133,7 +134,7 @@ def provenance_for_claim(
     than asserted.
     """
     try:
-        with session_scope() as session:
+        with session_scope(claim_id=UUID(claim_id)) as session:
             rows = (
                 session.execute(
                     text("""
@@ -193,7 +194,7 @@ def retention_status(
     of what the authority keeps.
     """
     try:
-        with session_scope() as session:
+        with session_scope(UUID(tenant_id)) as session:
             rows = (
                 session.execute(
                     text("""
@@ -253,7 +254,7 @@ def trace_figure(
     corrected extraction and an altered record look identical from one side.
     """
     try:
-        with session_scope() as session:
+        with session_scope(claim_id=UUID(claim_id)) as session:
             claim_uuid = UUID(claim_id)
             ledger_hits: list[dict[str, Any]] = []
             for entry in entries_for_claim(session, claim_uuid):
@@ -373,7 +374,7 @@ def ledger_chain(
     is entitled to ask about.
     """
     try:
-        with session_scope() as session:
+        with session_scope(UUID(tenant_id)) as session:
             result = verify_chain(session, UUID(tenant_id))
         return {"ok": True, "tenant_id": tenant_id, **result}
     except Exception as exc:
@@ -391,7 +392,7 @@ def claim_ledger(
     what an audit of an override asks about.
     """
     try:
-        with session_scope() as session:
+        with session_scope(claim_id=UUID(claim_id)) as session:
             entries = entries_for_claim(session, UUID(claim_id))
             rows = [
                 {

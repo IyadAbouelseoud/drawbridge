@@ -23,7 +23,8 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from services.api.src import packaging
-from services.api.src.sync_db import in_thread
+from services.api.src.sync_db import in_thread_for_claim
+from services.api.src.tenancy import TenantScopeError
 from services.packager.src.packet import Claimant
 
 router = APIRouter(prefix="/packaging", tags=["packaging"])
@@ -108,7 +109,12 @@ async def build(body: BuildRequest) -> dict[str, Any]:
         return result
 
     try:
-        return await in_thread(_work)
+        return await in_thread_for_claim(body.claim_id, _work)
+    except TenantScopeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "not_found", "claim_id": str(body.claim_id)},
+        ) from exc
     except packaging.PackagingError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
