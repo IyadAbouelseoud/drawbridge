@@ -430,7 +430,7 @@ drawbridge/
 ├── packages/schemas/             # shared contracts incl. jurisdiction.py profiles
 ├── scripts/                      # ingest_tariff.py · embed_corpus.py · e2e_pipeline_test.py
 ├── tests/                        # unit · golden-claim fixtures · property-based rules
-│   └── fixtures/                 # tariff_benchmark.json — the labelled retrieval set
+│   └── fixtures/                 # tariff_benchmark.json · bayan.py (synthetic RTL table)
 └── infra/
 ```
 
@@ -476,7 +476,7 @@ design — none are solved by "turn on Arabic OCR".
 | Failure mode | Handling |
 |---|---|
 | **Arabic-Indic digits** (٠١٢٣٤٥٦٧٨٩) and Eastern variants (۰۱۲۳۴۵۶۷۸۹) in amounts | Normalise to ASCII digits at token level, before any parse. A duty figure read as `٥٠٠٠` must become `5000`, never `0` or a mojibake string |
-| **Bidi reordering** — RTL Arabic interleaved with LTR numbers and Latin HS codes | Extract with bidi-aware ordering; store the logical-order string, not the visual-order one. Visual order silently reverses multi-part numbers |
+| **Bidi reordering** — RTL Arabic interleaved with LTR numbers and Latin HS codes | Extract with bidi-aware ordering; store the logical-order string, not the visual-order one. Visual order silently reverses multi-part numbers. Week 10 measured which half of this actually bites — see §15.6 |
 | **Arabic presentation forms and diacritics** — the same word in several Unicode encodings | NFKC-normalise, strip tashkeel, unify alef/ya/ta-marbuta variants before matching a field label |
 | **Bilingual field labels** — the same field labelled `رقم البيان` or "Declaration No." depending on issuer | Field resolution goes through a bilingual alias table, not a regex per layout |
 | **Arabic-language scans** where the native text layer is absent or wrong | Tesseract `ara+eng` (or PaddleOCR `arabic`) fallback, gated on the native-path confidence score, with Claude vision as the last resort |
@@ -913,3 +913,153 @@ Case B is expected to end **untransmittable**. The packet carries five open Reso
 citations and the packager blocks it (`COMPLIANCE-GCC.md` §8.4.1). A run reporting Case B as
 ready to file would mean that guard had been lost, so the script asserts the block rather
 than the absence of one.
+\n
+
+---
+
+## 15. The record (week 10)
+
+### 15.1 What §163 and Art. 175 actually ask for
+
+Both regimes reduce to the same operation: produce, on request and years later, the record
+supporting a figure. Not the claim, not the document — the figure. Week 9 could answer
+"which document" and week 10 answers "where on it".
+
+Three pieces, each doing one job:
+
+```
+ProvenanceSpan     hash + page + box, all mandatory, on every figure a line states
+audit_ledger       append-only, hash-chained, one row per event that touched a claim
+trace_figure       claim id + field name -> the box, from the ledger and from the line
+```
+
+### 15.2 `ProvenanceSpan` versus `Span`
+
+`Span` addresses a *region* and always could be loose: a page, a field path, optionally a
+box. That is right for saying "this record came from this document".
+
+`ProvenanceSpan` addresses a *figure* and has no optional fields. `document_sha256` sits
+alongside `document_id` because the id is ours and the hash is the document's — an auditor
+holding a PDF can verify the hash without access to our database, which is what makes the
+trace checkable rather than asserted. A degenerate box is rejected at construction: a
+swapped coordinate pair renders as a highlight over nothing, and nothing downstream would
+notice.
+
+`EntryLine` and `ExportLine` refuse to construct when a figure they state has no entry in
+`provenance.figures` — but only when the provenance cites a paginated document
+(`provenance.STRUCTURED_KINDS` is the exclusion). An EDI feed has records rather than
+pages; a 7501 has pages, and no longer gets to address its duty figure as `lines[0]`.
+
+Zero and `None` are exempt. A duty of 0.00 on a line that paid none is a default, not a
+figure someone read, and demanding coordinates for it would mean pointing at whitespace —
+which is the failure the whole mechanism exists to prevent.
+
+### 15.3 The ledger, and why it is chained
+
+`claim_transitions` records state changes and is append-only *by convention*: nothing
+updates it, and nothing stops a future route from starting to. `audit_ledger` is append-only
+by construction — triggers refuse UPDATE, DELETE and TRUNCATE, and TRUNCATE needs its own
+statement-level trigger because row triggers do not fire on it.
+
+Triggers stop the application. They do not stop a role that can drop them, so each row also
+carries `entry_hash`: SHA-256 over the row's own content plus its predecessor's hash, per
+tenant. `verify_chain` recomputes the lot and distinguishes the two failure modes — a
+mismatched `prev_hash` means a row was removed, a mismatched `entry_hash` means one was
+altered.
+
+Per tenant rather than globally, for two reasons: a global chain makes one tenant's
+verification depend on rows they cannot see, and it serialises every write in the system
+behind one advisory lock. `record` takes a transaction-scoped advisory lock keyed on the
+tenant, so the read-then-write of `prev_hash` cannot fork under concurrency.
+
+Ordering is `sequence`, a database-assigned identity column, not `recorded_at`. Persistence
+writes several rows inside one transaction and they share a timestamp to the microsecond;
+"which came first" is exactly what an audit of an override asks.
+
+**What the chain does not detect** is the removal of an entire tenant's chain, because an
+empty chain verifies. The TRUNCATE guard covers the obvious route; anything beyond it is
+off-site retention, which is a deployment question this section does not answer.
+
+### 15.4 Two schema consequences
+
+**`tenant_id` is RESTRICT.** A tenant with ledger rows cannot be deleted, so offboarding is
+a deliberate manual act. A retention obligation that a `DELETE` satisfies is not a retention
+obligation.
+
+**`claim_id` carries no foreign key at all.** Every other claim-scoped table cascades. A
+cascade here would mean deleting a claim silently deletes the evidence it existed, so the
+column is allowed to outlive its claim instead — the correct direction for an audit record
+to fail.
+
+### 15.5 `trace_figure` reads two copies and compares them
+
+The ledger copy is written at persistence time and cannot change. The `provenance` column
+on the line is live. `trace_figure` returns both and reports `consistent`, rather than
+preferring one — because which of them is wrong is the finding, and a corrected extraction
+and an altered record look identical from one side.
+
+The comparison is **containment**, not equality: every box the claim shows must be one the
+ledger recorded, and the ledger may hold more. A GCC claim whose second re-export fell under
+the Art. 16 §2 minimum persists both export lines and claims one; the unclaimed line's
+ledger entry is the record of something considered and excluded, which an audit of a
+rejection wants.
+
+### 15.6 RTL tables: the corruption is in the numerals
+
+`services/extraction/src/geometry.py` was stubbed in week 2 on the theory that glyph advance
+direction would reveal which producers stored Arabic visually. Measured, that was the wrong
+half of the problem.
+
+MuPDF applies its own bidi pass to Arabic *letter* runs before anything downstream sees
+them, so words usually arrive readable whichever way the producer wrote them. It does not do
+the same for Arabic-Indic *numerals*: a quantity of ١٢٠٠ comes out of the text layer as
+٠٠٢١, normalising to 21. A reversed word is noticed by whoever reads it. A reversed quantity
+is filed.
+
+So the reconstruction stopped consulting the stream. `extract_table` reads per-glyph boxes
+from `rawdict`, bands them into rows by vertical overlap, splits them into cells at
+horizontal gaps wider than a word space, and emits each cell in the order the coordinates
+say a reader meets it — right to left for an Arabic cell, left to right for the Latin and
+numeric runs inside one. That last part is not a nicety: a *Bayan* writes its HS code inside
+an Arabic cell, and reversing the whole cell turns 84713000 into 00031748, which is
+well-formed, classifiable, and a different chapter.
+
+Word spaces are restored from the physical gaps, because space glyphs are dropped on the way
+in and the gap they leave is the only remaining evidence that a cell holds a label and a
+value rather than one long token.
+
+`order_of` survives as a diagnostic on `Cell.glyph_order` and nothing branches on it — see
+§15.7 for why the tests are built the way they are.
+
+**What this does not do** is decide which cell is which field. Column semantics come from a
+template or from the table header, supplied by the caller. Inferring them from position
+would put a layout heuristic between an Arabic table and a duty figure.
+
+### 15.7 Testing a document format with no font
+
+No font in the environment carries Arabic glyphs, and depending on a system font would make
+the suite pass on one machine and skip on another. `tests/fixtures/bayan.py` therefore
+assembles the fixture at the PDF object level: a Type0/Identity-H font with a ToUnicode CMap
+and no embedded font program, one `Tm` per glyph. MuPDF resolves each code through the CMap
+and positions it from the text matrix, which is exactly the pair of facts the geometry
+module consumes. The page renders as empty boxes and no test looks at how it renders.
+
+The suite writes the same table twice — once with the glyphs emitted in visual order, once
+in logical — and asserts identical output. A test against one storage order would pass just
+as well if the module were quietly reading the stream.
+
+### 15.8 What this cost the e2e
+
+Week 9's `scripts/e2e_pipeline_test.py` sent `field_path="lines[0]"` and its docstring said
+that claiming a rectangle it had not measured would be a fabricated provenance record. That
+was correct, so week 10 changed the input rather than the standard.
+
+Each case now ingests **two** documents — the import declaration and the export evidence —
+because a re-export value is not printed on an import *Bayan* and no box on that page holds
+it. Figures are located with `page.search_for` on the rendered bytes rather than computed
+from the layout constants, so the coordinates are where the text is and not where the script
+intended to put it. `_boxes` raises when a label is not on the page; there is no approximate
+fallback.
+
+Both cases then trace one figure back through `mcp-ledger` before finishing: Case A the
+Section 301 duty on the 7501, Case B the re-export value the Art. 16 §2 decision turned on.

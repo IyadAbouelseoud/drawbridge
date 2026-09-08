@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, Self
+from typing import Annotated, ClassVar, Self
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -28,6 +28,30 @@ from drawbridge_schemas.provenance import Provenance
 # Money is Decimal throughout. Never float — a claim is a dollar figure filed with a
 # customs authority and must reproduce to the cent.
 Money = Annotated[Decimal, Field(max_digits=16, decimal_places=2)]
+
+
+def _untraceable_figures(record: BaseModel, fields: tuple[str, ...]) -> list[str]:
+    """Figure fields carrying a value with no box behind it.
+
+    The rule enforced by callers: a record read off a paginated document — a 7501, a
+    *Bayan*, an invoice — must carry a `ProvenanceSpan` for every figure it states. A
+    record fed in from EDI or an ERP export has no pages, so its figures are addressed by
+    `field_path` on the record's spans instead, which is what week 9's pipeline supplies.
+
+    Zero and None are exempt. A duty of 0.00 on a line that paid no duty is the field's
+    default rather than a figure someone read, and demanding coordinates for it would
+    mean fabricating a box that points at whitespace — which is the failure this whole
+    mechanism exists to prevent.
+    """
+    provenance: Provenance = record.provenance  # type: ignore[attr-defined]
+    missing = []
+    for name in fields:
+        value = getattr(record, name, None)
+        if value is None or value == 0:
+            continue
+        if provenance.figure(name) is None:
+            missing.append(name)
+    return missing
 
 
 class HTSCode(BaseModel):
@@ -155,6 +179,40 @@ class EntryLine(BaseModel):
     def quantity_available(self) -> Decimal:
         return self.quantity - self.quantity_designated
 
+    #: Figures a customs authority can ask us to evidence, line by line.
+    TRACEABLE_FIGURES: ClassVar[tuple[str, ...]] = (
+        "quantity",
+        "entered_value",
+        "duty_paid",
+        "mpf_paid",
+        "hmf_paid",
+        "section_301_duty",
+        "other_duty",
+        "vat_paid",
+        "excise_paid",
+    )
+
+    @model_validator(mode="after")
+    def _figures_carry_their_boxes(self) -> Self:
+        """Every stated figure on a document-sourced line must cite a box.
+
+        This is the CLAUDE.md invariant made structural rather than aspirational: until
+        week 10 a line could carry one span covering the whole page and satisfy
+        "traceable to a source-document span" without any figure being locatable. An
+        analyst clicking a refund figure needs the rectangle, not the page.
+        """
+        if not self.provenance.cites_a_paginated_document:
+            return self
+        missing = _untraceable_figures(self, self.TRACEABLE_FIGURES)
+        if missing:
+            msg = (
+                f"entry line {self.declaration_number}/{self.line_number} states "
+                f"{missing} with no ProvenanceSpan; a figure read off a document must "
+                "carry the box it was read from"
+            )
+            raise ValueError(msg)
+        return self
+
     @model_validator(mode="after")
     def _designation_within_bounds(self) -> Self:
         if self.quantity_designated > self.quantity:
@@ -261,6 +319,30 @@ class ExportLine(BaseModel):
     @property
     def quantity_available(self) -> Decimal:
         return self.quantity - self.quantity_claimed
+
+    #: Export-side figures. `quantity_claimed` is a claim decision, not an extraction.
+    TRACEABLE_FIGURES: ClassVar[tuple[str, ...]] = ("quantity", "declared_value")
+
+    @model_validator(mode="after")
+    def _figures_carry_their_boxes(self) -> Self:
+        """As `EntryLine._figures_carry_their_boxes`.
+
+        The export side matters as much as the import side under GCC Rules of Impl.
+        Art. 16 §2, where the re-export value is what the USD 5,000 minimum is tested
+        against — a threshold decision resting on a figure nobody can locate is a
+        decision that cannot be defended.
+        """
+        if not self.provenance.cites_a_paginated_document:
+            return self
+        missing = _untraceable_figures(self, self.TRACEABLE_FIGURES)
+        if missing:
+            msg = (
+                f"export line {self.reference}/{self.line_number} states {missing} with "
+                "no ProvenanceSpan; a figure read off a document must carry the box it "
+                "was read from"
+            )
+            raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def _destination_or_destruction(self) -> Self:

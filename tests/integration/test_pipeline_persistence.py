@@ -34,6 +34,7 @@ from services.api.src.models import ReviewQueue
 from services.api.src.packaging import PackagingError, build
 from services.api.src.persistence import PersistenceError, persist_claim
 from services.packager.src.packet import Claimant
+from tests.conftest import figure_spans
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -60,8 +61,9 @@ def _provenance() -> Provenance:
         language=Language.ENGLISH,
     )
     return Provenance(
-        spans=(Span(document=ref, field_path="lines[0]"),),
-        confidence=Confidence(score=0.99, method="structured-feed"),
+        spans=(Span(document=ref, page=1, field_path="lines[0]"),),
+        confidence=Confidence(score=0.99, method="pdfplumber-native"),
+        figures=figure_spans(ref),
     )
 
 

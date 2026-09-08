@@ -21,7 +21,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from services.api.src.models import Base, Claim, ReviewQueue, Tenant
+from services.api.src.models import Base, Claim, ReviewQueue, Tenant, install_ledger_guards
 
 TEST_DSN = os.environ.get(
     "DRAWBRIDGE_TEST_DATABASE_URL",
@@ -49,6 +49,13 @@ pytestmark = pytest.mark.skipif(
 def engine() -> Engine:
     eng = create_engine(TEST_DSN, pool_pre_ping=True)
     Base.metadata.create_all(eng, checkfirst=True)
+    # `create_all` installs the ledger's append-only triggers via its after_create hook,
+    # but only for a table it actually creates. A developer database carrying an
+    # `audit_ledger` from before the guards existed would otherwise run the immutability
+    # tests against a table that has none — which is the one failure mode those tests
+    # cannot detect from the inside.
+    with eng.begin() as connection:
+        install_ledger_guards(connection)
     return eng
 
 

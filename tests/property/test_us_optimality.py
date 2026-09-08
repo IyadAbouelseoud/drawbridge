@@ -32,6 +32,7 @@ from drawbridge_schemas.provenance import (
 from drawbridge_schemas.trade import EntryLine, ExportLine, HTSCode
 from services.matcher.src.base import MatchRequest, SolverStatus
 from services.matcher.src.us_substitution import UsSubstitutionMatcher
+from tests.conftest import figure_spans
 
 TENANT = UUID("00000000-0000-0000-0000-0000000000a1")
 IMPORT_DATE = date(2023, 1, 10)
@@ -53,6 +54,7 @@ def _provenance() -> Provenance:
     return Provenance(
         spans=(Span(document=ref, page=1, bbox=(0.0, 0.0, 10.0, 10.0)),),
         confidence=Confidence(score=0.99, method="pdfplumber-native"),
+        figures=figure_spans(ref),
     )
 
 
@@ -201,10 +203,19 @@ class TestCpSatOptimality:
     def test_never_exceeds_lp_upper_bound(
         self, pools: tuple[list[EntryLine], list[ExportLine]]
     ) -> None:
-        """A solver that beats the bound is over-allocating, not out-performing."""
+        """A solver that beats the bound is over-allocating, not out-performing.
+
+        Tolerance is per allocation, as in `test_allocation_equals_brute_force_optimum`
+        and for the same reason: the solver quantizes each allocation to the cent while
+        the bound is computed at full precision, so the drift scales with the number of
+        matches. A flat one-cent tolerance here was an oversight rather than a tighter
+        claim — hypothesis found it with three matches against a duty of one cent, where
+        the rounding is the entire figure.
+        """
         imports, exports = pools
         result = self._run(imports, exports)
-        assert result.total_duty_allocated <= _lp_upper_bound(imports, exports) + Decimal("0.01")
+        tolerance = Decimal("0.01") * max(len(result.matches), 1)
+        assert result.total_duty_allocated <= _lp_upper_bound(imports, exports) + tolerance
 
     @settings(max_examples=120, deadline=None, suppress_health_check=[HealthCheck.too_slow])
     @given(_pools())

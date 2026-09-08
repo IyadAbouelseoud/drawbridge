@@ -38,6 +38,7 @@ from services.rules.src.fx import (
     quoted_rate,
 )
 from services.rules.src.triage import ReviewReason, Severity, triage
+from tests.conftest import figure_spans
 
 TENANT = UUID("00000000-0000-0000-0000-0000000000a1")
 DECLARATION = "20240115447821"
@@ -216,6 +217,7 @@ def _provenance() -> Provenance:
     return Provenance(
         spans=(Span(document=ref, page=1, bbox=(0.0, 0.0, 10.0, 10.0)),),
         confidence=Confidence(score=0.97, method="pymupdf-native"),
+        figures=figure_spans(ref),
     )
 
 

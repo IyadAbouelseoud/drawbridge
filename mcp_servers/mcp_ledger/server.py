@@ -21,6 +21,7 @@ from sqlalchemy import text
 
 from mcp_servers.mcp_claims.db import session_scope
 from services.api.src.analyst import claim_history, claim_summary
+from services.api.src.ledger import entries_for_claim, verify_chain
 
 server = MCPServer("mcp-ledger")
 
@@ -229,6 +230,183 @@ def retention_status(
                 for r in rows
             ],
         }
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def trace_figure(
+    claim_id: Annotated[str, Field(description="Claim UUID")],
+    field: Annotated[str, Field(description="Figure name, e.g. 'duty_paid', 'entered_value'")],
+    line_id: Annotated[str | None, Field(description="Restrict to one entry/export line")] = None,
+) -> dict[str, Any]:
+    """Where one figure on a claim came from: which document, which page, which box.
+
+    This is the tool the recordkeeping obligation actually reduces to. 19 CFR §163 and
+    GCC Art. 175 both come down to producing, on request, the record that supports a
+    figure — and "it is on the *Bayan* somewhere" is not that record.
+
+    Two sources are consulted and both are returned. `ledger` is the append-only copy
+    written when the claim was persisted; `live` is the current `provenance` column on the
+    line. They should agree. When they do not, `consistent` is false and both are shown
+    rather than one being preferred, because which of them is wrong is the finding — a
+    corrected extraction and an altered record look identical from one side.
+    """
+    try:
+        with session_scope() as session:
+            claim_uuid = UUID(claim_id)
+            ledger_hits: list[dict[str, Any]] = []
+            for entry in entries_for_claim(session, claim_uuid):
+                if entry.event_type != "figure_traced":
+                    continue
+                payload = entry.payload or {}
+                if line_id and payload.get("line_id") != line_id:
+                    continue
+                span = (payload.get("figures") or {}).get(field)
+                if span is None:
+                    continue
+                ledger_hits.append(
+                    {
+                        "line_id": payload.get("line_id"),
+                        "sequence": entry.sequence,
+                        "recorded_at": entry.recorded_at.isoformat(),
+                        "actor": entry.actor,
+                        **span,
+                    }
+                )
+
+            live_hits = _live_spans(session, claim_uuid, field, line_id)
+
+        consistent = _spans_agree(ledger_hits, live_hits)
+        return {
+            "ok": True,
+            "claim_id": claim_id,
+            "field": field,
+            "found": bool(ledger_hits or live_hits),
+            "consistent": consistent,
+            "ledger": ledger_hits,
+            "live": live_hits,
+            "citations": ["19 CFR §163 (US)", "GCC Common Customs Law Art. 175 (GCC)"],
+        }
+    except Exception as exc:
+        return _fail(exc)
+
+
+def _live_spans(
+    session: Any, claim_id: UUID, field: str, line_id: str | None
+) -> list[dict[str, Any]]:
+    """The same figure read off the working line rows rather than off the ledger."""
+    rows = (
+        session.execute(
+            text("""
+            SELECT el.line_id, el.provenance
+            FROM refund_lines rl JOIN entry_lines el ON el.line_id = rl.import_line_id
+            WHERE rl.claim_id = CAST(:claim_id AS uuid)
+            UNION ALL
+            SELECT xl.line_id, xl.provenance
+            FROM refund_lines rl JOIN export_lines xl ON xl.line_id = rl.export_line_id
+            WHERE rl.claim_id = CAST(:claim_id AS uuid)
+        """),
+            {"claim_id": str(claim_id)},
+        )
+        .mappings()
+        .all()
+    )
+
+    hits: list[dict[str, Any]] = []
+    for row in rows:
+        if line_id and str(row["line_id"]) != line_id:
+            continue
+        span = ((row["provenance"] or {}).get("figures") or {}).get(field)
+        if span is None:
+            continue
+        hits.append(
+            {
+                "line_id": str(row["line_id"]),
+                "document_id": span.get("document_id"),
+                "document_sha256": span.get("document_sha256"),
+                "page": span.get("page"),
+                "bbox": [span.get("x0"), span.get("y0"), span.get("x1"), span.get("y1")],
+                "raw_text": span.get("raw_text"),
+                "extractor": span.get("extractor"),
+            }
+        )
+    return hits
+
+
+def _spans_agree(ledger: list[dict[str, Any]], live: list[dict[str, Any]]) -> bool:
+    """Whether every box the claim currently shows is one the ledger recorded.
+
+    Containment, not equality, and the asymmetry is the point. The ledger holds a row for
+    every line that was *persisted*; the live view walks the claim's refund lines, so it
+    shows only the lines that were actually claimed. A GCC claim whose second re-export
+    fell under the Art. 16 §2 minimum legitimately has a ledger entry with no live
+    counterpart — that entry is the record of a line considered and excluded, which is
+    something an audit wants rather than a discrepancy.
+
+    What containment still catches is the case that matters: a figure on the claim whose
+    box is not the box the ledger recorded, or is not in the ledger at all.
+
+    Compared on the tuple that identifies a location — line, document hash, page, box —
+    and not on the whole record, because `raw_text` may legitimately be absent from one
+    side while the location is identical.
+    """
+
+    def key(rows: list[dict[str, Any]]) -> set[tuple[Any, ...]]:
+        return {
+            (r.get("line_id"), r.get("document_sha256"), r.get("page"), tuple(r.get("bbox") or ()))
+            for r in rows
+        }
+
+    return key(live) <= key(ledger)
+
+
+@server.tool()
+def ledger_chain(
+    tenant_id: Annotated[str, Field(description="Tenant UUID")],
+) -> dict[str, Any]:
+    """Verify the tenant's hash chain and report the first break.
+
+    The triggers on `audit_ledger` stop the application from rewriting history. This
+    checks whether history was rewritten anyway — around the application, by someone with
+    database access — which is the case the triggers cannot cover and the one an auditor
+    is entitled to ask about.
+    """
+    try:
+        with session_scope() as session:
+            result = verify_chain(session, UUID(tenant_id))
+        return {"ok": True, "tenant_id": tenant_id, **result}
+    except Exception as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def claim_ledger(
+    claim_id: Annotated[str, Field(description="Claim UUID")],
+) -> dict[str, Any]:
+    """Every ledger event touching one claim, in the order the database assigned.
+
+    Ordered by `sequence` rather than by timestamp: several events land inside one
+    transaction and share a `recorded_at` to the microsecond, and their order is exactly
+    what an audit of an override asks about.
+    """
+    try:
+        with session_scope() as session:
+            entries = entries_for_claim(session, UUID(claim_id))
+            rows = [
+                {
+                    "sequence": e.sequence,
+                    "event_type": e.event_type,
+                    "actor": e.actor,
+                    "subject": e.subject,
+                    "document_sha256": e.document_sha256,
+                    "recorded_at": e.recorded_at.isoformat(),
+                    "entry_hash": e.entry_hash,
+                    "payload": e.payload,
+                }
+                for e in entries
+            ]
+        return {"ok": True, "claim_id": claim_id, "count": len(rows), "events": rows}
     except Exception as exc:
         return _fail(exc)
 

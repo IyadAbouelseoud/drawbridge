@@ -17,20 +17,25 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     Numeric,
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
+from sqlalchemy.engine import Connection
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 # Money precision matches the schema package: 16 digits, 2 decimal places, Decimal only.
@@ -355,6 +360,128 @@ class ClaimTransition(Base):
     claim: Mapped[Claim] = relationship(back_populates="transitions")
 
     __table_args__ = (Index("ix_claim_transitions_claim", "claim_id", "occurred_at"),)
+
+
+class AuditLedger(Base):
+    """Append-only recordkeeping ledger — 19 CFR §163 (US), GCC Art. 175 (KSA).
+
+    `claim_transitions` records what happened to a claim's *state*. This records
+    everything else an audit asks about and state alone cannot answer: which document was
+    ingested and what was read off it, which figure was traced to which box, and which
+    analyst overrode which machine output, on what reasoning.
+
+    Two properties make it a ledger rather than a log table.
+
+    **Ordering.** `sequence` is a database-assigned monotonic integer, not a timestamp.
+    Two events inside one transaction share a `recorded_at` to the microsecond, and
+    "which came first" is exactly what an auditor asks about an override.
+
+    **Tamper evidence.** `entry_hash` is a SHA-256 over the row's own content plus the
+    previous row's hash, so the rows form a chain per tenant. Deleting or editing a row
+    breaks every hash after it. The immutability triggers (migration f7a3c9d2e814) stop
+    the application from doing either; the chain is what detects it having been done
+    around the application, which is the case the triggers cannot cover.
+    """
+
+    __tablename__ = "audit_ledger"
+
+    ledger_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    sequence: Mapped[int] = mapped_column(BigInteger, Identity(always=True))
+
+    tenant_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.tenant_id", ondelete="RESTRICT")
+    )
+    # No CASCADE, deliberately: a deleted claim must not take its audit trail with it.
+    # The FK is omitted for the same reason — see the migration.
+    claim_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
+
+    event_type: Mapped[str] = mapped_column(String(48))
+    actor: Mapped[str] = mapped_column(String(128), doc="'pipeline', 'n8n', or an analyst")
+    subject: Mapped[str | None] = mapped_column(
+        String(128), doc="What the event is about: a field name, a document key, a state"
+    )
+    document_sha256: Mapped[str | None] = mapped_column(String(64))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+
+    prev_hash: Mapped[str | None] = mapped_column(String(64))
+    entry_hash: Mapped[str] = mapped_column(String(64))
+
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('document_ingested','extraction_run','figure_traced',"
+            "'claim_persisted','claim_transition','review_opened','review_resolved',"
+            "'valuation_override','packet_built')",
+            name="ck_ledger_event_type",
+        ),
+        CheckConstraint("char_length(entry_hash) = 64", name="ck_ledger_entry_hash_length"),
+        UniqueConstraint("sequence", name="uq_ledger_sequence"),
+        Index("ix_ledger_tenant_sequence", "tenant_id", "sequence"),
+        Index("ix_ledger_claim", "claim_id", "sequence"),
+    )
+
+
+# The append-only guarantee, as DDL rather than as a convention.
+#
+# Attached to the table's metadata so `create_all` installs it too — the integration
+# suite builds its schema that way, and an immutability property that only exists where
+# Alembic has run is a property no test can check. Migration f7a3c9d2e814 executes the
+# same statements against a deployed database.
+#
+# TRUNCATE is covered as well as UPDATE and DELETE. Row triggers do not fire on TRUNCATE,
+# so without the statement-level trigger the whole ledger could be emptied by a single
+# command that the row guards never see. What none of this covers is a role that can drop
+# the triggers, which is why the rows also carry a hash chain: the triggers stop the
+# application, the chain reports on everyone else.
+LEDGER_GUARD_FUNCTION = """
+CREATE OR REPLACE FUNCTION audit_ledger_is_append_only()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION
+        'audit_ledger is append-only (19 CFR 163 / GCC Art. 175): % refused', TG_OP
+        USING ERRCODE = 'restrict_violation';
+END;
+$$ LANGUAGE plpgsql;
+"""
+
+# Paired DROP/CREATE so the whole sequence is idempotent: a database whose `audit_ledger`
+# predates these guards can have them installed by replaying the list, which is how the
+# integration suite reaches a table `create_all` skipped as already present.
+LEDGER_GUARD_TRIGGERS = (
+    "DROP TRIGGER IF EXISTS audit_ledger_no_update ON audit_ledger",
+    "CREATE TRIGGER audit_ledger_no_update BEFORE UPDATE ON audit_ledger "
+    "FOR EACH ROW EXECUTE FUNCTION audit_ledger_is_append_only()",
+    "DROP TRIGGER IF EXISTS audit_ledger_no_delete ON audit_ledger",
+    "CREATE TRIGGER audit_ledger_no_delete BEFORE DELETE ON audit_ledger "
+    "FOR EACH ROW EXECUTE FUNCTION audit_ledger_is_append_only()",
+    "DROP TRIGGER IF EXISTS audit_ledger_no_truncate ON audit_ledger",
+    "CREATE TRIGGER audit_ledger_no_truncate BEFORE TRUNCATE ON audit_ledger "
+    "FOR EACH STATEMENT EXECUTE FUNCTION audit_ledger_is_append_only()",
+)
+
+
+def install_ledger_guards(connection: Connection) -> None:
+    """Create (or recreate) the append-only triggers on an existing connection."""
+    connection.execute(text(LEDGER_GUARD_FUNCTION))
+    for statement in LEDGER_GUARD_TRIGGERS:
+        connection.execute(text(statement))
+
+
+@event.listens_for(AuditLedger.__table__, "after_create")
+def _install_guards_on_create(
+    target: object,  # noqa: ARG001 - fixed SQLAlchemy event signature
+    connection: Connection,
+    **kwargs: Any,  # noqa: ARG001 - fixed SQLAlchemy event signature
+) -> None:
+    """So `create_all` produces the same table a migration would.
+
+    The integration suite builds its schema this way, and an immutability property that
+    exists only where Alembic has run is a property no test can check.
+    """
+    install_ledger_guards(connection)
 
 
 class ReviewQueue(Base):

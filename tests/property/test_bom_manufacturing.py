@@ -30,6 +30,7 @@ from drawbridge_schemas.provenance import (
 from drawbridge_schemas.trade import EntryLine, ExportLine, HTSCode
 from services.matcher.src.base import MatchRequest, SolverStatus
 from services.matcher.src.us_substitution import UsSubstitutionMatcher
+from tests.conftest import figure_spans
 
 TENANT = UUID("00000000-0000-0000-0000-0000000000a1")
 IMPORT_DATE = date(2023, 1, 10)
@@ -52,6 +53,7 @@ def _provenance() -> Provenance:
     return Provenance(
         spans=(Span(document=ref, page=1, bbox=(0.0, 0.0, 10.0, 10.0)),),
         confidence=Confidence(score=0.99, method="pdfplumber-native"),
+        figures=figure_spans(ref),
     )
 
 

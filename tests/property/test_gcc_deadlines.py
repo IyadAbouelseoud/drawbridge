@@ -29,6 +29,7 @@ from drawbridge_schemas.trade import EntryLine, ExportLine, HTSCode
 from services.matcher.src.base import MatchRequest, RejectionCode, SolverStatus
 from services.matcher.src.gcc_linkage import GccLinkageMatcher
 from services.rules.src.deadlines import add_gregorian_months, window_for
+from tests.conftest import figure_spans
 
 TENANT = UUID("00000000-0000-0000-0000-0000000000a1")
 DECLARATION = "20240115447821"
@@ -49,6 +50,7 @@ def _provenance() -> Provenance:
     return Provenance(
         spans=(Span(document=ref, page=1, bbox=(0.0, 0.0, 10.0, 10.0)),),
         confidence=Confidence(score=0.96, method="pymupdf-native"),
+        figures=figure_spans(ref),
     )
 
 

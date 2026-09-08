@@ -41,9 +41,10 @@ from mcp_servers.mcp_docs.store import (
     document_id_for,
 )
 from services.api.src.config import get_settings
+from services.api.src.ledger import record
 from services.api.src.models import Document
 from services.api.src.sync_db import in_thread
-from services.extraction.src import native
+from services.extraction.src import geometry, native
 from services.rules.src.triage import EXTRACTION_CONFIDENCE_FLOOR
 
 if TYPE_CHECKING:
@@ -89,6 +90,33 @@ class BatchRequest(BaseModel):
 
     tenant_id: UUID
     documents: list[DocumentIn] = Field(min_length=1)
+
+
+def _table_cells(path: Path, pages: int) -> list[dict[str, Any]]:
+    """Geometry-reconstructed table cells, with the box each was measured from.
+
+    Returned rather than parsed into fields: which column is the duty and which is the
+    VAT is a fact about the form's layout, and inferring it from position would put a
+    layout guess between an Arabic table and a duty figure. The caller — a Bayan template,
+    or an analyst — supplies the semantics; this supplies the text and the coordinates.
+    """
+    cells: list[dict[str, Any]] = []
+    for page in range(1, pages + 1):
+        for table_row in geometry.extract_table(path, page):
+            for cell in table_row.cells:
+                cells.append(
+                    {
+                        "page": cell.page,
+                        "row": cell.row,
+                        "column": cell.column,
+                        "text": cell.text,
+                        "bbox": list(cell.bbox),
+                        "language": cell.language,
+                        "glyph_order": cell.glyph_order.value,
+                        "rtl_row": table_row.rtl,
+                    }
+                )
+    return cells
 
 
 def _suffix(filename: str) -> str:
@@ -170,7 +198,26 @@ async def store_batch(body: BatchRequest) -> dict[str, Any]:
 
     def _work(session: Session) -> None:
         for ref in refs:
+            before = session.get(Document, ref.document_id) is not None
             _register(session, body.tenant_id, ref)
+            if before:
+                # Re-ingesting identical bytes is a no-op, and a ledger row saying a
+                # document arrived twice would misdescribe it as two documents.
+                continue
+            record(
+                session,
+                tenant_id=body.tenant_id,
+                event_type="document_ingested",
+                actor="pipeline",
+                subject=ref.kind.value,
+                document_sha256=ref.sha256,
+                payload={
+                    "document_id": str(ref.document_id),
+                    "object_key": ref.object_key,
+                    "language": ref.language.value,
+                    "page_count": ref.page_count,
+                },
+            )
 
     await in_thread(_work)
 
@@ -254,6 +301,16 @@ async def run_extraction(body: ExtractionRequest) -> dict[str, Any]:
                 assessment = native.assess(path)
                 lines = native.extract_lines(path) if assessment.usable else []
                 labelled = native.find_labelled_values(lines) if lines else {}
+                # Geometry runs only where the character stream cannot be trusted. On a
+                # Latin document the stream and the coordinates agree, and reading both
+                # would double the work to confirm something already known; on an Arabic
+                # one they disagree often enough that the coordinates are the only
+                # evidence — see services/extraction/src/geometry.py.
+                table = (
+                    _table_cells(path, row.page_count or 1)
+                    if assessment.usable and row.language in {"ar", "mixed"}
+                    else []
+                )
             finally:
                 path.unlink(missing_ok=True)
 
@@ -282,7 +339,24 @@ async def run_extraction(body: ExtractionRequest) -> dict[str, Any]:
                     # A scanned document is not an error and not an answer. It routes to
                     # the OCR path, and the OCR path has its own floors.
                     "needs_ocr": not assessment.usable,
+                    "table_cells": table,
                 }
+            )
+            record(
+                session,
+                tenant_id=body.tenant_id,
+                event_type="extraction_run",
+                actor="pipeline",
+                subject=row.kind,
+                document_sha256=row.sha256,
+                payload={
+                    "document_id": str(document_id),
+                    "native_text_usable": assessment.usable,
+                    "confidence": confidence.score,
+                    "method": confidence.method,
+                    "fields_found": sorted(field.value for field in labelled),
+                    "table_cells": len(table),
+                },
             )
 
         below = [r for r in results if r.get("readable") and r["confidence"]["score"] < body.floor]

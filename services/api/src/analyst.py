@@ -20,6 +20,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from drawbridge_schemas.claim import ClaimState
+from services.api.src.ledger import record
 from services.api.src.models import Claim, ClaimTransition, ReviewQueue
 
 if TYPE_CHECKING:
@@ -171,6 +172,24 @@ def resolve_exception(
     # row per reason.
     outstanding = _outstanding_for_claim(session, row.claim_id) if row.claim_id else 0
 
+    # A human decided something a machine could not. The reasoning is recorded verbatim
+    # because it is the decision — a resolution code without it is indistinguishable
+    # from a row someone clicked through.
+    record(
+        session,
+        tenant_id=row.tenant_id,
+        claim_id=row.claim_id,
+        event_type="review_resolved",
+        actor=analyst,
+        subject=row.reason,
+        payload={
+            "review_id": str(review_id),
+            "resolution": resolution,
+            "reasoning": note,
+            "outstanding_after": outstanding,
+        },
+    )
+
     session.flush()
     return {
         "review_id": str(review_id),
@@ -249,6 +268,26 @@ def override_valuation(
     row.resolution_note = note
     row.assigned_to = analyst
     row.resolved_at = datetime.now(UTC)
+
+    # The manual override the recordkeeping rules care about most: a human replaced a
+    # figure the machine extracted. Both figures go in the ledger, so the trace shows
+    # what was read off the document and what was filed instead of it.
+    record(
+        session,
+        tenant_id=row.tenant_id,
+        claim_id=row.claim_id,
+        event_type="valuation_override",
+        actor=analyst,
+        subject="declared_value",
+        payload={
+            "review_id": str(review_id),
+            "corrected_value": str(corrected_value),
+            "currency": currency,
+            "valuation_basis": valuation_basis,
+            "reasoning": note,
+            "citation": "GCC Common Customs Law Art. 28; Rules of Implementation Art. 16 §2",
+        },
+    )
     session.flush()
 
     return {
@@ -379,6 +418,19 @@ def transition_claim(
             actor=actor,
             reason=reason,
         )
+    )
+    # The transition row is the state machine's record; the ledger row is the audit's.
+    # Both, rather than one: `claim_transitions` is scoped to a claim and answers "how
+    # did this claim get here", where the ledger is scoped to a tenant and answers "what
+    # was done, in what order" across claims, documents, and analysts alike.
+    record(
+        session,
+        tenant_id=claim.tenant_id,
+        claim_id=claim_id,
+        event_type="claim_transition",
+        actor=actor,
+        subject=target.value,
+        payload={"from_state": current.value, "to_state": target.value, "reason": reason},
     )
     session.flush()
     return {"claim_id": str(claim_id), "from_state": current.value, "state": target.value}

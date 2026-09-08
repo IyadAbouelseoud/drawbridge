@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 9 |
+| Current week | 10 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | **The closed loop** — n8n orchestration end to end, both jurisdictions |
+| Current milestone | **The record** — RTL geometry, mandatory figure provenance, append-only ledger |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -331,26 +331,130 @@ carry. Worth recording because the tempting fix was to lower the floor.
 - **Send anything to a customs authority.** Case B ends untransmittable by design: the ZATCA
   packet carries five open Resolution 28624 citations and the packager blocks it.
 
-## Week 10 entry checklist
+## Week 10 task breakdown
+
+- [x] **RTL table parsing, un-deferred.** `services/extraction/src/geometry.py` was a stub
+      from week 2. It now reads per-glyph coordinates from `rawdict`, bands them into rows
+      by vertical overlap, splits them into cells by horizontal proximity, and emits each
+      cell in reading order — right to left for an Arabic cell, left to right for the
+      Latin and numeric runs inside it.
+- [x] **`audit_ledger`** — append-only by construction, not by convention. Triggers refuse
+      UPDATE, DELETE and TRUNCATE; every row carries a SHA-256 chained to its predecessor
+      within the tenant. Migration `f7a3c9d2e814`.
+- [x] **`ProvenanceSpan`** in `packages/schemas`: document hash, page, x0/y0/x1/y1, all
+      mandatory. `EntryLine` and `ExportLine` refuse to construct if a figure they state
+      has no box behind it.
+- [x] **`trace_figure`** on `mcp-ledger`, plus `ledger_chain` and `claim_ledger`.
+- [x] **Golden fixtures**: a synthetic *Bayan* table parsed from geometry
+      (`tests/golden/test_rtl_geometry.py`), and an approved claim's duty traced to a
+      rectangle through the MCP tool (`tests/integration/test_ledger.py`).
+
+### The corruption is in the numerals, not the words
+
+The week 2 plan assumed the problem was reversed Arabic *text* and that glyph advance
+direction would reveal which producers stored it visually. Measured, that turned out to be
+the wrong half of the problem. MuPDF applies its own bidi pass to Arabic letter runs before
+anything downstream sees them, so words usually arrive readable and `order_of` reports
+LOGICAL whichever way the producer wrote them.
+
+It does not do the same for Arabic-Indic numerals. A quantity of ١٢٠٠ comes out of the text
+layer as ٠٠٢١, which normalises to 21 — a figure that parses, reconciles against nothing,
+and is wrong by a factor of fifty-seven. That is strictly worse than a reversed word, which
+whoever reads it notices.
+
+So `order_of` stayed, downgraded to diagnostic, and the reconstruction stopped consulting
+the stream at all. `extract_table` never reads the character sequence; it reads positions.
+The suite renders the same table into a PDF twice — once stored visually, once logically —
+and asserts identical output, because a test against one storage order would pass just as
+well if the module were quietly reading the stream.
+
+### What "traceable to a source-document span" meant before this week
+
+`CLAUDE.md` has said since week 1 that every figure in a claim must trace to a span in a
+source document. Until week 10 that was satisfiable by one span covering a page. A claim
+could carry nine figures and a single rectangle, and the invariant held.
+
+`ProvenanceSpan` is the strict form: hash, page, and a non-degenerate box, none of them
+optional. `EntryLine._figures_carry_their_boxes` refuses a line that states a figure with
+no box — but only when the provenance cites a *paginated* document. EDI and ERP feeds have
+records rather than pages and address their figures by `field_path`, which is not a
+loophole so much as the honest description of a source with no coordinates. The distinction
+is `provenance.STRUCTURED_KINDS`, and a claim citing a 7501 no longer gets to use it.
+
+The e2e run is where that bites. Week 9's script sent `field_path="lines[0]"` and said in
+its docstring that claiming a rectangle it had not measured would be a fabricated record.
+It was right, so week 10 changed the input rather than the standard: each case now ingests
+two documents — the import declaration and the export evidence — and locates each figure on
+the one that evidences it with `page.search_for`. `_boxes` raises when a label is not on the
+page. Nothing approximates.
+
+### Why the ledger is chained and not just append-only
+
+Triggers stop the application from rewriting history. They do not stop someone with
+database access from dropping the triggers, and a customs audit is the setting where "the
+application could not have done it" is a weaker claim than "the record shows it was not
+done".
+
+Each row therefore hashes its own content together with its predecessor's hash, per tenant.
+`verify_chain` recomputes the lot and reports the sequence number of the first break, and
+distinguishes the two ways it can break: a `prev_hash` that does not match means a row was
+removed, an `entry_hash` that does not match means a row was altered.
+
+What the chain does *not* detect is the removal of an entire tenant's chain, because an
+empty chain verifies. That is what the TRUNCATE guard is for, and beyond it, off-site
+retention — which is a deployment question week 10 did not answer.
+
+### Two consequences worth stating plainly
+
+**A tenant can no longer be deleted.** `audit_ledger.tenant_id` is RESTRICT, so offboarding
+becomes a deliberate manual act. That is the correct direction for a five-year retention
+obligation to fail, and it made the integration teardown say so out loud: the fixtures
+suspend the triggers, remove their own rows, and put the guards back.
+
+**`claim_id` carries no foreign key at all.** Every other claim-scoped table cascades on
+delete. A cascade here would mean deleting a claim silently deletes the evidence it
+existed, so the column is allowed to outlive its claim instead.
+
+### What week 10 deliberately did not do
+
+- **Assemble typed lines from a scanned table.** `extract_table` returns cells and their
+  boxes; which column is the duty and which is the VAT still comes from the caller. A
+  Bayan template is a small piece of work and inferring the mapping from position is not —
+  it would put a layout guess between an Arabic table and a duty figure.
+- **Backfill provenance for the pre-week-10 fixtures.** The property suites now hand every
+  line a full set of distinct boxes, but they are synthetic boxes on synthetic documents.
+  Only the e2e measures against real bytes.
+- **Verify the chain automatically.** `ledger_chain` is a tool an operator or an auditor
+  calls. Nothing runs it on a schedule and nothing alerts on it, which is a deployment
+  concern rather than a code one, and pretending otherwise with a background task nobody
+  watches would be worse.
+
+### One thing found by running the suite
+
+`test_never_exceeds_lp_upper_bound` tolerated one cent of rounding regardless of how many
+allocations the solver made, where its sibling test already scaled the tolerance per
+allocation. Hypothesis found it with three matches against a duty of one cent — where the
+quantization *is* the entire figure. The tolerance was the oversight; the solver was doing
+what it says it does.
+
+## Week 11 entry checklist
 
 1. **Full-volume corpus load** — the ~19,000-line USITC schedule and the CROSS body.
-   Carried from week 9. It gates (2), and the twenty-four-line benchmark corpus is the
-   reason the current thresholds are provisional rather than wrong.
-2. **Re-run the benchmark against that corpus.** Both constants — `vector_ceiling` 0.68 and
-   `CONFIRMATION_LEXICAL_FLOOR` 0.20 — were measured against twenty-four lines. The second
-   sits in a 0.06 gap and is the one likeliest to move.
-3. **A live agent run against real queue rows.** Unchanged from week 8, and now cheaper to
-   do: the pipeline produces real rows with real claims attached.
-4. **Import the workflows into n8n and run one for real.** The JSON is generated and the
-   endpoints it calls are exercised, but nothing has executed inside n8n yet — the Wait
-   node's resume path in particular is asserted by `services/api/src/resume.py` and
-   `mcp-claims`, not observed.
-5. **Real scanned *Bayan* corpus** to calibrate the OCR floor against measured error.
-6. **A real ERP connector** to replace `erp_mock.py`.
-7. **Tenant profiles.** `/packaging/build` takes the claimant per request because filing
-   identity — EIN, CR number, broker code, IBAN — is not modelled. It has to be before a
-   pilot, and it is a small schema change, not a design question.
-8. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text.
+   Carried from weeks 9 and 10. It gates (2).
+2. **Re-run the tariff benchmark against that corpus.** `vector_ceiling` 0.68 and
+   `CONFIRMATION_LEXICAL_FLOOR` 0.20 were both measured against twenty-four lines.
+3. **A real scanned *Bayan* corpus.** Now the most valuable missing input in the project:
+   it calibrates the OCR floor, and it is the only way to find out whether the cell
+   clustering constants — `COLUMN_GAP_POINTS`, `ROW_OVERLAP_RATIO`, `WORD_GAP_WIDTHS` —
+   survive contact with a real form. They were chosen against a fixture this repo wrote.
+4. **A *Bayan* field template**, so geometry cells become typed lines. Blocked on (3).
+5. **A live agent run against real queue rows.** Carried from week 8.
+6. **Import the workflows into n8n and run one for real.** Carried from week 9; the Wait
+   node's resume path is still asserted rather than observed.
+7. **Tenant profiles** — EIN, CR number, broker code, IBAN. Carried from week 9.
+8. **A retention job**: `verify_chain` on a schedule, and an answer to where the ledger is
+   replicated. Both new this week and both deployment questions.
+9. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text.
 
 ## Sequencing rationale
 
@@ -385,3 +489,12 @@ before the pieces it connects would have been rewritten around each of them in t
 pipeline built after them is where their contracts get tested against each other for the
 first time. Two of the three defects week 9 found were of exactly that kind — not bugs in a
 component, but disagreements between components that only a run can surface.
+
+Recordkeeping (wk 10–11) after the pipeline rather than alongside the schemas, and week 10
+is the argument for that too. A ledger built in week 2 would have recorded the events week 2
+could imagine. Built after a run exists, it records the events the run actually produces —
+and the same ordering is what made the provenance requirement enforceable: it is easy to
+require a bounding box on every figure when nothing yet produces figures, and the
+requirement means something only once there is a pipeline that has to satisfy it. The
+week 9 e2e had to grow a second document per case to comply, which is a real cost the
+week 2 version of this decision would have hidden.

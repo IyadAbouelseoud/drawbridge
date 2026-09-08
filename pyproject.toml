@@ -112,6 +112,7 @@ disallow_untyped_calls = false
 [[tool.mypy.overrides]]
 module = [
     "services.extraction.src.native",
+    "services.extraction.src.geometry",
     "services.extraction.src.ocr",
     "mcp_servers.mcp_docs.store",
     "scripts.e2e_pipeline_test",

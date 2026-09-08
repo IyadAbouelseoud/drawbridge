@@ -32,6 +32,7 @@ from uuid import UUID, uuid4
 
 from drawbridge_schemas.claim import ClaimState, DrawbackType, RecoveryLane
 from drawbridge_schemas.jurisdiction import Jurisdiction, MatchTheory, profile_for
+from services.api.src.ledger import record
 from services.api.src.models import Claim, ClaimTransition, EntryLine, ExportLine, RefundLine
 from services.rules.src.deadlines import window_for
 
@@ -47,6 +48,29 @@ if TYPE_CHECKING:
 
 class PersistenceError(RuntimeError):
     """The claim could not be written. Never partially applied — see `sync_session`."""
+
+
+def _figure_manifest(line: EntryLineSchema | ExportLineSchema) -> dict[str, Any]:
+    """Every figure on a line, with the document and box it was read from.
+
+    Written into the ledger at persistence time so a trace can be answered from an
+    append-only row rather than from `entry_lines.provenance`, which is a live column an
+    application bug or a well-meaning correction could rewrite. The line rows stay the
+    working copy; the ledger is the copy an auditor is shown, and `trace_figure` compares
+    the two rather than trusting either alone.
+    """
+    spans = line.provenance.figures
+    return {
+        name: {
+            "document_id": str(span.document_id),
+            "document_sha256": span.document_sha256,
+            "page": span.page,
+            "bbox": [span.x0, span.y0, span.x1, span.y1],
+            "raw_text": span.raw_text,
+            "extractor": span.extractor,
+        }
+        for name, span in spans.items()
+    }
 
 
 # Which lane a jurisdiction's drawback claims travel. Both are the ordinary case; the US
@@ -263,6 +287,37 @@ def persist_claim(
             occurred_at=datetime.now(UTC),
         )
     )
+
+    record(
+        session,
+        tenant_id=tenant_id,
+        claim_id=claim.claim_id,
+        event_type="claim_persisted",
+        actor=actor,
+        subject=state.value,
+        payload={
+            "jurisdiction": jurisdiction.value,
+            "total_refund": str(total_refund),
+            "refund_lines": len(matches),
+            "filing_deadline": filing_deadline.isoformat(),
+            "requires_review": requires_review,
+        },
+    )
+    traceable: list[EntryLineSchema | ExportLineSchema] = [*imports, *exports]
+    for line in traceable:
+        manifest = _figure_manifest(line)
+        if not manifest:
+            continue
+        record(
+            session,
+            tenant_id=tenant_id,
+            claim_id=claim.claim_id,
+            event_type="figure_traced",
+            actor=actor,
+            subject=str(line.line_id),
+            document_sha256=next(iter(manifest.values()))["document_sha256"],
+            payload={"line_id": str(line.line_id), "figures": manifest},
+        )
     session.flush()
 
     return {

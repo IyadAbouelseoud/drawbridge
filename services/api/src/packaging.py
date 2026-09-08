@@ -27,6 +27,7 @@ from sqlalchemy import select
 
 from drawbridge_schemas.claim import RecoveryLane
 from drawbridge_schemas.jurisdiction import Currency, Jurisdiction
+from services.api.src.ledger import record
 from services.api.src.models import Claim, EntryLine, ExportLine, RefundLine
 from services.packager.src.packet import Claimant, PacketLine, PacketRequest
 from services.packager.src.router import build_packet
@@ -163,4 +164,25 @@ def build(
         prepared_on=prepared_on,
         **options,
     )
-    return build_packet(request)
+    packet = build_packet(request)
+
+    claim = session.get(Claim, claim_id)
+    if claim is not None:
+        # What was filed, and whether it could be. `transmittable` is recorded because a
+        # packet blocked by an open citation and a packet that was never built look the
+        # same from outside, and only one of them is a compliance posture.
+        record(
+            session,
+            tenant_id=claim.tenant_id,
+            claim_id=claim_id,
+            event_type="packet_built",
+            actor="pipeline",
+            subject=claim.lane,
+            payload={
+                "artifacts": [a.filename for a in packet.artifacts],
+                "transmittable": not packet.requires_analyst_review,
+                "open_citations": [f"{c.authority} {c.article}" for c in packet.open_citations],
+                "total_refund": str(claim.total_refund),
+            },
+        )
+    return packet

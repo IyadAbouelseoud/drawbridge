@@ -168,6 +168,73 @@ ZATCA_BAYAN_FACE: tuple[str, list[tuple[str, str]]] = (
 )
 
 
+# The export side needs its own document. Until week 10 both the import and the export
+# lines cited the 7501 / *Bayan*, which was tolerable while provenance addressed a record;
+# it stops being tolerable once a figure has to cite the box it was read from, because a
+# re-export value is not printed on the import declaration and no box on that page holds
+# it. Two documents per case is also what a real filing carries.
+US_EXPORT_FACE: tuple[str, list[tuple[str, str]]] = (
+    "PROOF OF EXPORT - OCEAN BILL OF LADING AND SHIPPER DECLARATION",
+    [
+        ("Bill of Lading Number", "MAEU123456789"),
+        ("Booking Number", "BKG-2023-884211"),
+        ("Shipper", "Northbridge Trading LLC"),
+        ("Shipper EIN", "47-1928374-00"),
+        ("Consignee", "Rheinwerk Distribution GmbH"),
+        ("Notify Party", "Rheinwerk Distribution GmbH"),
+        ("Vessel", "MAERSK KENSINGTON"),
+        ("Voyage", "351E"),
+        ("Port of Loading", "2704 Newark, NJ"),
+        ("Port of Discharge", "DEHAM Hamburg"),
+        ("Place of Delivery", "Koeln, Germany"),
+        ("Date of Export", "2024-01-09"),
+        ("Onboard Date", "2024-01-09"),
+        ("Container Number", "MSKU4471820"),
+        ("Seal Number", "SL8842137"),
+        ("Marks and Numbers", "NB/PO-2023-00418"),
+        ("Number of Packages", "40 Pallets"),
+        ("Description of Goods", "Portable ADP machines, re-exported unused"),
+        ("Schedule B Number", "8471300150"),
+        ("Quantity Exported", "400 NO"),
+        ("Gross Weight", "3368 KG"),
+        ("Declared Value", "100000.00 USD"),
+        ("Freight Terms", "Prepaid"),
+        ("Merchandise Condition", "Unused and unaltered"),
+        ("AES ITN", "X20240109123456"),
+    ],
+)
+
+KSA_REEXPORT_FACE: tuple[str, list[tuple[str, str]]] = (
+    "ZAKAT, TAX AND CUSTOMS AUTHORITY - RE-EXPORT DECLARATION",
+    [
+        ("Re-Export Declaration Number", "RE-20240912-0031"),
+        ("Second Declaration Number", "RE-20240915-0032"),
+        ("Linked Import Declaration", "20240115447821"),
+        ("Declaration Type", "Re-Export of Foreign Goods"),
+        ("Customs Office", "Jeddah Islamic Port"),
+        ("Exporter Name", "Al-Marfa Logistics Company"),
+        ("Registration Number", "4030291847"),
+        ("Consignee", "Gulf Systems Trading FZE"),
+        ("Destination Country", "AE"),
+        ("Mode of Transport", "Road"),
+        ("HS Code", "84713000"),
+        ("Goods Description", "Portable data processing machines"),
+        ("Consignment A Reference", "CNS-2024-0115-A"),
+        ("Consignment A Date", "2024-07-12"),
+        ("Consignment A Quantity", "500 PCE"),
+        ("Consignment A Value", "390625.00 SAR"),
+        ("Consignment B Reference", "CNS-2024-0115-B"),
+        ("Consignment B Date", "2024-07-15"),
+        ("Consignment B Quantity", "22 PCE"),
+        ("Consignment B Value", "17500.00 SAR"),
+        ("Total Re-Exported Value", "408125.00 SAR"),
+        ("Condition of Goods", "Unused and unaltered"),
+        ("Inspection Result", "Released"),
+        ("Release Date", "2024-07-16"),
+    ],
+)
+
+
 # --------------------------------------------------------------------------- reporting
 
 
@@ -252,7 +319,7 @@ def _pdf(title: str, rows: list[tuple[str, str]]) -> bytes:
         page = document.new_page()
         page.insert_text((72, 72), title, fontsize=13)
         for index, (label, value) in enumerate(rows):
-            column, row = divmod(index, 18)
+            column, row = divmod(index, 22)
             page.insert_text(
                 (72 + column * 250, 110 + row * 17),
                 f"{label}: {value}",
@@ -261,13 +328,64 @@ def _pdf(title: str, rows: list[tuple[str, str]]) -> bytes:
         return bytes(document.tobytes())
 
 
+# Bytes of every document this run rendered, so a figure's box can be measured off the
+# same file that was uploaded rather than computed from the coordinates `_pdf` used. The
+# two agree today; measuring keeps them agreeing when the layout changes.
+_RENDERED: dict[str, bytes] = {}
+_ROWS: dict[str, dict[str, str]] = {}
+
+
 def _document(kind: str, filename: str, title: str, rows: list[tuple[str, str]]) -> dict[str, Any]:
+    data = _pdf(title, rows)
+    _RENDERED[filename] = data
+    _ROWS[filename] = dict(rows)
     return {
         "kind": kind,
         "filename": filename,
-        "content_base64": base64.b64encode(_pdf(title, rows)).decode("ascii"),
+        "content_base64": base64.b64encode(data).decode("ascii"),
         "page_count": 1,
     }
+
+
+def _boxes(
+    filename: str, ref: dict[str, Any], mapping: dict[str, str]
+) -> dict[str, dict[str, Any]]:
+    """Measure the box each named figure occupies on the rendered document.
+
+    `search_for` rather than arithmetic over the layout constants: the coordinates that go
+    into a provenance record have to be where the text *is*, and a box derived from where
+    we intended to put it is an assertion about our own code rather than about the file an
+    auditor would be handed.
+
+    Raises when a label is not on the page. A missing box must stop the run — falling back
+    to an approximate rectangle would produce exactly the fabricated provenance the whole
+    mechanism exists to prevent.
+    """
+    import pymupdf
+
+    boxes: dict[str, dict[str, Any]] = {}
+    with pymupdf.open(stream=_RENDERED[filename], filetype="pdf") as document:
+        page = document[0]
+        for figure, label in mapping.items():
+            value = _ROWS[filename][label]
+            rects = page.search_for(f"{label}: {value}")
+            if not rects:
+                msg = f"{filename}: no box for {figure!r} - label {label!r} is not on the page"
+                raise RuntimeError(msg)
+            rect = rects[0]
+            boxes[figure] = {
+                "document_id": ref["document_id"],
+                "document_sha256": ref["sha256"],
+                "page": 1,
+                "x0": round(rect.x0, 2),
+                "y0": round(rect.y0, 2),
+                "x1": round(rect.x1, 2),
+                "y1": round(rect.y1, 2),
+                "field_path": figure,
+                "raw_text": value,
+                "extractor": "native-labelled",
+            }
+    return boxes
 
 
 def _ref(stored: dict[str, Any]) -> dict[str, Any]:
@@ -287,20 +405,46 @@ def _ref(stored: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _provenance(document_ref: dict[str, Any], field_path: str) -> dict[str, Any]:
-    """Provenance pointing at the structured feed, not at a bbox we did not measure.
+def _provenance(
+    document_ref: dict[str, Any], field_path: str, figures: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """Provenance whose every figure names the box it was read from.
 
-    `Span.field_path` exists for exactly this: a value that came from an ERP export has an
-    address in that export, and claiming a page rectangle it was never read from would be
-    a fabricated provenance record — the one kind of record this system must not produce.
+    Week 9 sent `field_path` alone here and said so: the values arrived from a structured
+    feed, and claiming a page rectangle they were never read from would have been a
+    fabricated record. Week 10 removes the excuse rather than the honesty — the figures
+    are located on the document that evidences them, and `_boxes` refuses to invent one
+    for a label that is not there.
     """
     return {
-        "spans": [{"document": document_ref, "field_path": field_path}],
-        "confidence": {"score": 0.99, "method": "structured-feed"},
+        "spans": [{"document": document_ref, "page": 1, "field_path": field_path}],
+        "confidence": {"score": 0.99, "method": "pdfplumber-native"},
+        "figures": figures,
     }
 
 
-def _us_payload(document_ref: dict[str, Any]) -> dict[str, Any]:
+US_IMPORT_FIGURES = {
+    "quantity": "31. Net Quantity in HTSUS Units",
+    "entered_value": "32. Entered Value",
+    "section_301_duty": "36. Section 301 Duty",
+    "mpf_paid": "37. Merchandise Processing Fee",
+}
+US_EXPORT_FIGURES = {
+    "quantity": "Quantity Exported",
+    "declared_value": "Declared Value",
+}
+KSA_IMPORT_FIGURES = {
+    "quantity": "Quantity",
+    "entered_value": "Customs Value (CIF)",
+    "duty_paid": "Customs Duty",
+    "vat_paid": "Value Added Tax",
+}
+
+
+def _us_payload(import_ref: dict[str, Any], export_ref: dict[str, Any]) -> dict[str, Any]:
+    document_ref = import_ref
+    import_boxes = _boxes("entry-summary.pdf", import_ref, US_IMPORT_FIGURES)
+    export_boxes = _boxes("proof-of-export.pdf", export_ref, US_EXPORT_FIGURES)
     import_id, export_id = str(uuid4()), str(uuid4())
     return {
         "tenant_id": str(TENANT),
@@ -327,7 +471,7 @@ def _us_payload(document_ref: dict[str, Any]) -> dict[str, Any]:
                 "duty_paid": "0.00",
                 "section_301_duty": "62500.00",
                 "mpf_paid": "864.00",
-                "provenance": _provenance(document_ref, "lines[0]"),
+                "provenance": _provenance(document_ref, "lines[0]", import_boxes),
             }
         ],
         "exports": [
@@ -344,19 +488,31 @@ def _us_payload(document_ref: dict[str, Any]) -> dict[str, Any]:
                 "quantity": "400",
                 "unit_of_measure": "NO",
                 "declared_value": "100000.00",
-                "provenance": _provenance(document_ref, "lines[0]"),
+                "provenance": _provenance(export_ref, "lines[0]", export_boxes),
             }
         ],
     }
 
 
-def _ksa_payload(document_ref: dict[str, Any]) -> dict[str, Any]:
+def _ksa_payload(import_ref: dict[str, Any], export_ref: dict[str, Any]) -> dict[str, Any]:
     """Two re-exports against one Bayan: one clears Art. 16 §2, one falls short by ~7%.
 
     SAR 17,500 converts to USD 4,666.67 at the peg — inside the 10% band that makes a
     rejection a *near miss* rather than a plain failure, which is what puts a row on the
     review queue instead of dropping the line silently.
     """
+    document_ref = import_ref
+    import_boxes = _boxes("bayan.pdf", import_ref, KSA_IMPORT_FIGURES)
+    consignment_a = _boxes(
+        "reexport.pdf",
+        export_ref,
+        {"quantity": "Consignment A Quantity", "declared_value": "Consignment A Value"},
+    )
+    consignment_b = _boxes(
+        "reexport.pdf",
+        export_ref,
+        {"quantity": "Consignment B Quantity", "declared_value": "Consignment B Value"},
+    )
     import_id = str(uuid4())
     return {
         "tenant_id": str(TENANT),
@@ -383,7 +539,7 @@ def _ksa_payload(document_ref: dict[str, Any]) -> dict[str, Any]:
                 "entered_value": "937500.00",
                 "duty_paid": "46875.00",
                 "vat_paid": "147656.25",
-                "provenance": _provenance(document_ref, "lines[0]"),
+                "provenance": _provenance(document_ref, "lines[0]", import_boxes),
             }
         ],
         "exports": [
@@ -403,7 +559,7 @@ def _ksa_payload(document_ref: dict[str, Any]) -> dict[str, Any]:
                 "linked_import_declaration": "20240115447821",
                 "consignment_id": "CNS-2024-0115-A",
                 "unused_and_unaltered": True,
-                "provenance": _provenance(document_ref, "lines[0]"),
+                "provenance": _provenance(export_ref, "lines[0]", consignment_a),
             },
             {
                 "line_id": str(uuid4()),
@@ -421,7 +577,7 @@ def _ksa_payload(document_ref: dict[str, Any]) -> dict[str, Any]:
                 "linked_import_declaration": "20240115447821",
                 "consignment_id": "CNS-2024-0115-B",
                 "unused_and_unaltered": True,
-                "provenance": _provenance(document_ref, "lines[0]"),
+                "provenance": _provenance(export_ref, "lines[1]", consignment_b),
             },
         ],
     }
@@ -645,12 +801,15 @@ def case_a(api: Api) -> tuple[Report, str | None]:
     stored = _store(
         api,
         report,
-        [_document("cbp_7501", "entry-summary.pdf", *CBP_7501_FACE)],
+        [
+            _document("cbp_7501", "entry-summary.pdf", *CBP_7501_FACE),
+            _document("proof_of_export", "proof-of-export.pdf", *US_EXPORT_FACE),
+        ],
     )
     if stored is None:
         return report, None
 
-    payload = _us_payload(_ref(stored[0]))
+    payload = _us_payload(_ref(stored[0]), _ref(stored[1]))
     intake = _intake(api, report, payload, stored)
     if intake is None:
         return report, None
@@ -688,6 +847,8 @@ def case_a(api: Api) -> tuple[Report, str | None]:
         all(actor == "pipeline" for actor in actors),
         f"actors={actors}",
     )
+
+    _trace_through_mcp(claim_id, "section_301_duty", report)
     return report, claim_id
 
 
@@ -696,12 +857,15 @@ def case_b(api: Api) -> tuple[Report, str | None]:
     stored = _store(
         api,
         report,
-        [_document("zatca_bayan", "bayan.pdf", *ZATCA_BAYAN_FACE)],
+        [
+            _document("zatca_bayan", "bayan.pdf", *ZATCA_BAYAN_FACE),
+            _document("zatca_reexport_declaration", "reexport.pdf", *KSA_REEXPORT_FACE),
+        ],
     )
     if stored is None:
         return report, None
 
-    payload = _ksa_payload(_ref(stored[0]))
+    payload = _ksa_payload(_ref(stored[0]), _ref(stored[1]))
     intake = _intake(api, report, payload, stored)
     if intake is None:
         return report, None
@@ -769,7 +933,47 @@ def case_b(api: Api) -> tuple[Report, str | None]:
         "the ZATCA packet carries an open procedural citation and may not be sent "
         "(COMPLIANCE-GCC.md §8.4.1)",
     )
+
+    # The GCC side of the trace. The figure an Art. 16 §2 decision turns on is the
+    # re-export value, and it is the one an analyst overrode a threshold near-miss
+    # against — so it is the one the ledger has to be able to point at.
+    _trace_through_mcp(claim_id, "declared_value", report)
     return report, claim_id
+
+
+def _trace_through_mcp(claim_id: str, field: str, report: Report) -> None:
+    """Ask `mcp-ledger` where one figure on the finished claim came from.
+
+    The last step of the loop and the one an auditor actually performs. Everything before
+    it produces a refund figure; this asks the system to point at the rectangle on the
+    document the figure was read from, and to do it from the append-only ledger rather
+    than from the working row.
+
+    In-process for the same reason as `_resolve_through_mcp`: the transport is FastMCP's
+    and has nothing to do with whether the trace is correct.
+    """
+    from mcp_servers.mcp_ledger import server as ledger
+
+    result = ledger.trace_figure(claim_id=claim_id, field=field)
+    if not result.get("ok") or not result.get("found"):
+        report.fail(f"trace {field}", str(result)[:200])
+        return
+
+    hit = result["ledger"][0]
+    box = ", ".join(f"{value:.1f}" for value in hit["bbox"])
+    report.check(
+        f"trace {field}",
+        result["consistent"] is True,
+        f"{hit['document_sha256'][:12]}... p{hit['page']} [{box}] "
+        f"raw={hit['raw_text']!r} ledger==live:{result['consistent']}",
+    )
+
+    chain = ledger.ledger_chain(tenant_id=str(TENANT))
+    report.check(
+        "ledger chain intact",
+        chain.get("ok") is True and chain.get("broken_at") is None,
+        f"{chain.get('entries')} entries, {chain.get('detail')}",
+    )
 
 
 def _resolve_through_mcp(review_ids: list[str], report: Report) -> bool:

@@ -19,11 +19,59 @@ from drawbridge_schemas.provenance import (
     DocumentRef,
     Language,
     Provenance,
+    ProvenanceSpan,
     Span,
 )
 from drawbridge_schemas.trade import EntryLine, ExportLine, HTSCode
 
 TENANT = UUID("00000000-0000-0000-0000-0000000000a1")
+
+# Every figure either schema can be asked to evidence. Fixtures hand the full set rather
+# than the subset a given line happens to populate: the validator only demands a box for a
+# figure that is actually stated, and a fixture that tracked which those were would need
+# updating every time a test changed a number.
+ALL_FIGURES = (
+    "quantity",
+    "entered_value",
+    "duty_paid",
+    "mpf_paid",
+    "hmf_paid",
+    "section_301_duty",
+    "other_duty",
+    "vat_paid",
+    "excise_paid",
+    "declared_value",
+)
+
+
+def figure_spans(
+    ref: DocumentRef,
+    *,
+    names: tuple[str, ...] = ALL_FIGURES,
+    page: int = 1,
+    extractor: str = "native-labelled",
+) -> dict[str, ProvenanceSpan]:
+    """Distinct, non-overlapping boxes — one per figure.
+
+    Distinct on purpose. Handing every figure the same rectangle would satisfy the schema
+    and defeat the point: a trace that returns the same box for the duty and the VAT has
+    not located either of them, and a test built on one would pass while the mechanism it
+    covers did nothing.
+    """
+    return {
+        name: ProvenanceSpan(
+            document_id=ref.document_id,
+            document_sha256=ref.sha256,
+            page=page,
+            x0=72.0,
+            y0=100.0 + index * 14.0,
+            x1=240.0,
+            y1=112.0 + index * 14.0,
+            field_path=name,
+            extractor=extractor,
+        )
+        for index, name in enumerate(names)
+    }
 
 
 @pytest.fixture
@@ -54,6 +102,7 @@ def provenance(document_ref: DocumentRef) -> Provenance:
     return Provenance(
         spans=(Span(document=document_ref, page=1, bbox=(72.0, 120.0, 240.0, 134.0)),),
         confidence=Confidence(score=0.98, method="pdfplumber-native"),
+        figures=figure_spans(document_ref),
     )
 
 
@@ -69,6 +118,7 @@ def bayan_provenance(bayan_ref: DocumentRef) -> Provenance:
             ),
         ),
         confidence=Confidence(score=0.95, method="pymupdf-native"),
+        figures=figure_spans(bayan_ref, extractor="geometry-table"),
     )
 
 

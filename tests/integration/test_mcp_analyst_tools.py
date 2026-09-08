@@ -101,6 +101,14 @@ def committed_claim(engine) -> Iterator[tuple[UUID, UUID, UUID]]:
         session.execute(text("DELETE FROM review_queue WHERE tenant_id = :t"), {"t": tenant_id})
         session.execute(text("DELETE FROM claim_transitions WHERE claim_id = :c"), {"c": claim_id})
         session.execute(text("DELETE FROM claims WHERE claim_id = :c"), {"c": claim_id})
+        # The ledger refuses deletion, which is the point of it, so teardown has to say so
+        # out loud: disable the guards, remove this test's rows, put them back. Only the
+        # table's owner can do this, and no application role is the owner — a test tearing
+        # down its own fixtures is the one setting where emptying an audit trail is
+        # legitimate, and it should look as deliberate as it is.
+        session.execute(text("ALTER TABLE audit_ledger DISABLE TRIGGER USER"))
+        session.execute(text("DELETE FROM audit_ledger WHERE tenant_id = :t"), {"t": tenant_id})
+        session.execute(text("ALTER TABLE audit_ledger ENABLE TRIGGER USER"))
         session.execute(text("DELETE FROM tenants WHERE tenant_id = :t"), {"t": tenant_id})
         session.commit()
 
