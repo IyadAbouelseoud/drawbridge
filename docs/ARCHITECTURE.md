@@ -640,3 +640,131 @@ without it is a claim CBP will deny and the year cannot be reclaimed.
 
 `PacketRequest.lane` now routes. The router refuses the two alternates with a pointer
 rather than rendering a 7551, since a 7551 for a PSC is a coherent form for the wrong claim.
+
+---
+
+## 13. The agent layer (week 8)
+
+### 13.1 Where the LLM sits, and why it sits there
+
+`services/agent/` is the last thing built, deliberately. Everything upstream of it —
+extraction, classification, the CP-SAT allocator, the rules engine, the quantifier — is
+deterministic and testable, and produces every figure a claim contains. The agent operates
+on that output and adds two things the deterministic core cannot: prose, and judgment about
+a record it can read but not compute over.
+
+The rule from `CLAUDE.md` — *the LLM writes narratives and judgment calls; it never
+originates a number* — is enforced, not requested. `grounding.py` scans every generated
+memo and rejects any numeric token not traceable to the fact set the model was given.
+
+This ordering is what makes the enforcement possible. Had the agent been built first there
+would have been no authoritative fact set to check against, and the rule would have been a
+convention: true until a prompt happened to break it.
+
+### 13.2 What the guard actually catches
+
+Not the model lying. The model being *fluent*.
+
+| Generated | Record says | Why it is dangerous |
+|---|---|---|
+| "approximately 4,800 units" | `12500.0000` units, `4812.50` duty | Reads as helpful rounding. A reader cannot tell which figure was meant. |
+| "duty of 4,821.50" | `4812.50` | A transposition. Perfectly plausible; survives no comparison. |
+| "0.42 confidence" | `0.71` | Confidence scores are figures too, and are the ones most casually restated. |
+
+Folding handles the cases where one figure has several correct spellings: `4,812.50`,
+`4812.50` and `٤٨١٢.٥٠` are one number, and a guard that rejected the readable spelling
+would be worked around. Integers at or below 12 read as prose — "the first of two
+conditions" is English, and a customs quantity is never 2.
+
+Citations are checked differently: by membership in the closed set the drafter was given,
+not numerically. Scanning `19 CFR §163.1` for figures would reject it as three invented
+numbers, which is the guard failing closed on correct output — the way guards get disabled.
+
+### 13.3 The two drafters
+
+**Interchangeability** (`interchangeability.py`) — the substitution justification for a US
+§1313(j)(2) pairing. One point of law matters here: post-TFTEA the operative test is
+classification, not commercial equivalence. Substitution requires the same 8-digit HTS
+subheading, narrowing to the 10-digit statistical reporting number where the 8-digit
+description begins with "other". Commercial interchangeability is *supporting* analysis —
+it is what persuades a reviewing officer the pairing is real — but it has not been the
+statutory standard since 2016, and the schema separates the two so a memo cannot present
+the support as the test.
+
+The schema also requires `distinguishing_facts`. A memo listing only favourable facts reads
+as advocacy, and a difference CBP finds unaided is worse than one the claimant raised.
+
+**Exceptions** (`exceptions.py`) — pre-analysis of one `review_queue` row, drafted before an
+analyst opens it. Each `ReviewReason` gets its own framing, because the question genuinely
+differs: a GCC threshold near-miss is an arithmetic and valuation question with a
+bright-line answer, a superseded CROSS ruling is a classification question, a low-confidence
+OCR field is a question about one glyph. A single generic prompt produces a memo that is
+fluent about all three and useful for none.
+
+`blocking_unknowns` being non-empty is a healthy outcome. A confident memo over a thin
+record is the failure mode — it is the one an analyst is most likely to accept without
+checking.
+
+### 13.4 The call itself
+
+Hardcoded in `client.py`, not parameterised, because each is a property of the product:
+
+- `max_tokens = 1024`. A memo needing more is padding, and the cap bounds a runaway loop.
+- `temperature = 0`. Two analysts opening the same claim must see the same memo, and a
+  filing built on a sampled narrative cannot be explained when an auditor asks four years
+  later why it says what it says.
+- **Forced tool use.** One tool, the memo schema, required by `tool_choice`. The model has
+  no prose path, so there is no JSON parsing step anywhere in the service and nothing that
+  can fail on a preamble.
+
+One retry on schema violation, with the validation error fed back. A second failure at
+temperature 0 will not become a third success — it means the schema and the task disagree.
+
+### 13.5 Queue integration
+
+The memo lives in its own column (`review_queue.agent_memo`), not inside `payload`.
+`payload` is documented as carrying the matcher's output verbatim, and an analyst comparing
+a row against a re-run of the matcher needs that to stay true.
+
+`agent_model` records the model *and* prompt version. A memo that influenced a filing is a
+document an auditor may ask about, and a prompt revision changes the output as surely as a
+model change does.
+
+Drafting is a separate call (`POST /review/draft`, or `draft_exception_memo` in
+`mcp-claims`), never part of `/review/suspend`. n8n waits on the suspend call; coupling
+workflow suspension to a model round trip would make it fail for an unrelated reason. The
+memo is wanted when the analyst arrives — minutes to hours later — so drafting then costs
+nothing.
+
+A failed draft leaves the column NULL. The row is then exactly what an analyst would have
+read before this service existed. An error blob in the memo column would mean someone
+scanning for pre-analysis finds something and reads it; nothing is better than noise.
+
+### 13.6 Embeddings became real (week 8)
+
+`fastembed` replaces the trigram placeholder: a quantised ONNX sentence-transformer running
+in-process on CPU. No API, no key, no per-token cost; one model download, then offline.
+
+Multilingual by necessity rather than preference. Half the corpus is Arabic, and an
+English-only encoder has no useful geometry for it. It also retrieves across the language
+boundary — an Arabic *Bayan* description reaches an English USITC line — which is the
+property the dual-jurisdiction corpus needed and did not have.
+
+Two things this broke, both found by running it rather than by reading it:
+
+**Width.** The column was 1536; the model emits 384. Migration `a7c31f9d4e60` moves it and
+nulls the existing vectors. There is no conversion between embedding spaces, so any backend
+change already required a full re-embed; nulling makes explicit what was true anyway.
+
+**The distance ceiling.** `VECTOR_CEILING = 0.55` was measured against trigram distances,
+which collapse fast. This model's distances are compressed — a good match near 0.6, an
+unrelated one near 0.86 — so every correct hit fell outside the threshold and search
+reported `method=lexical` with nothing found, indistinguishable from a corpus that was never
+embedded. Nothing raised.
+
+The ceiling now belongs to the backend (`Embedder.vector_ceiling`), because a distance
+threshold is meaningful only inside one embedding space. It does not degrade gracefully
+across a model change: it suppresses everything or admits everything.
+
+The current value is provisional and says so. It was measured against nine tariff lines,
+which establishes that 0.55 was wrong and does not establish that 0.75 is right.

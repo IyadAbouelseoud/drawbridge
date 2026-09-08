@@ -21,9 +21,9 @@ from pydantic import Field
 from sqlalchemy import text
 
 from mcp_servers.mcp_claims.db import session_scope
+from services.classifier.src.embeddings import BACKENDS, DEFAULT_BACKEND
 from services.classifier.src.search import (
     LEXICAL_FLOOR,
-    VECTOR_CEILING,
     search_rulings,
     search_tariff,
 )
@@ -88,18 +88,31 @@ def classify_with_embedding(
     description: Annotated[str, Field(description="Goods description to classify")],
     embedding: Annotated[
         list[float],
-        Field(description="Query embedding, 1536 dimensions, same model as the corpus"),
+        Field(description="Query embedding, 384 dimensions, same model as the corpus"),
     ],
     jurisdiction: Annotated[str, Field(description="us | ksa")] = "us",
     revision: Annotated[str | None, Field(description="Schedule revision")] = None,
     limit: Annotated[int, Field(ge=1, le=25)] = 10,
+    backend: Annotated[
+        str,
+        Field(description="Backend that produced the embedding; sets the distance ceiling"),
+    ] = DEFAULT_BACKEND,
 ) -> dict[str, Any]:
     """Hybrid classification over lexical and vector search.
 
     The embedding must come from the same model the corpus was embedded with; mixing
     models produces confident nonsense, because cosine distance between two different
     embedding spaces is meaningless rather than merely inaccurate.
+
+    `backend` names which model produced it, and is what sets the distance ceiling. A
+    threshold is only meaningful inside one embedding space, so naming the wrong backend
+    does not skew the results slightly — it suppresses every hit or admits every one.
     """
+    try:
+        ceiling = BACKENDS[backend].vector_ceiling
+    except KeyError:
+        return _fail(ValueError(f"unknown embedding backend {backend!r}"))
+
     try:
         with session_scope() as session:
             hits, method = search_tariff(
@@ -109,13 +122,18 @@ def classify_with_embedding(
                 embedding=embedding,
                 revision=revision,
                 limit=limit,
+                vector_ceiling=ceiling,
             )
         return {
             "ok": True,
             "method": method,
             "count": len(hits),
             "candidates": [h.as_dict() for h in hits],
-            "thresholds": {"lexical_floor": LEXICAL_FLOOR, "vector_ceiling": VECTOR_CEILING},
+            "thresholds": {
+                "lexical_floor": LEXICAL_FLOOR,
+                "vector_ceiling": ceiling,
+                "backend": backend,
+            },
         }
     except Exception as exc:
         return _fail(exc)

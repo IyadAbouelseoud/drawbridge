@@ -28,6 +28,9 @@ from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
 from mcp_servers.mcp_claims.db import session_scope
+from services.agent.src.client import AgentRefusedError, AgentUnavailableError
+from services.agent.src.grounding import UngroundedFigureError
+from services.agent.src.queue import draft_one
 from services.api.src.analyst import (
     AnalystError,
     approve_claim,
@@ -105,11 +108,51 @@ def inspect_exception(
 
     The payload carries the rejections and solver metadata verbatim, so the provisions
     that failed and the figures involved are visible without re-running the match.
+
+    `agent_memo`, when present, is pre-analysis drafted before you opened this row. It is
+    advisory: it says what the drafter would do and what it could not settle, and it has
+    moved nothing. Every figure in it was checked against the payload above — the drafter
+    cannot originate a number — but its *judgment* is unverified, and `blocking_unknowns`
+    is the part worth reading first.
     """
     try:
         with session_scope() as session:
             return {"ok": True, "exception": get_exception(session, _uuid(review_id, "review_id"))}
     except (AnalystError, ValueError) as exc:
+        return _fail(exc)
+
+
+@server.tool()
+def draft_exception_memo(
+    review_id: Annotated[str, Field(description="Review queue row UUID")],
+    overwrite: Annotated[
+        bool, Field(description="Redraft even if a memo is already attached")
+    ] = False,
+) -> dict[str, Any]:
+    """Draft pre-analysis for one exception now, rather than waiting for the worker.
+
+    Useful when you have just opened a fresh exception and want the summary before
+    reading the payload. Returns the memo without resolving anything — `recommendation`
+    is a suggestion, and this claim does not move until you call
+    `resolve_review_exception` yourself.
+
+    Refuses to overwrite an existing memo unless asked. A memo an analyst has already
+    read is part of the record of how the decision was reached, and silently replacing it
+    would make that record unreconstructable.
+    """
+    try:
+        with session_scope() as session:
+            return {
+                "ok": True,
+                **draft_one(session, _uuid(review_id, "review_id"), overwrite=overwrite),
+            }
+    except (
+        AnalystError,
+        AgentUnavailableError,
+        AgentRefusedError,
+        UngroundedFigureError,
+        ValueError,
+    ) as exc:
         return _fail(exc)
 
 

@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 7 |
+| Current week | 8 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | Embedding pass, OCR gating, ERP BOM source, PSC + §1520(d) |
+| Current milestone | **The autonomous agent layer** (`services/agent/`) + real semantic embeddings |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -179,22 +179,83 @@ GCC Common Customs Law, which is transcribed and authoritative. Closing B2 is on
       recursive CP-SAT matcher
 - [x] PSC (19 CFR §141.11) and §1520(d) renderers in `services/packager`
 
-## Week 8 entry checklist
+## Week 8 task breakdown
 
-1. **Full-volume corpus load.** The embedding pass is proven; what remains is downloading
-   the ~19,000-line USITC schedule and the CROSS body and running it. Bounded by download
-   and compute, not by design.
-2. **A real embedding backend.** `services/classifier/src/embeddings.py` ships a
-   deterministic hashing vectorizer and an Ollama client. The hashing backend is honest
-   about being lexical-only; a semantic backend needs a model endpoint decision.
-3. **Real scanned *Bayan* corpus** to calibrate the OCR floor against measured error
-   rather than a defensible default.
-4. **A real ERP connector.** `erp_mock.py` fixes the contract — SAP/Oracle field shapes,
+- [x] **Semantic embeddings.** `fastembed` replaces the trigram placeholder — a quantised
+      ONNX sentence-transformer running in-process on CPU. No API, no key, no per-token
+      cost; one model download, then offline. `is_semantic` is now True and earns it.
+- [x] **The agent layer** (`services/agent/`): interchangeability narratives for US
+      §1313(j)(2) pairings, and pre-analysis memos for `review_queue` rows.
+- [x] **Queue integration.** Memos attach to the row and come back from
+      `mcp-claims.inspect_exception`, so an analyst opening a claim already has the
+      drafter's reading and its list of what it could not settle.
+- [x] Golden fixtures for both.
+
+### Why the model is multilingual
+
+`paraphrase-multilingual-MiniLM-L12-v2` rather than `bge-small-en-v1.5`, which is smaller
+and slightly sharper on English. Half this corpus is Arabic, and an English-only encoder
+does not merely score Arabic badly — it has no useful geometry for it, so every ZATCA line
+would sit at an arbitrary point. It also retrieves *across* the language boundary, which is
+the property the dual-jurisdiction design needs and did not previously have: an Arabic
+*Bayan* description now reaches an English USITC line.
+
+### Two things week 8 found by running it
+
+**The embedding width was wrong, not adjustable.** The column was provisioned at 1536; the
+model emits 384. Migration `a7c31f9d4e60` moves it and nulls the existing vectors — there
+is no conversion between embedding spaces, and any backend change already required a full
+re-embed. `embed_corpus.py` selects on `embedding IS NULL`, so the re-embed is the normal
+pass with nothing new to run.
+
+**`VECTOR_CEILING` was calibrated for the old model and silently suppressed every semantic
+hit.** 0.55 was measured against trigram distances, which collapse fast. This model's
+distances are compressed into a narrow band — a good match near 0.6, an unrelated one near
+0.86 — so every correct hit fell outside the threshold and search reported `method=lexical`
+with nothing found. Indistinguishable from a corpus that was never embedded, and nothing
+raised. The ceiling now lives on the backend (`Embedder.vector_ceiling`) because it is
+meaningless outside one embedding space, and `tests/golden/test_semantic_embeddings.py`
+keeps the regression.
+
+The new value (0.75) was measured against nine tariff lines. That is enough to establish
+the old one was wrong and not enough to call the new one right — see week 9.
+
+### What week 8 deliberately did not do
+
+- **Let the agent originate a figure.** `services/agent/src/grounding.py` scans every
+  generated memo and rejects any number not traceable to the facts it was given. This is
+  `CLAUDE.md`'s rule made mechanical rather than requested in a prompt: the failure it
+  catches is not the model lying but the model being fluent — "approximately 4,800 units"
+  where the record says 4,812.50.
+- **Let the agent originate a citation.** Authorities are selected from a closed set the
+  rules engine resolved. A fabricated ruling number in an audit-facing memo is the
+  highest-cost error available to this system: confident, specific, checkable, wrong.
+- **Let the agent resolve anything.** `recommendation` is a field on a row. A human
+  calling `resolve_review_exception` is still the only thing that moves a claim.
+- **Draft inside `POST /review/suspend`.** n8n waits on that call; coupling workflow
+  suspension to a model round trip would make it fail for an unrelated reason.
+
+## Week 9 entry checklist
+
+1. **Full-volume corpus load.** Still the largest single unblock, and now the gating one
+   for two other things. Downloading the ~19,000-line USITC schedule and the CROSS body
+   and running the proven pass. Bounded by download and compute, not by design.
+2. **Calibrate `vector_ceiling` against that corpus.** The current 0.75 was set from nine
+   lines. Nine is enough to show 0.55 was wrong and not enough to call 0.75 right. This
+   needs a labelled query set — a few dozen descriptions with known correct codes — and
+   the threshold chosen from the measured separation rather than from inspection.
+3. **A live agent run against real queue rows.** The fixtures use a stub client, because
+   what needed testing was whether the guardrails hold when the prose is bad, and a live
+   call cannot be made to hallucinate on demand. What the stub cannot tell us is how often
+   a real memo trips the numeric guard. If that rate is high the prompt is wrong; if it is
+   zero the guard may not be doing anything.
+4. **Real scanned *Bayan* corpus** to calibrate the OCR floor against measured error
+   rather than a defensible default. Same shape of problem as (2).
+5. **A real ERP connector.** `erp_mock.py` fixes the contract — SAP/Oracle field shapes,
    multi-level explosion, yield and scrap. Swapping in a live connector changes the
    source, not the shape.
-5. **The agent layer** (weeks 9-10): Claude scoped to exactly the residue the rules
-   engine cannot decide.
-6. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text.
+6. **n8n orchestration + HITL gates** (weeks 8–9 on the milestone table).
+7. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text.
 
 ## Sequencing rationale
 
@@ -210,6 +271,13 @@ rewriting weeks 4–6, not extending them.
 The agent layer (wk 7–8) lands *after* the deterministic core, so the LLM is scoped to
 exactly the residue the rules engine cannot decide. Building it earlier invites the model
 to absorb work that belongs in testable code.
+
+That scoping is enforced rather than intended. By week 8 the matcher, the quantifier and
+the rules engine already produce every figure a memo can contain, so `grounding.py` can
+reject anything else as invented. Had the agent been built first there would have been no
+fact set to check against, and "the LLM never originates a number" would have been a
+convention — which is to say, a thing that holds until someone writes a prompt that
+happens to break it.
 
 The pilot (wk 12–13) targets a backward-looking claim rather than live flow: a 5-year
 lookback has a known answer set and no operational dependency on the customer's current

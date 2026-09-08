@@ -395,6 +395,14 @@ class ReviewQueue(Base):
     resolution: Mapped[str | None] = mapped_column(String(24))
     resolution_note: Mapped[str | None] = mapped_column(Text)
 
+    # Agent pre-analysis, drafted before an analyst opens the row. Advisory only: nothing
+    # in `services/agent` writes claim state, and `resolution` still requires a human.
+    # Separate from `payload` so the matcher's record stays verbatim and comparable
+    # against a re-run.
+    agent_memo: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    agent_model: Mapped[str | None] = mapped_column(String(128))
+    agent_drafted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

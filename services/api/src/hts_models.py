@@ -12,7 +12,8 @@ They share one table because the search is the same operation in both jurisdicti
 because a claim that spans both needs one query surface. `jurisdiction` and `source`
 partition them; nothing joins across a jurisdiction boundary.
 
-Embeddings are 1536-dimensional to match the common text-embedding size. The column is
+Embeddings are 384-dimensional: the width of the multilingual sentence-transformer the
+project settled on in week 8 (`services/classifier/src/embeddings.py`). The column is
 nullable so a schedule can be ingested and searched lexically before the embedding pass
 completes — a half-embedded corpus is still useful, and blocking ingest on the model
 would make the first load an all-or-nothing operation.
@@ -42,9 +43,11 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from services.api.src.models import Base
 
-# text-embedding-3-small and most open equivalents. Changing this is a migration, not a
-# config change, because the index is built against the dimension.
-EMBEDDING_DIM = 1536
+# The width of sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2, which is what
+# `services/classifier` embeds with. Changing this is a migration, not a config change,
+# because the HNSW index is built against the dimension — and because vectors written at
+# one width cannot be compared with vectors written at another.
+EMBEDDING_DIM = 384
 
 
 class TariffLine(Base):

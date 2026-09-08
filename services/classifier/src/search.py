@@ -35,8 +35,14 @@ if TYPE_CHECKING:
 LEXICAL_FLOOR = 0.15
 
 # Cosine distance above this means the vector path found nothing genuinely close. Vector
-# search always returns *something*, so without a floor a nonsense query yields confident
-# rubbish.
+# search always returns *something*, so without a ceiling a nonsense query yields
+# confident rubbish.
+#
+# This is only the fallback. The real value belongs to the backend that wrote the corpus
+# (`Embedder.vector_ceiling`), because a distance threshold is meaningful only inside one
+# embedding space — week 8 changed the model and this constant, unchanged, suppressed
+# every semantic hit. Callers should pass `vector_ceiling` explicitly; this default exists
+# for the lexical backend and for callers that have no embedder to ask.
 VECTOR_CEILING = 0.55
 
 # Weight given to each path when both contribute. Lexical is trusted slightly more
@@ -142,12 +148,18 @@ def search_tariff(
     embedding: Sequence[float] | None = None,
     revision: str | None = None,
     limit: int = 10,
+    vector_ceiling: float = VECTOR_CEILING,
 ) -> tuple[list[TariffHit], str]:
     """Classify a goods description. Returns hits and which method answered.
 
     Passing no embedding is a supported mode, not a degraded one: lexical-only search is
     correct when the description is already tariff language, and it keeps the service
     usable before the embedding pass has run over a freshly ingested schedule.
+
+    `vector_ceiling` should come from the backend that embedded the corpus. Leaving it at
+    the default while querying a corpus embedded by a different model is the failure week
+    8 hit: every vector hit falls outside a threshold calibrated for another space, and
+    the search silently degrades to lexical without reporting that it did.
     """
     lexical: dict[str, dict[str, Any]] = {}
     for row in session.execute(
@@ -175,7 +187,7 @@ def search_tariff(
                 "limit": limit * 2,
             },
         ).mappings():
-            if row["dist"] <= VECTOR_CEILING:
+            if row["dist"] <= vector_ceiling:
                 vector[row["code"]] = dict(row)
 
     method = (

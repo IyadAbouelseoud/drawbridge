@@ -53,6 +53,9 @@ class QueuedItem(BaseModel):
     resume_token: str
     state: str
     created_at: datetime
+    has_agent_memo: bool = False
+    """Whether pre-analysis is already attached. Surfaced in the list so an analyst can
+    see it before opening the row; the memo itself comes back from `inspect_exception`."""
 
 
 class ResolveRequest(BaseModel):
@@ -150,6 +153,7 @@ async def list_queue(
                 resume_token=r.resume_token,
                 state=r.state,
                 created_at=r.created_at,
+                has_agent_memo=r.agent_memo is not None,
             )
             for r in rows
         ]
@@ -190,6 +194,41 @@ async def resolve(review_id: UUID, body: ResolveRequest, request: Request) -> di
         "resume_token": row.resume_token,
         "resumed": body.resolution in {"approved", "corrected"},
     }
+
+
+@router.post("/draft")
+async def draft_memos(tenant_id: UUID, limit: int = 20) -> dict[str, Any]:
+    """Draft agent pre-analysis for open, undrafted rows.
+
+    Deliberately *not* called from `/suspend`. n8n suspends by posting there and waits on
+    the token it gets back; making that path depend on a model call would couple workflow
+    suspension to an unrelated service being reachable, and would add seconds to a request
+    whose job is to record a decision durably. The memo is wanted when the analyst opens
+    the row, so it is drafted on this separate, retryable call.
+
+    Synchronous SQLAlchemy inside a threadpool rather than the async session, because the
+    Anthropic SDK call in the middle is blocking and the agent worker is shared with the
+    CLI entry point. Wrapping it here keeps one implementation instead of two.
+    """
+    from anyio import to_thread
+
+    from services.agent.src.queue import draft_pending
+    from services.api.src.config import get_settings
+
+    def _run() -> dict[str, Any]:
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+
+        engine = create_engine(get_settings().sync_database_url)
+        with Session(engine) as session:
+            report = draft_pending(session, tenant_id=tenant_id, limit=limit)
+        return {
+            "drafted": report.drafted,
+            "skipped": report.skipped,
+            "unavailable": report.unavailable,
+        }
+
+    return await to_thread.run_sync(_run)
 
 
 @router.get("/pending/{resume_token}")

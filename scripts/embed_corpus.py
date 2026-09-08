@@ -1,8 +1,9 @@
 """Populate the pgvector columns over the tariff corpus.
 
-    python scripts/embed_corpus.py --backend hashing
+    python scripts/embed_corpus.py                       # semantic, the default
+    python scripts/embed_corpus.py --table rulings
+    python scripts/embed_corpus.py --backend hashing     # lexical, no model download
     python scripts/embed_corpus.py --backend ollama --model nomic-embed-text
-    python scripts/embed_corpus.py --backend hashing --table rulings --jurisdiction ksa
 
 **Resumable by construction.** Only rows with a NULL embedding are selected, so an
 interrupted run continues where it stopped and a second run over a finished corpus is a
@@ -12,7 +13,7 @@ it will be interrupted, and a non-resumable pass would mean starting over.
 **Batched.** A real backend amortises one round trip across the batch. `--batch-size`
 trades throughput against how much work an interruption discards.
 
-**Never prints a vector.** The output is counts and rates. A 1536-float array in a
+**Never prints a vector.** The output is counts and rates. A 384-float array in a
 terminal is unreadable and, at corpus scale, ruinous to anything capturing the output.
 
 The text embedded is the description as published, joined with the code, because a query
@@ -31,7 +32,14 @@ from typing import Any, TextIO
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
-from services.classifier.src.embeddings import Embedder, EmbeddingError, build, to_pgvector
+from services.classifier.src.embeddings import (
+    BACKENDS,
+    DEFAULT_BACKEND,
+    Embedder,
+    EmbeddingError,
+    build,
+    to_pgvector,
+)
 
 DEFAULT_DSN = "postgresql+psycopg://drawbridge:drawbridge@localhost:5432/drawbridge"
 
@@ -158,9 +166,10 @@ def main(argv: list[str] | None = None) -> int:
     _utf8(sys.stderr)
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", default="hashing", choices=("hashing", "ollama"))
-    parser.add_argument("--model", default=None, help="ollama only")
+    parser.add_argument("--backend", default=DEFAULT_BACKEND, choices=tuple(sorted(BACKENDS)))
+    parser.add_argument("--model", default=None, help="fastembed or ollama")
     parser.add_argument("--base-url", default=None, help="ollama only")
+    parser.add_argument("--cache-dir", default=None, help="fastembed model cache")
     parser.add_argument("--table", default="lines", choices=tuple(TABLES))
     parser.add_argument("--jurisdiction", default=None, choices=("us", "ksa"))
     parser.add_argument("--revision", default=None)
@@ -175,11 +184,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     kwargs: dict[str, Any] = {}
-    if args.backend == "ollama":
-        if args.model:
-            kwargs["model"] = args.model
-        if args.base_url:
-            kwargs["base_url"] = args.base_url
+    if args.backend in {"ollama", "fastembed"} and args.model:
+        kwargs["model"] = args.model
+    if args.backend == "ollama" and args.base_url:
+        kwargs["base_url"] = args.base_url
+    if args.backend == "fastembed" and args.cache_dir:
+        kwargs["cache_dir"] = args.cache_dir
 
     embedder = build(args.backend, **kwargs)
     if not embedder.is_semantic:

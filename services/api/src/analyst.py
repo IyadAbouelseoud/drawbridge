@@ -116,9 +116,15 @@ def _queue_row(row: ReviewQueue, *, include_payload: bool = False) -> dict[str, 
         "resume_token": row.resume_token,
         "workflow_run_id": row.workflow_run_id,
     }
+    # Advertised on every row, not just the detailed one, so an analyst scanning the
+    # queue can see which items already have pre-analysis waiting.
+    out["has_agent_memo"] = row.agent_memo is not None
     if include_payload:
         out["payload"] = row.payload
         out["resolution_note"] = row.resolution_note
+        out["agent_memo"] = row.agent_memo
+        out["agent_model"] = row.agent_model
+        out["agent_drafted_at"] = row.agent_drafted_at.isoformat() if row.agent_drafted_at else None
     return out
 
 

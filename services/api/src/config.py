@@ -34,6 +34,16 @@ class Settings(BaseSettings):
     mcp_claims_url: str = "http://mcp-claims:8104/mcp"
     mcp_ledger_url: str = "http://mcp-ledger:8105/mcp"
 
+    @property
+    def sync_database_url(self) -> str:
+        """The same database over the sync driver.
+
+        The agent worker calls a blocking SDK in the middle of its transaction, so it runs
+        on `psycopg` rather than `asyncpg`. Derived from `database_url` rather than
+        configured separately so the two can never point at different databases.
+        """
+        return self.database_url.replace("+asyncpg", "+psycopg")
+
 
 @lru_cache
 def get_settings() -> Settings:

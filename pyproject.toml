@@ -45,6 +45,9 @@ ocr = [
     "pillow>=11.0",
     "pytesseract>=0.3.13",
 ]
+embed = [
+    "fastembed>=0.5",
+]
 
 [build-system]
 requires = ["hatchling"]
