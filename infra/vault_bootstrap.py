@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets as _stdlib_secrets
 import sys
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,31 @@ DEFAULT_ADDR = "http://localhost:8200"
 DEFAULT_ROOT_TOKEN = "drawbridge-dev-root"
 POLICY_NAME = "drawbridge-api"
 ROLE_NAME = "drawbridge-api"
+
+#: Where the credentials that Postgres, MinIO and n8n read live, and the role that may
+#: read them. Deliberately a different path and a different AppRole from the API's.
+#:
+#: Before week 15 these six were plaintext files under ./secrets, and the separation was
+#: accidental but real: the API process could not read the Postgres *owner* password or
+#: the n8n encryption key, because they were not in `.secrets.json`. Moving them into the
+#: same Vault path as the application's secrets would have handed the API everything and
+#: called it an improvement. The split is the part worth keeping; Vault is just where it
+#: now lives.
+INFRA_PATH = "drawbridge-infra"
+INFRA_POLICY_NAME = "drawbridge-infra"
+INFRA_ROLE_NAME = "drawbridge-infra"
+
+#: What vault-agent renders. Five are generated here; `service_token` is a JWT the
+#: identity provider signs and cannot be minted from random bytes, so it is supplied.
+INFRA_GENERATED: tuple[str, ...] = (
+    "postgres_password",
+    "minio_root_user",
+    "minio_root_password",
+    "authentik_secret_key",
+    "n8n_encryption_key",
+)
+INFRA_SUPPLIED: tuple[str, ...] = ("service_token",)
+INFRA_FIELDS: tuple[str, ...] = INFRA_GENERATED + INFRA_SUPPLIED
 
 #: The AppRole token's lifetime. Twenty minutes is longer than a container start and
 #: shorter than a shift: the token this process ends up holding is useless to anyone who
@@ -136,7 +162,7 @@ def ensure_kv_v2(vault: Vault, mount: str) -> str:
     return "mounted KV v2"
 
 
-def ensure_policy(vault: Vault, mount: str, path: str) -> str:
+def ensure_policy(vault: Vault, mount: str, path: str, *, name: str = POLICY_NAME) -> str:
     """Read on one path. No list, no write, no metadata.
 
     `list` is withheld on purpose. It reads as harmless and it is not: a token that can
@@ -151,14 +177,21 @@ def ensure_policy(vault: Vault, mount: str, path: str) -> str:
         f'  capabilities = ["read"]\n'
         f"}}\n"
     )
-    current = vault.call("GET", f"/v1/sys/policies/acl/{POLICY_NAME}", allow=(404,))
+    current = vault.call("GET", f"/v1/sys/policies/acl/{name}", allow=(404,))
     if current.get("data", {}).get("policy") == document:
         return "already current"
-    vault.call("PUT", f"/v1/sys/policies/acl/{POLICY_NAME}", json_body={"policy": document})
+    vault.call("PUT", f"/v1/sys/policies/acl/{name}", json_body={"policy": document})
     return f"read-only on {mount}/{path}"
 
 
-def ensure_approle(vault: Vault, *, rotate: bool) -> tuple[str, str, str]:
+def ensure_approle(
+    vault: Vault,
+    *,
+    rotate: bool,
+    name: str = ROLE_NAME,
+    policy: str = POLICY_NAME,
+    token_ttl: str = TOKEN_TTL,
+) -> tuple[str, str, str]:
     """The AppRole, its `role_id`, and a `secret_id`. Returns (note, role_id, secret_id).
 
     `role_id` is stable and is deployment configuration — it may sit in a compose file.
@@ -171,11 +204,11 @@ def ensure_approle(vault: Vault, *, rotate: bool) -> tuple[str, str, str]:
 
     vault.call(
         "POST",
-        f"/v1/auth/approle/role/{ROLE_NAME}",
+        f"/v1/auth/approle/role/{name}",
         json_body={
-            "token_policies": [POLICY_NAME],
-            "token_ttl": TOKEN_TTL,
-            "token_max_ttl": TOKEN_TTL,
+            "token_policies": [policy],
+            "token_ttl": token_ttl,
+            "token_max_ttl": token_ttl,
             # The number of times one secret_id may be used to log in. Zero is unlimited,
             # which is what a container that restarts needs; the bound that matters here
             # is the token's TTL, not the login count.
@@ -183,13 +216,11 @@ def ensure_approle(vault: Vault, *, rotate: bool) -> tuple[str, str, str]:
             "secret_id_ttl": "0",
         },
     )
-    role_id = str(
-        vault.call("GET", f"/v1/auth/approle/role/{ROLE_NAME}/role-id")["data"]["role_id"]
-    )
+    role_id = str(vault.call("GET", f"/v1/auth/approle/role/{name}/role-id")["data"]["role_id"])
 
     if rotate:
-        vault.call("POST", f"/v1/auth/approle/role/{ROLE_NAME}/secret-id/destroy", allow=(404,))
-    issued = vault.call("POST", f"/v1/auth/approle/role/{ROLE_NAME}/secret-id")
+        vault.call("POST", f"/v1/auth/approle/role/{name}/secret-id/destroy", allow=(404,))
+    issued = vault.call("POST", f"/v1/auth/approle/role/{name}/secret-id")
     secret_id = str(issued["data"]["secret_id"])
     note = "rotated" if rotate else "issued"
     return note, role_id, secret_id
@@ -245,6 +276,79 @@ def verify(address: str, mount: str, path: str, role_id: str, secret_id: str) ->
     return 0
 
 
+def ensure_infra_secrets(vault: Vault, mount: str, path: str, *, service_token: str) -> str:
+    """Put the six credentials vault-agent renders into Vault, generating what it can.
+
+    **Read-modify-write, and every existing value wins.** Regenerating a credential that
+    is already in force is not a rotation, it is an outage: `postgres_password` is the
+    owner role's password and Postgres set it at initdb, `authentik_secret_key` decrypts
+    every stored session, and `n8n_encryption_key` decrypts every stored workflow
+    credential. A bootstrap that is safe to re-run has to be a bootstrap that cannot
+    quietly replace any of the three. Rotation is a separate, deliberate act — write the
+    new value, then restart the consumer — and `secrets/README.md` says which of these
+    survive it.
+
+    `service_token` is the exception in the other direction: it is a JWT the identity
+    provider signs, so it cannot be generated from random bytes and has to be supplied.
+    Passing nothing leaves whatever is already there, which is what a re-run wants.
+    """
+    current = vault.call("GET", f"/v1/{mount}/data/{path}", allow=(404,))
+    existing = current.get("data", {}).get("data") or {}
+
+    values = dict(existing)
+    minted: list[str] = []
+    for field in INFRA_GENERATED:
+        if not values.get(field):
+            # url-safe: these reach Postgres and MinIO through a DSN and a shell, and a
+            # password carrying '@' or '/' is a connection string bug waiting to be
+            # diagnosed as a wrong password.
+            values[field] = _stdlib_secrets.token_urlsafe(32)
+            minted.append(field)
+    if service_token:
+        values["service_token"] = service_token
+
+    unknown = sorted(set(values) - set(INFRA_FIELDS))
+    if unknown:
+        msg = (
+            f"{mount}/{path} carries {', '.join(unknown)}, which vault-agent has no "
+            f"template for; those values would be unreachable"
+        )
+        raise BootstrapError(msg)
+
+    if values == existing:
+        return f"{len(values)} credential(s) already at {mount}/{path}, unchanged"
+    written = vault.call("POST", f"/v1/{mount}/data/{path}", json_body={"data": values})
+    version = written.get("data", {}).get("version", "?")
+    note = f"generated {', '.join(minted)}" if minted else "updated"
+    missing = [f for f in INFRA_FIELDS if not values.get(f)]
+    tail = f"; still missing {', '.join(missing)}" if missing else ""
+    return f"{note} at {mount}/{path}, version {version}{tail}"
+
+
+def bootstrap_infra(vault: Vault, mount: str, *, rotate: bool, service_token: str) -> str:
+    """Configure the infra path, its policy, its role, and return the secret_id.
+
+    Prints nothing. The caller owns the one place a credential reaches stdout.
+    """
+    ensure_kv_v2(vault, mount)
+    ensure_policy(vault, mount, INFRA_PATH, name=INFRA_POLICY_NAME)
+    print(
+        f"  infra     {ensure_infra_secrets(vault, mount, INFRA_PATH, service_token=service_token)}"
+    )
+    # Longer than the API's twenty minutes because this process is long-lived and renews
+    # on its own schedule; a token that expired between renewals would leave the rendered
+    # files stale with nothing saying so.
+    _, role_id, secret_id = ensure_approle(
+        vault,
+        rotate=rotate,
+        name=INFRA_ROLE_NAME,
+        policy=INFRA_POLICY_NAME,
+        token_ttl="1h",
+    )
+    print(f"  approle   {INFRA_ROLE_NAME}: read on {mount}/{INFRA_PATH} only")
+    return f"{role_id}\n{secret_id}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Configure Vault for Drawbridge.")
     parser.add_argument("--addr", default=os.environ.get("VAULT_ADDR") or DEFAULT_ADDR)
@@ -263,6 +367,20 @@ def main(argv: list[str] | None = None) -> int:
         "restarted with the new one",
     )
     parser.add_argument(
+        "--infra",
+        action="store_true",
+        help="configure secret/drawbridge-infra and the vault-agent AppRole instead of "
+        "the application's. These are the credentials Postgres, MinIO and n8n read, and "
+        "they are a separate path and role on purpose: the API has no business being "
+        "able to read the database owner's password.",
+    )
+    parser.add_argument(
+        "--service-token",
+        default=os.environ.get("DRAWBRIDGE_SERVICE_TOKEN", ""),
+        help="--infra only: the JWT n8n carries. Cannot be generated; mint it with "
+        "scripts/mint_token.py --service. Omitting it leaves whatever Vault already has.",
+    )
+    parser.add_argument(
         "--verify-only",
         action="store_true",
         help="skip configuration; read back with DRAWBRIDGE_VAULT_ROLE_ID / _SECRET_ID",
@@ -279,6 +397,24 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
         return verify(args.addr, args.mount, args.path, role_id, secret_id)
+
+    if args.infra:
+        vault = Vault(args.addr, args.token)
+        try:
+            print(f"vault {args.addr}")
+            role_id, secret_id = bootstrap_infra(
+                vault, args.mount, rotate=args.rotate, service_token=args.service_token
+            ).split("\n")
+        except BootstrapError as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            vault.close()
+        print("\nPut these in .env.onprem. ./secrets is not needed and should not exist:")
+        print(f"  DRAWBRIDGE_VAULT_AGENT_ROLE_ID={role_id}")
+        print(f"  DRAWBRIDGE_VAULT_AGENT_SECRET_ID={secret_id}")
+        print(f"  DRAWBRIDGE_VAULT_INFRA_PATH={INFRA_PATH}")
+        return 0
 
     vault = Vault(args.addr, args.token)
     try:

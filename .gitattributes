@@ -1,0 +1,38 @@
+# Line endings, made explicit because week 15 spent an hour on one.
+#
+# A shell script whose lines end `\` + CRLF does not continue — the backslash escapes the
+# carriage return, and `ash` reports "syntax error: unexpected word (expecting do)" three
+# lines away from anything that looks wrong. That was a self-inflicted extraction bug when
+# it happened, but the same shape reaches a container for real through a Dockerfile `RUN`
+# continuation or a mounted `.sh`, and it is the kind of failure that only appears on
+# somebody else's machine.
+#
+# YAML is exempt from the worry rather than from the rule: the spec normalises line breaks
+# inside scalars, so a CRLF compose file yields LF strings. It is listed anyway so the
+# repository has one answer instead of two.
+
+* text=auto eol=lf
+
+# Files an interpreter inside a Linux container reads directly. These must be LF on disk,
+# not merely LF in the object store.
+*.sh            text eol=lf
+*.hcl           text eol=lf
+*.ctmpl         text eol=lf
+Dockerfile      text eol=lf
+*.Dockerfile    text eol=lf
+Makefile        text eol=lf
+Caddyfile       text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.sql           text eol=lf
+*.py            text eol=lf
+
+# The rendered templates carry no trailing newline on purpose: Postgres and MinIO read the
+# file verbatim, so a newline becomes part of the password and the failure looks like a
+# wrong password rather than a wrong file. Nothing here should ever add one.
+infra/vault-agent/templates/* -text
+
+*.pdf           binary
+*.png           binary
+*.jpg           binary
+*.traineddata   binary

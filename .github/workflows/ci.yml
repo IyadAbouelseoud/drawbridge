@@ -24,8 +24,13 @@ jobs:
       - name: ruff format
         run: uv run ruff format --check .
 
+      # The same tree `make type` covers. It used to be `packages/schemas/src` alone, which
+      # made "mypy --strict is gating" true of one package and of nothing else — the
+      # services, the MCP servers, the scripts and infra/ were all unchecked in CI while
+      # passing locally. A gate that runs on a tenth of the repository is a gate that will
+      # eventually disagree with the developer who ran the real one.
       - name: mypy
-        run: uv run mypy packages/schemas/src
+        run: uv run mypy services mcp_servers packages/schemas/src scripts infra
 
       - name: pytest
         run: uv run pytest
@@ -36,3 +41,10 @@ jobs:
       - uses: actions/checkout@v5
       - name: validate compose
         run: docker compose config --quiet
+
+      # The deployment file, with placeholders. It has required variables and YAML merge
+      # anchors that the development file does not, so `config` on one says nothing about
+      # the other.
+      - name: validate on-prem compose
+        run: |
+          DRAWBRIDGE_VERSION=0.0.0-ci           DRAWBRIDGE_PUBLIC_HOST=ci.example           VAULT_ADDR=http://vault:8200           DRAWBRIDGE_VAULT_ROLE_ID=ci DRAWBRIDGE_VAULT_SECRET_ID=ci           DRAWBRIDGE_VAULT_AGENT_ROLE_ID=ci DRAWBRIDGE_VAULT_AGENT_SECRET_ID=ci           DRAWBRIDGE_OIDC_JWKS_URL=http://ci/jwks DRAWBRIDGE_JWT_ISSUER=http://ci/           DRAWBRIDGE_PREPARER_NAME=ci             docker compose -f docker-compose.onprem.yml config --quiet

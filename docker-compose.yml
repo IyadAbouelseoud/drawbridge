@@ -37,7 +37,22 @@ x-python-base: &python-base
     DRAWBRIDGE_VAULT_ROLE_ID: ${DRAWBRIDGE_VAULT_ROLE_ID:-}
     DRAWBRIDGE_VAULT_SECRET_ID: ${DRAWBRIDGE_VAULT_SECRET_ID:-}
     DRAWBRIDGE_S3_ENDPOINT_URL: http://minio:9000
-    DRAWBRIDGE_S3_ACCESS_KEY: drawbridge
+    # Both halves of the MinIO credential come from the same two variables here and on the
+    # minio service below, and they are set explicitly rather than left to `.secrets.json`.
+    #
+    # They have to be, and week 15 is where that was found. `s3_secret_key` is in
+    # GENERATED_FIELDS, so `make secrets-init` mints a random one — while this compose file
+    # hardcoded MinIO's root password as `drawbridge` and had no way to learn the new
+    # value. The two disagreed by construction from the moment a secrets file was
+    # generated, and every document write in the development stack failed with a bare
+    # HTTP 403 from HeadObject. It survived because nothing in the test suite talks to a
+    # real MinIO and the pilot runs against fixtures already in the bucket.
+    #
+    # `EnvSecretProvider` is first in `default_providers()` and first writer wins, so this
+    # overrides the file for development without weakening the deployment: on-prem, both
+    # sides read the same value from Vault through vault-agent and neither is set here.
+    DRAWBRIDGE_S3_ACCESS_KEY: ${DRAWBRIDGE_S3_ACCESS_KEY:-drawbridge}
+    DRAWBRIDGE_S3_SECRET_KEY: ${DRAWBRIDGE_S3_SECRET_KEY:-drawbridge}
     DRAWBRIDGE_S3_BUCKET_DOCUMENTS: drawbridge-documents
     DRAWBRIDGE_S3_BUCKET_ARCHIVE: drawbridge-archive
     # Spans go to Jaeger's OTLP/HTTP receiver. Empty would still be a working stack —
@@ -115,8 +130,9 @@ services:
     image: minio/minio:latest
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      MINIO_ROOT_USER: drawbridge
-      MINIO_ROOT_PASSWORD: drawbridge
+      # The same two variables the application services read. See the note above them.
+      MINIO_ROOT_USER: ${DRAWBRIDGE_S3_ACCESS_KEY:-drawbridge}
+      MINIO_ROOT_PASSWORD: ${DRAWBRIDGE_S3_SECRET_KEY:-drawbridge}
     volumes: [minio-data:/data]
     ports: ["9000:9000", "9001:9001"]
     healthcheck:
@@ -131,13 +147,24 @@ services:
     image: minio/mc:latest
     depends_on:
       minio: { condition: service_healthy }
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 drawbridge drawbridge &&
-      mc mb --ignore-existing local/drawbridge-documents &&
-      mc version enable local/drawbridge-documents &&
-      echo 'document bucket ready (versioned - objects are immutable)'
-      "
+    environment:
+      # The same credential the server and the application services use, so a generated
+      # secret cannot leave the bucket-creation step behind. See the note in x-python-env.
+      MINIO_ROOT_USER: ${DRAWBRIDGE_S3_ACCESS_KEY:-drawbridge}
+      MINIO_ROOT_PASSWORD: ${DRAWBRIDGE_S3_SECRET_KEY:-drawbridge}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing local/drawbridge-documents
+        mc version enable local/drawbridge-documents
+        # Object lock cannot be enabled on an existing bucket, so the backup bucket is
+        # created with it. See scripts/retention.py for why COMPLIANCE and not GOVERNANCE.
+        mc mb --ignore-existing --with-lock local/drawbridge-backups
+        mc version enable local/drawbridge-backups
+        echo "buckets ready (versioned; backups locked - a correction writes a new object)"
     networks: [drawbridge]
 
   # ------------------------------------------------------------ orchestration
@@ -154,6 +181,14 @@ services:
       GENERIC_TIMEZONE: America/New_York
       # n8n holds no business state. It fires transitions against mcp-claims.
       N8N_DIAGNOSTICS_ENABLED: "false"
+      # n8n 2.x blocks `$env` inside nodes by default, and the workflows read the
+      # service token that way. Left at the default, every API call in the pipeline
+      # goes out with `Bearer ` and an empty token: the first live run logged
+      # "access to env vars denied" and would have failed on 401 at the first node
+      # that reached the API. Scoped rather than opened wide — the allowlist below
+      # is the only variable a workflow may read.
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      N8N_VARS_ALLOWLIST: DRAWBRIDGE_SERVICE_TOKEN
       # Every HTTP Request node sends this as a bearer token. It is a *service* token:
       # cross-tenant by design, because one workflow runs whichever tenant its trigger
       # names. Mint it with `make token-service` and treat it as the most valuable secret

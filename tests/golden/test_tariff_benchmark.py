@@ -40,11 +40,25 @@ CALIBRATED_CEILING = 0.68
 
 # Measured, not chosen: the worst distance at which a labelled positive's correct code is
 # still retrieved. The ceiling must sit above it or recall is lost silently.
-WORST_TRUE_POSITIVE = 0.625
+#
+# Re-measured in week 15 when the corpus stopped being embedded with its own tariff code
+# joined to the front. 0.625 -> 0.6348. These two numbers are *observations*, and moving
+# one because a test failed would be exactly the habit the file exists to prevent — so
+# what changed here is the text being embedded, and these are what the same measurement
+# then returned.
+WORST_TRUE_POSITIVE = 0.635
 
 # Measured: the nearest a query the corpus cannot answer gets. The ceiling sits *above*
 # this, which is the point of the whole file — see the module docstring.
-NEAREST_HARD_NEGATIVE = 0.508
+#
+# 0.508 -> 0.4969 for the same reason. Note which way each moved: the worst positive got
+# *further* and the nearest negative got *closer*, so removing the code prefix widened the
+# overlap rather than closing it. That is worth stating plainly, because the convenient
+# reading of week 15 would be that fixing the embedding text fixed retrieval. It did not.
+# It removed a defect that made every prior measurement unsound; the overlap this file has
+# asserted since week 9 is still here, and a single distance threshold still cannot deliver
+# precision at any value.
+NEAREST_HARD_NEGATIVE = 0.497
 
 
 def _load() -> dict[str, Any]:
@@ -73,8 +87,19 @@ def corpus_vectors(embedder: FastEmbedEmbedder) -> list[list[float]]:
 
     Same text composition, same model. A benchmark that embedded its corpus differently
     from production would measure a threshold nothing else uses.
+
+    That sentence was true and was the reason the defect survived. Until week 15 both
+    sides embedded `f"{code} {description}"`, so every document vector — here and in the
+    database — began with a ten-digit tariff code that no query contains. The benchmark
+    reproduced the defect faithfully, agreed with production, and reported a threshold
+    measured over a corpus the queries could not reach. The one test whose job is to catch
+    a mismatch between the two sides was built to match.
+
+    The lesson is not that the fixture was wrong. It is that "the benchmark does what
+    production does" is only worth having if what production does is checked separately —
+    otherwise the two agree their way into the same mistake.
     """
-    return embedder.embed([f"{row['code']} {row['description_en']}" for row in CORPUS])
+    return embedder.embed([row["description_en"] for row in CORPUS])
 
 
 def _ranked(
@@ -179,6 +204,9 @@ class TestTheCeilingIsCalibratedForRecall:
             for p in POSITIVES
         )
         assert worst <= WORST_TRUE_POSITIVE
+        # 0.0452 of headroom at the time of measuring. The bound is loose enough to
+        # survive a re-measure and tight enough to catch a ceiling raised to make
+        # something pass.
         assert CALIBRATED_CEILING - worst < 0.10
 
 

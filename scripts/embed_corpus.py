@@ -16,8 +16,24 @@ trades throughput against how much work an interruption discards.
 **Never prints a vector.** The output is counts and rates. A 384-float array in a
 terminal is unreadable and, at corpus scale, ruinous to anything capturing the output.
 
-The text embedded is the description as published, joined with the code, because a query
-like "8471.30 portable machines" should reach the line by either half.
+**The text embedded is the description, and nothing else.** Until week 15 it was
+`f"{code} {body}"` — the ten-digit tariff code joined to the front of every document,
+on the reasoning that a query like "8471.30 portable machines" should reach the line by
+either half. It does not work that way. No analyst query carries the code, so every one
+of the 28,899 document vectors began with a token the query side never contains, and
+28,899 near-identical digit strings pull the whole corpus toward one direction in a space
+that is supposed to separate them. The stored vector for a line reproduced at cosine
+1.000000 against `code + " " + search_text` and 0.950 against the text alone: the corpus
+and the queries were in measurably different distributions, for seven weeks, and it
+presented the whole time as "the model is too thin at volume".
+
+A query that does carry a code is now served by `search_tariff`'s code path, which
+matches the digits exactly instead of hoping a subword tokeniser does. That is both
+better retrieval and an answer somebody can defend in an audit.
+
+Every row written records the backend **and the text convention** in
+`embedding_model_id`, which is what `embeddings.py` has claimed since week 8 and what no
+column existed to hold.
 """
 
 from __future__ import annotations
@@ -52,7 +68,9 @@ _PENDING_LINES = text("""
            -- before f2b90d47ac13, so the description remains the fallback.
            coalesce(nullif(search_text, ''), nullif(description_en, ''), description_ar, '') AS body
     FROM tariff_lines
-    WHERE embedding IS NULL
+    WHERE (embedding IS NULL
+           OR (CAST(:reembed AS boolean)
+               AND embedding_model_id IS DISTINCT FROM CAST(:corpus_id AS text)))
       AND (CAST(:jurisdiction AS text) IS NULL OR jurisdiction = CAST(:jurisdiction AS text))
       AND (CAST(:revision AS text) IS NULL OR revision = CAST(:revision AS text))
     ORDER BY tariff_line_id
@@ -64,7 +82,9 @@ _PENDING_RULINGS = text("""
     SELECT ruling_id AS id, classified_code AS code,
            subject || ' ' || left(body, 4000) AS body
     FROM tariff_rulings
-    WHERE embedding IS NULL
+    WHERE (embedding IS NULL
+           OR (CAST(:reembed AS boolean)
+               AND embedding_model_id IS DISTINCT FROM CAST(:corpus_id AS text)))
       AND (CAST(:jurisdiction AS text) IS NULL OR jurisdiction = CAST(:jurisdiction AS text))
       AND (CAST(:revision AS text) IS NULL OR TRUE)
     ORDER BY ruling_id
@@ -73,23 +93,33 @@ _PENDING_RULINGS = text("""
 """)
 
 _UPDATE_LINE = text("""
-    UPDATE tariff_lines SET embedding = CAST(:embedding AS vector)
-    WHERE tariff_line_id = :id
+    UPDATE tariff_lines
+       SET embedding = CAST(:embedding AS vector), embedding_model_id = :model_id
+     WHERE tariff_line_id = :id
 """)
 
 _UPDATE_RULING = text("""
-    UPDATE tariff_rulings SET embedding = CAST(:embedding AS vector)
-    WHERE ruling_id = :id
+    UPDATE tariff_rulings
+       SET embedding = CAST(:embedding AS vector), embedding_model_id = :model_id
+     WHERE ruling_id = :id
 """)
 
 _COVERAGE = text("""
-    SELECT count(*) AS total, count(embedding) AS embedded
+    SELECT count(*) AS total, count(embedding) AS embedded,
+           count(*) FILTER (
+               WHERE embedding IS NOT NULL
+                 AND embedding_model_id IS DISTINCT FROM CAST(:corpus_id AS text)
+           ) AS stale
     FROM tariff_lines
     WHERE (CAST(:jurisdiction AS text) IS NULL OR jurisdiction = CAST(:jurisdiction AS text))
 """)
 
 _COVERAGE_RULINGS = text("""
-    SELECT count(*) AS total, count(embedding) AS embedded
+    SELECT count(*) AS total, count(embedding) AS embedded,
+           count(*) FILTER (
+               WHERE embedding IS NOT NULL
+                 AND embedding_model_id IS DISTINCT FROM CAST(:corpus_id AS text)
+           ) AS stale
     FROM tariff_rulings
     WHERE (CAST(:jurisdiction AS text) IS NULL OR jurisdiction = CAST(:jurisdiction AS text))
 """)
@@ -98,6 +128,22 @@ TABLES = {
     "lines": (_PENDING_LINES, _UPDATE_LINE, _COVERAGE),
     "rulings": (_PENDING_RULINGS, _UPDATE_RULING, _COVERAGE_RULINGS),
 }
+
+
+#: The text convention this script embeds, recorded alongside the model. Two corpora
+#: embedded by the same model from different text are as incomparable as two models, and
+#: that is the mistake that actually happened — so the stamp has to name both halves or
+#: it would not have caught it.
+TEXT_CONVENTION = "desc"
+
+
+def corpus_id(embedder: Embedder) -> str:
+    """What goes in `embedding_model_id`: the backend and the text it was given.
+
+    Truncated to the column width rather than allowed to fail the write, because a long
+    Ollama model name should degrade to a shorter stamp and not to an unembedded corpus.
+    """
+    return f"{embedder.model_id}/{TEXT_CONVENTION}"[:128]
 
 
 def _utf8(stream: TextIO) -> None:
@@ -120,6 +166,7 @@ def embed_batch(
     jurisdiction: str | None,
     revision: str | None,
     batch_size: int,
+    reembed: bool = False,
 ) -> tuple[int, int]:
     """Embed one batch. Returns (written, skipped).
 
@@ -132,7 +179,13 @@ def embed_batch(
     rows = (
         session.execute(
             select_sql,
-            {"jurisdiction": jurisdiction, "revision": revision, "limit": batch_size},
+            {
+                "jurisdiction": jurisdiction,
+                "revision": revision,
+                "limit": batch_size,
+                "reembed": reembed,
+                "corpus_id": corpus_id(embedder),
+            },
         )
         .mappings()
         .all()
@@ -140,7 +193,9 @@ def embed_batch(
     if not rows:
         return 0, 0
 
-    texts = [f"{row['code']} {row['body']}".strip() for row in rows]
+    # The description alone. See the module docstring: joining the code prefixed every
+    # document with a token no query carries.
+    texts = [str(row["body"]).strip() for row in rows]
     try:
         vectors = embedder.embed(texts)
     except EmbeddingError:
@@ -157,7 +212,14 @@ def embed_batch(
         if not vector:
             skipped += 1
             continue
-        session.execute(update_sql, {"id": row["id"], "embedding": to_pgvector(vector)})
+        session.execute(
+            update_sql,
+            {
+                "id": row["id"],
+                "embedding": to_pgvector(vector),
+                "model_id": corpus_id(embedder),
+            },
+        )
         written += 1
 
     session.commit()
@@ -182,6 +244,14 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=0,
         help="Stop after this many rows. 0 embeds everything pending.",
+    )
+    parser.add_argument(
+        "--reembed",
+        action="store_true",
+        help="also rewrite rows whose embedding_model_id is not the current backend and "
+        "text convention. Overwrites in place rather than nulling first, so the corpus "
+        "converges instead of going dark and an interrupted run leaves a mixture the "
+        "stamp makes visible.",
     )
     parser.add_argument("--dsn", default=None)
     args = parser.parse_args(argv)
@@ -222,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
                 jurisdiction=args.jurisdiction,
                 revision=args.revision,
                 batch_size=limit,
+                reembed=args.reembed,
             )
             if written == 0 and skipped == 0:
                 break
@@ -234,7 +305,12 @@ def main(argv: list[str] | None = None) -> int:
 
         _, _, coverage_sql = TABLES[args.table]
         coverage = (
-            session.execute(coverage_sql, {"jurisdiction": args.jurisdiction}).mappings().one()
+            session.execute(
+                coverage_sql,
+                {"jurisdiction": args.jurisdiction, "corpus_id": corpus_id(embedder)},
+            )
+            .mappings()
+            .one()
         )
 
     elapsed = time.monotonic() - started
@@ -242,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(
             {
                 "backend": embedder.model_id,
+                "corpus_id": corpus_id(embedder),
                 "semantic": embedder.is_semantic,
                 "table": args.table,
                 "embedded": total_written,
@@ -251,6 +328,11 @@ def main(argv: list[str] | None = None) -> int:
                 "coverage": {
                     "total": coverage["total"],
                     "embedded": coverage["embedded"],
+                    # Rows holding a vector some other backend or text convention wrote.
+                    # Non-zero means the corpus is not searchable as one thing: a query
+                    # vector is comparable to one convention and meaningless against the
+                    # other. `--reembed` is what clears it.
+                    "stale": coverage["stale"],
                     "pct": (
                         round(100 * coverage["embedded"] / coverage["total"], 1)
                         if coverage["total"]

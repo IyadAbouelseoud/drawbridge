@@ -46,9 +46,10 @@ scripts/fasah_probe_results.json
 # contents name a tenant id that only exists in whichever database was seeded.
 pilot/
 
-# The six credentials the on-prem stack hands to Postgres, MinIO and n8n as docker
-# secrets. Everything else comes from Vault; these three images cannot read a manager.
-# The README is committed so the directory exists and says what belongs in it.
+# secrets/ is a tombstone as of week 15: vault-agent renders these six into tmpfs and the
+# host filesystem holds none of them. The rule stays so that an upgraded deployment which
+# still has the old files cannot commit them on the way to deleting them.
+# The README is committed so the directory exists and says that nothing belongs in it.
 secrets/*
 !secrets/README.md
 

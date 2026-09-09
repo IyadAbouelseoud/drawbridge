@@ -1,0 +1,1 @@
+{{- with secret (printf "%s/data/%s" (env "DRAWBRIDGE_VAULT_MOUNT") (env "DRAWBRIDGE_VAULT_INFRA_PATH")) -}}{{- index .Data.data "minio_root_user" -}}{{- end -}}

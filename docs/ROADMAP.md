@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 14 |
+| Current week | 15 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | **The deployment** — real identity, a real secrets manager, a hardened on-prem stack that carries the deployer's name |
+| Current milestone | **Debug, review, harden** — run every artefact that had only been validated, and fix what running it found |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -30,6 +30,7 @@
 | 11–12 | Multi-tenant hardening: RLS (wk 11) **then** Authentik on top of it (wk 12), secrets, OTel | Second tenant onboarded with zero code change |
 | 12–13 | Pilot: one US importer + one KSA re-exporter, backward-looking claims | Filed claim in each jurisdiction, refund in motion |
 | 14 | Broker white-label packaging + on-prem compose | Reproducible `.onprem.yml` deploy |
+| 15 | Debug, review, harden | Backups under object lock; every committed artefact executed at least once |
 
 ---
 
@@ -1118,7 +1119,93 @@ of each secret and it is stated in `secrets/README.md` rather than glossed: the 
 8. **A *Bayan* header-block template.** Partially blocked on **B3**.
 9. **Digest-pinned images** and a signed release, so "what is deployed" has one answer.
 10. Blocked externally: **B1** Fasah credentials, **B2** Resolution 28624 text, **B3** a
-    real scanned *Bayan* corpus.
+    real scanned *Bayan* corpus. **Parked permanently — see below.**
+
+## External blockers — parked, permanently
+
+**B1, B2 and B3 are commercial dependencies and will not be automated in this codebase.**
+They have been carried as open items since week 2; that was right while there was a chance
+a technical route existed, and it is now just a list that makes the roadmap look shorter
+than it is. Each is closed here with what unblocks it and what stands in for it meanwhile.
+
+| | What it is | Why no code closes it | What stands in |
+|---|---|---|---|
+| **B1** | Fasah (Saudi single-window) credentials | Issued to a licensed customs broker against a commercial registration. There is no sandbox, no self-service, and no public API to build against. `scripts/fasah_sandbox_probe.py` exists to record that, not to obtain them. | The KSA lane produces a ZATCA refund payload and stops. Nothing in this repository transmits to Fasah, and `assert_not_evidence` refuses to act on fixture provenance. |
+| **B2** | The authoritative text of Ministerial Resolution 28624 | Not published in machine-readable form. Obtaining it means a Saudi counsel engagement or a paid legal database licence. | `COMPLIANCE-GCC.md` cites the GCC Common Customs Law directly and the rules engine implements Art. 174 from it. Where 28624 would refine a rule, the rule is absent rather than guessed. |
+| **B3** | A real scanned *Bayan* corpus | Real declarations are a customer's commercial records. There is no public corpus, and a synthetic one cannot establish OCR accuracy on real scans. | `tests/fixtures/bayan.py` renders a synthetic RTL table. It proves the bilingual extraction path runs; it does not establish field accuracy on scanned Arabic, and `ARCHITECTURE.md` says so. |
+
+The practical consequence: **the GCC lane is complete as far as a repository can take it.**
+Further GCC work needs a customer, not a commit. Anything that appears to close one of
+these without the underlying access is a fixture wearing a deployment's name, and the
+correct engineering response is to leave the gap visible.
+
+## Week 15 task breakdown
+
+- [x] **Retrieval.** Root cause found and fixed: the corpus was embedded from
+      `f"{code} {body}"`, so every document vector carried a ten-digit token no query
+      contains. `search_tariff` now looks a code up instead of hoping for it.
+- [x] **Embedding provenance.** `embedding_model_id` on both corpora (`a3f81c22d907`),
+      stamping the text convention as well as the model. `--reembed` converges the corpus
+      in place.
+- [x] **The benchmark had the same defect** — `tests/golden/test_tariff_benchmark.py`
+      embedded its fixture corpus as `f"{code} {description}"` too, which is why nothing
+      caught this. Fixed and re-measured: the worst true positive moved 0.625 → 0.635 and
+      the nearest hard negative 0.508 → 0.497, so removing the prefix *widened* the
+      overlap. Fixing the text made the measurements sound; it did not make the classifier
+      work.
+- [x] Reranking evaluated and **rejected on measurement** — an English cross-encoder makes
+      the Arabic queries worse; the multilingual one buys one position in ten for four
+      seconds a query and 1.1 GB.
+- [x] **Vault Agent sidecar.** `./secrets` deleted; six credentials rendered to tmpfs from
+      a separate Vault path under a separate AppRole, proven live.
+- [x] **Backups.** `scripts/retention.py` — `pg_dump` under S3 object lock in COMPLIANCE
+      mode, plus `verify_chain` across every tenant on its own interval.
+- [x] **Digest pinning.** All nine third-party images; `make pin-check` fails on drift.
+- [x] **n8n, for real.** Three workflows imported, activated, and one webhook run to a
+      packaged claim with a CBP 7551. Seven defects fixed to get there.
+- [x] **The agent worker against live rows** — connects and selects; drafting proven with
+      the model stubbed. Still blocked on an API key.
+- [ ] **Thresholds.** Deliberately not moved. See below.
+
+### What week 15 deliberately did not do
+
+- **Move a threshold.** `vector_ceiling` and `CONFIRMATION_LEXICAL_FLOOR` are still week
+  8's numbers and `LEXICAL_FLOOR` is still 0.15. Every measurement that would justify
+  moving one was taken against a corpus in the wrong embedding space, so all of them are
+  void. Re-measuring needs the re-embed to finish; tuning before that would be fitting
+  constants to an artefact of the defect.
+- **Fix the pipeline's inability to fail.** Every n8n HTTP node sets `neverError: true`, so
+  a 500 from `/claims/persist` became `{data: "Internal Server Error"}`, the run continued
+  through packaging, returned 200 and recorded `success`. Real, understood, and a
+  structural change to a 22-node graph that wants doing deliberately rather than at the end
+  of a long week.
+- **Sign anything.** Digests say the bytes have not changed since somebody wrote them down,
+  not that they were trustworthy then.
+- **Load more of CROSS.** Still 120 rulings.
+
+## Week 16 entry checklist
+
+1. **A pipeline that can fail.** Remove `neverError` or gate on status after every HTTP
+   node. Today a run that 500s reports success and packages a claim built on nothing.
+   Largest correctness hole in the repository.
+2. **Re-measure every threshold**, now that the corpus and the queries are in one space.
+   `scripts/calibrate_thresholds.py`, then decide on `vector_ceiling`,
+   `CONFIRMATION_LEXICAL_FLOOR` and `LEXICAL_FLOOR` together and in one commit.
+3. **Then, and only then, revisit the model.** The reranker numbers in `ARCHITECTURE.md`
+   §20.1 were measured against the broken space and should be re-run before they are
+   trusted.
+4. **A restore drill.** A backup nobody has restored is a file. `pg_restore` into a scratch
+   database, run the golden fixtures against it, and record how long it took.
+5. **An Anthropic key in a deployment**, so the agent worker's drafting runs live rather
+   than to a stub.
+6. **Test the deployment file the way the workflows were tested.** `docker compose config`
+   proves the on-prem YAML parses; nothing has ever started it. Everything week 15 found
+   came from executing an artefact that had only been validated.
+7. **More of CROSS**, and a decision about whether the answer is a larger sample, a
+   purchased corpus, or narrowing what `find_rulings` claims to cover.
+8. **Signed images**, so "what is deployed" has a provenance answer and not just an
+   identity one.
+9. **A *Bayan* header-block template** — as far as B3 allows, which is not far.
 
 ## Sequencing rationale
 
@@ -1190,6 +1277,21 @@ full corpus produced was the discovery that classification does not work at volu
 a green pilot on a toy corpus would have hidden behind a green pilot. The ordering that
 matters here is not pilot-then-corpus or corpus-then-pilot; it is that both ran in the same
 week, so the one that passes could be checked against the one that does not.
+
+Debugging as a milestone (wk 15) rather than as maintenance, and it paid for itself in the
+first hour. Week 15 was scheduled to *improve* five things — retrieval, secrets, backups,
+digests, orchestration. What it actually did was execute five artefacts that had only ever
+been validated, and every one of them was broken in a way its validation could not see: the
+embedding text was valid text, the workflow files were valid JSON, the image tags were
+valid tags, the generated secret was a valid secret. Seven weeks of "5 of 10 at hs6" turned
+out to be a string concatenation, and six weeks of "import the workflows" turned out to be
+seven defects deep.
+
+The ordering lesson is not "test more". Each of these had a test that passed. It is that a
+check on an artefact's *form* certifies nothing about its *use*, and the gap between the
+two is exactly where a roadmap item that says "run it for real" gets deferred to next week.
+Weeks 13 and 14 each found one defect of this kind and named it in passing; week 15 found
+five and is the week that should have been scheduled after week 9.
 
 The debt before the milestone (wk 14), which is the reverse of every other week here and
 was right. The three carried items — Authentik, a real secrets manager, CROSS — are exactly

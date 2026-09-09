@@ -97,6 +97,22 @@ and the only way the agent layer reaches data:
 | `mcp-claims` | the claim state machine |
 | `mcp-ledger` | the audit ledger |
 
+The workflows are imported and run:
+
+```
+POST /webhook/drawbridge/ingest
+  documents/batch 201 · extraction 200 · classification 200 · matching 200
+  triage 200 · claims/persist 201 · claims/transition 200
+  packaging/build 200 · claims/transition 200
+{"state":"packaged","refund":"25092.14","transmittable":true,
+ "artifacts":[{"filename":"cbp7551-....pdf","bytes":13345}]}
+```
+
+`make n8n-import` imports, activates and restarts — all three, because
+`n8n import:workflow` deactivates what it imports and n8n reads neither until it restarts.
+That, and six other defects, is what running these files for the first time found; they had
+been committed and validated as JSON since week 9. `docs/ARCHITECTURE.md` §20.6 lists them.
+
 ---
 
 ## Running it
@@ -122,7 +138,9 @@ Optional profiles, both of which replace a development shortcut with the real th
 
 ```sh
 make vault-up                     # secrets from HashiCorp Vault over AppRole, not a file
+make vault-agent-up               # the infra path vault-agent renders Postgres/MinIO/n8n from
 make identity-up TENANT=<uuid>    # Authentik: OIDC provider, tenant claim, RS256 round trip
+make n8n-import                   # import the workflows, activate them, restart n8n
 ```
 
 ### On premises
@@ -132,7 +150,8 @@ inherits every bind mount and published port from the development file, and forg
 `-f` deploys development under a production name.
 
 ```sh
-cp .env.onprem.example .env.onprem     # fill in; see secrets/README.md for the six files
+make images VERSION=1.2.3               # the seven images the deployment file names
+cp .env.onprem.example .env.onprem      # fill in; nothing goes in ./secrets any more
 docker compose -f docker-compose.onprem.yml --env-file .env.onprem up -d
 ```
 
@@ -141,7 +160,29 @@ default gateway, so Postgres, Redis and MinIO cannot originate outbound traffic 
 Secrets come from Vault with **no file to fall back to**; identity is Authentik with no
 shared-secret fallback, so nothing inside the deployment can mint a token. Migrations run
 as a job the API waits on. Every container drops all capabilities and runs read-only where
-the image allows it.
+the image allows it. Every third-party image is pinned to a SHA-256 digest, so a `pull`
+either fetches identical bytes or fails; `make pin-check` fails the build if a tag has been
+repointed under an unchanged version number.
+
+**No credential is on the host filesystem.** Postgres, MinIO and n8n read passwords from a
+file and cannot call a manager, so until week 15 six plaintext files sat next to the compose
+file. A `vault-agent` sidecar now renders them into tmpfs from `secret/drawbridge-infra`,
+under an AppRole that is denied both the application's Vault path and `list` on the mount —
+the API has no business being able to read the database owner's password, and it could not
+before the move. `secrets/README.md` has the detail.
+
+**Backups are immutable, and that is expensive on purpose.** `scripts/retention.py` takes a
+nightly `pg_dump` into MinIO under S3 object lock in COMPLIANCE mode and recomputes every
+tenant's ledger hash chain hourly. COMPLIANCE and not GOVERNANCE, because GOVERNANCE can be
+lifted by whoever holds `s3:BypassGovernanceRetention` — on a single-tenant on-prem MinIO,
+the operator, who is the party a records dispute is about. The consequence is that nothing
+prunes: storage grows for the length of the obligation, five years by default. Verified
+against a live MinIO, root credentials cannot delete or shorten a written backup.
+
+One nuance worth knowing before an incident: object lock protects the bytes, not the
+listing. `DeleteObject` still succeeds by writing a delete marker, and the protected version
+survives underneath but disappears from an ordinary `ls`. `retention.py catalogue`
+enumerates versions and names anything a delete marker is masking.
 
 **White label is a compliance surface, not a logo.** The preparer notice on a CBP form is a
 representation to a customs authority. A licensed broker running this prepares filings
@@ -168,7 +209,7 @@ make pilot-run                    # both corpora end to end against the deployed
 | `packages/schemas` | Shared Pydantic contracts. Single source of truth |
 | `services/` | api · ingest · extraction · classifier · matcher · rules · packager · agent |
 | `mcp_servers/` | Five typed MCP servers — the tool boundary |
-| `infra/` | Vault and Authentik bootstrap, Caddy, Dockerfiles, Postgres init |
+| `infra/` | Vault + Authentik bootstrap, the vault-agent sidecar, image pinning, Caddy, Dockerfiles |
 | `n8n/workflows` | Orchestration, version-controlled as JSON |
 | `scripts/` | Ingest, embedding, token minting, offboarding, the pilot |
 | `tests/golden` | Known-answer claims that must reproduce to the cent |
@@ -190,12 +231,22 @@ make pilot-run                    # both corpora end to end against the deployed
 Stated here rather than discovered later. The full list, with the reasoning, is in
 `docs/ROADMAP.md`.
 
-- **Classify reliably.** Against the full 28,899-line HTSA the benchmark retrieves 5 of 10
-  correct subheadings at six digits. That is a measured improvement on 1 of 10 and it is
-  not a working classifier.
+- **Classify reliably.** The benchmark retrieved 5 of 10 correct subheadings at six digits
+  against the full 28,899-line HTSA, and week 15 found why: the corpus had been embedded
+  from `f"{code} {body}"`, so every document vector carried a ten-digit tariff code that no
+  analyst query contains. The document side and the query side were never in the same
+  distribution. That is fixed and the corpus is being re-embedded, but **the thresholds
+  have not been re-measured and the classifier is not yet known to work**. Every number in
+  this repository about retrieval quality was measured against the broken space and should
+  be treated as void until week 16 re-runs them.
 - **Carry the ruling corpus.** CBP publishes no bulk export; `scripts/ingest_cross.py`
   draws a term-sampled ~120 rulings. A sample is not CROSS.
-- **Back anything up.** The on-prem volume is not a backup, and the retention job that
-  would run `verify_chain` on a schedule is not written.
+- **Fail a pipeline run.** Every n8n HTTP node sets `neverError: true`, so a 500 from
+  `/claims/persist` becomes `{data: "Internal Server Error"}`, the run continues through
+  packaging, returns HTTP 200 and records `success`. Understood, reproduced, and not yet
+  fixed — it is a structural change to a 22-node graph and it is the first item on the week
+  16 list.
+- **Restore a backup.** Backups are taken and are provably immutable. Nobody has restored
+  one, and a backup nobody has restored is a file.
 - **File anything.** Both pilot corpora are fiction, every figure carries a
   `pilot-fixture` provenance box, and `assert_not_evidence` refuses to act on one.

@@ -109,6 +109,23 @@ class TariffLine(Base):
     effective_to: Mapped[date | None] = mapped_column(Date)
 
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
+    embedding_model_id: Mapped[str | None] = mapped_column(String(128))
+    """Which backend, and which text convention, wrote `embedding`.
+
+    `embeddings.py` has claimed since week 8 that "every backend records `model_id` on the
+    rows it writes; a corpus is queryable only by the backend that wrote it, and mixing
+    them is a data error the ingest can detect". There was no column, so nothing recorded
+    it and nothing could detect anything — the invariant was a comment.
+
+    Week 15 is what that cost. `embed_corpus.py` prefixed every document with its own
+    ten-digit tariff code before embedding, so 28,899 document vectors carried a token no
+    analyst query ever contains, and the corpus and the query side were never in the same
+    distribution. It presented as "the model is too thin at volume" and survived two weeks
+    of being measured as a model problem. A stamp on the row would have made it one query.
+
+    So the stamp names the text convention as well as the model: two corpora embedded by
+    the same model from different text are as incomparable as two models, and the mistake
+    that actually happened was the second kind."""
     ingested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -167,6 +184,9 @@ class TariffRuling(Base):
     deleted, because a claim filed while it was good law relied on it."""
 
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
+    embedding_model_id: Mapped[str | None] = mapped_column(String(128))
+    """Which backend and text convention wrote `embedding`. See `TariffLine`."""
+
     ingested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

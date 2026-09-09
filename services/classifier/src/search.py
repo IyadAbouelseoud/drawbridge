@@ -21,6 +21,7 @@ without depending on a model endpoint that may no longer exist.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -62,6 +63,11 @@ VECTOR_CEILING = 0.55
 # misclassification reaches a filing unexamined.
 CONFIRMATION_LEXICAL_FLOOR = 0.20
 
+# What a code match scores. Above any similarity, because it is not one: the caller named
+# the digits and the schedule has this row for them. Ranking a paraphrase above the line
+# the analyst asked for would be the search overriding its user.
+CODE_SCORE = 1.0
+
 # Weight given to each path when both contribute. Lexical is trusted slightly more
 # because an exact phrase match against published tariff text is stronger evidence than
 # embedding proximity.
@@ -84,6 +90,12 @@ class TariffHit:
     lexical_score: float | None
     vector_distance: float | None
 
+    code_matched: bool = False
+    """Whether the caller named this line's code in the query.
+
+    Not a similarity. The caller supplied digits and the schedule has a row for them, so
+    this is a lookup and the only judgement in it is the caller's."""
+
     confirmation_lexical_floor: float = CONFIRMATION_LEXICAL_FLOOR
     """The floor this hit was judged against, carried on the hit rather than looked up.
 
@@ -93,6 +105,8 @@ class TariffHit:
 
     @property
     def matched_by(self) -> str:
+        if self.code_matched:
+            return "code"
         if self.lexical_score is not None and self.vector_distance is not None:
             return "both"
         return "lexical" if self.lexical_score is not None else "vector"
@@ -115,7 +129,17 @@ class TariffHit:
 
         Classification drives the duty rate, so an unconfirmed suggestion reaching a
         filing is a misclassification waiting to be assessed.
+
+        A code match is the exception, and it is not an exception to the rule so much as
+        a case the rule does not cover. Nothing was inferred: the caller typed digits and
+        this is the schedule's row for them. Asking the person who typed the code to
+        confirm the code is not a control, it is a dialog box — and it would train the
+        habit of clearing the flag, which is the thing that makes the flag work everywhere
+        else. A mistyped code still returns a real line, and that risk sits with the
+        caller, where nothing in this module can reach it.
         """
+        if self.code_matched:
+            return False
         if self.lexical_score is None:
             return True
         return self.lexical_score < self.confirmation_lexical_floor
@@ -131,6 +155,7 @@ class TariffHit:
             "duty_rate_general": self.duty_rate_general,
             "score": round(self.score, 4),
             "matched_by": self.matched_by,
+            "code_matched": self.code_matched,
             "lexical_score": round(self.lexical_score, 4) if self.lexical_score else None,
             "vector_distance": (
                 round(self.vector_distance, 4) if self.vector_distance is not None else None
@@ -139,6 +164,45 @@ class TariffHit:
             "confirmation_lexical_floor": self.confirmation_lexical_floor,
         }
 
+
+#: A tariff code appearing inside a query: six to ten digits, optionally dotted the way
+#: the schedule prints them. Anchored to word boundaries so a container number or an
+#: invoice reference embedded in a sentence is not mistaken for a classification.
+#:
+#: This exists because until week 15 `embed_corpus.py` joined each line's own code to the
+#: front of the text it embedded, on the reasoning that "8471.30 portable machines" should
+#: reach the line by either half. It did not: no analyst query carries a code, so the only
+#: effect was that all 28,899 document vectors began with a token the query side never
+#: contains. A query that *does* name a code deserves an exact answer rather than a
+#: model's opinion about the shape of a digit string — and an exact answer is one an
+#: auditor can check, which cosine proximity to a number is not.
+_CODE_IN_QUERY = re.compile(r"(?<![0-9])(\d{4}(?:[.\s]?\d{2}){1,3})(?![0-9])")
+
+
+def code_prefix(query: str) -> str | None:
+    """The digits of a tariff code named in `query`, or None.
+
+    Returns the prefix rather than a whole code: an analyst who types "8471.30" means the
+    subheading and everything under it, and the schedule's ten-digit statistical suffixes
+    are not something a person types from memory.
+    """
+    match = _CODE_IN_QUERY.search(query)
+    if match is None:
+        return None
+    digits = re.sub(r"[^0-9]", "", match.group(1))
+    return digits if len(digits) >= 6 else None
+
+
+_CODE_SQL = text("""
+    SELECT code, description_en, description_ar, jurisdiction, source, revision,
+           duty_rate_general
+    FROM tariff_lines
+    WHERE jurisdiction = :jurisdiction
+      AND (CAST(:revision AS text) IS NULL OR revision = CAST(:revision AS text))
+      AND code LIKE :prefix || '%'
+    ORDER BY length(code), code
+    LIMIT :limit
+""")
 
 _LEXICAL_SQL = text("""
     SELECT code, description_en, description_ar, jurisdiction, source, revision,
@@ -228,7 +292,26 @@ def search_tariff(
     the default while querying a corpus embedded by a different model is the failure week
     8 hit: every vector hit falls outside a threshold calibrated for another space, and
     the search silently degrades to lexical without reporting that it did.
+
+    A query naming a tariff code is answered by looking the code up, not by embedding it.
+    Week 15 removed the opposite arrangement — every document had its own code joined to
+    the front of the text before embedding, so the corpus carried a token no query ever
+    contains and the two sides were never in the same distribution.
     """
+    by_code: dict[str, dict[str, Any]] = {}
+    prefix = code_prefix(query)
+    if prefix is not None:
+        for row in session.execute(
+            _CODE_SQL,
+            {
+                "prefix": prefix,
+                "jurisdiction": jurisdiction,
+                "revision": revision,
+                "limit": limit,
+            },
+        ).mappings():
+            by_code[row["code"]] = dict(row)
+
     lexical: dict[str, dict[str, Any]] = {}
     for row in session.execute(
         _LEXICAL_SQL,
@@ -259,7 +342,9 @@ def search_tariff(
                 vector[row["code"]] = dict(row)
 
     method = (
-        "hybrid"
+        "code"
+        if by_code
+        else "hybrid"
         if lexical and vector
         else "lexical"
         if lexical
@@ -267,8 +352,15 @@ def search_tariff(
         if vector
         else "lexical"
     )
-    hits = _merge(lexical, vector, confirmation_lexical_floor)
-    hits.sort(key=lambda h: h.score, reverse=True)
+    hits = _merge(lexical, vector, confirmation_lexical_floor, by_code)
+    # Score first, then the code itself. Every code hit scores exactly CODE_SCORE, so
+    # without a tiebreak a prefix lookup would return its lines in whatever order a set
+    # iterated — a different ranking for the same query on the same corpus. Shorter codes
+    # first puts the subheading ahead of its ten-digit statistical suffixes, which is the
+    # order `_CODE_SQL` already asks the database for and the order an analyst who typed
+    # six digits means. A stored classification has to be reproducible years later, and
+    # that starts with the same query returning the same first row twice.
+    hits.sort(key=lambda h: (-h.score, len(h.code), h.code))
     return hits[:limit], method
 
 
@@ -276,25 +368,34 @@ def _merge(
     lexical: dict[str, dict[str, Any]],
     vector: dict[str, dict[str, Any]],
     confirmation_lexical_floor: float = CONFIRMATION_LEXICAL_FLOOR,
+    by_code: dict[str, dict[str, Any]] | None = None,
 ) -> list[TariffHit]:
-    """Combine the two paths into one ranked list.
+    """Combine the paths into one ranked list.
 
     Cosine distance is inverted to a similarity so the two scores point the same way
     before they are weighted; a hit found by only one path keeps that path's score
     rather than being penalised for the other's silence.
+
+    A code hit is not a third similarity to be blended in. It takes `CODE_SCORE` outright
+    and its row supplies the description, because the caller named this line and there is
+    nothing to weigh it against — a lookup that came back second to a paraphrase would be
+    the search overruling its user.
     """
+    by_code = by_code or {}
     hits: list[TariffHit] = []
-    for code in set(lexical) | set(vector):
+    for code in set(lexical) | set(vector) | set(by_code):
         lex_row = lexical.get(code)
         vec_row = vector.get(code)
-        row = lex_row or vec_row
+        row = by_code.get(code) or lex_row or vec_row
         assert row is not None
 
         lex_score = float(lex_row["lex"]) if lex_row else None
         distance = float(vec_row["dist"]) if vec_row else None
         vec_score = (1.0 - distance) if distance is not None else None
 
-        if lex_score is not None and vec_score is not None:
+        if code in by_code:
+            score = CODE_SCORE
+        elif lex_score is not None and vec_score is not None:
             score = LEXICAL_WEIGHT * lex_score + VECTOR_WEIGHT * vec_score
         else:
             score = lex_score if lex_score is not None else (vec_score or 0.0)
@@ -311,6 +412,7 @@ def _merge(
                 score=score,
                 lexical_score=lex_score,
                 vector_distance=distance,
+                code_matched=code in by_code,
                 confirmation_lexical_floor=confirmation_lexical_floor,
             )
         )

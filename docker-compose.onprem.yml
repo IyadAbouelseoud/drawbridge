@@ -16,7 +16,9 @@
 #
 # **No source is mounted.** Development bind-mounts ./services so uvicorn can reload. Here
 # the code is what was built into the image, so what is deployed is a thing with a digest
-# rather than whatever is checked out on the host.
+# rather than whatever is checked out on the host. Every third-party image carries its
+# digest for the same reason: `n8nio/n8n:1.70.1` is a name its publisher can repoint, and a
+# stack that re-pulls on restart is a stack whose contents changed without a commit.
 #
 # **Nothing is published except the ingress.** Development exposes Postgres on 5432, MinIO
 # on 9000, Jaeger on 16686 and five MCP servers on 8101-8105, which is convenient on a
@@ -54,9 +56,17 @@
 # - **It takes no backups.** `postgres-data` is a volume on one host. The retention
 #   obligation under 19 CFR 163 and GCC Art. 175 is years, and a volume is not a backup.
 #   That job is not written and is on the roadmap.
-# - **It pins tags, not digests.** `postgres:16.6` is reproducible until it is retyped.
-#   `docker compose pull && docker image inspect --format '{{index .RepoDigests 0}}'` gives
-#   the digests; a deployment that has been through change control should carry them here.
+# - **It cannot verify its own images.** Every third-party image is pinned to a SHA-256
+#   digest, so `docker pull` fetches identical bytes or fails — but a digest says the bytes
+#   did not change, not that they were trustworthy when they were recorded. Signature
+#   verification (cosign, or a registry policy) is the control that answers that, and it is
+#   not here. Refresh the digests with `make pin-images`, which resolves each tag against
+#   the registry and rewrites this file; the diff is then something a person reviews.
+#
+#   Note that a digest and a tag together mean *the digest*: Docker resolves the digest and
+#   ignores the tag, so the tag beside each one is documentation for the reader and is not
+#   load-bearing. That is deliberate — `redis@sha256:ff02b5...` alone tells nobody what it
+#   is, and a digest nobody can read is a digest nobody checks.
 # - **Vault runs in dev mode in the `bootstrap` profile only.** The default is an external
 #   Vault the broker already operates. See the `vault` service.
 #
@@ -109,6 +119,7 @@ x-python-onprem: &python-onprem
     DRAWBRIDGE_S3_ACCESS_KEY: ${DRAWBRIDGE_S3_ACCESS_KEY:-drawbridge}
     DRAWBRIDGE_S3_BUCKET_DOCUMENTS: drawbridge-documents
     DRAWBRIDGE_S3_BUCKET_ARCHIVE: drawbridge-archive
+    DRAWBRIDGE_S3_BUCKET_BACKUPS: drawbridge-backups
 
     DRAWBRIDGE_OTEL_EXPORTER_ENDPOINT: http://jaeger:4318
 
@@ -159,7 +170,7 @@ services:
   # one TLS endpoint with an audit log.
   caddy:
     <<: *hardening
-    image: caddy:2.8-alpine
+    image: caddy:2.8-alpine@sha256:af32e97399febea808609119bb21544d0265c58a02836576e32a2d082c262c17
     # Caddy writes its certificate store and needs to bind 443. `read_only` is off here
     # for the certificate store and NET_BIND_SERVICE is added back for the port; both are
     # the minimum this container cannot do without.
@@ -184,16 +195,16 @@ services:
   # ---------------------------------------------------------------- data plane
   postgres:
     <<: *hardening
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
     # The owner password reaches Postgres as a file rather than as `POSTGRES_PASSWORD`,
     # so it is not in `docker inspect` and not inherited by the initdb scripts' children.
     environment:
       POSTGRES_USER: drawbridge
-      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_PASSWORD_FILE: /vault/render/postgres/postgres_password
       POSTGRES_DB: drawbridge
       POSTGRES_INITDB_ARGS: "--data-checksums"
-    secrets: [postgres_password]
     volumes:
+      - render-postgres:/vault/render/postgres:ro
       - postgres-data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
     healthcheck:
@@ -202,13 +213,15 @@ services:
       timeout: 5s
       retries: 10
     networks: [data]
+    depends_on:
+      vault-agent: { condition: service_healthy }
     deploy:
       resources:
         limits: { cpus: "4.0", memory: 4G }
 
   redis:
     <<: [*hardening, *small]
-    image: redis:7.4-alpine
+    image: redis:7.4-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
     volumes: [redis-data:/data]
     healthcheck:
@@ -220,46 +233,60 @@ services:
 
   minio:
     <<: *hardening
-    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    image: minio/minio:RELEASE.2024-11-07T00-52-20Z@sha256:ac591851803a79aee64bc37f66d77c56b0a4b6e12d9e5356380f4105510f2332
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      MINIO_ROOT_USER_FILE: /run/secrets/minio_root_user
-      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_password
+      MINIO_ROOT_USER_FILE: /vault/render/minio/minio_root_user
+      MINIO_ROOT_PASSWORD_FILE: /vault/render/minio/minio_root_password
       # No console on a deployment nobody logs into interactively. The bucket layout is
       # created by minio-init below and changed by a migration, not by a person clicking.
       MINIO_BROWSER: "off"
-    secrets: [minio_root_user, minio_root_password]
-    volumes: [minio-data:/data]
+    volumes:
+      - render-minio:/vault/render/minio:ro
+      - minio-data:/data
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 15s
       timeout: 5s
       retries: 10
     networks: [data]
+    depends_on:
+      vault-agent: { condition: service_healthy }
     deploy:
       resources:
         limits: { cpus: "2.0", memory: 2G }
 
   minio-init:
     <<: [*hardening, *small]
-    image: minio/mc:RELEASE.2024-11-05T11-29-45Z
+    image: minio/mc:RELEASE.2024-11-05T11-29-45Z@sha256:ba8af71554963bb6ad5c4301ff3d82176e96f0b0c7595047da989cacfae83682
     restart: "no"
     depends_on:
       minio: { condition: service_healthy }
-    secrets: [minio_root_user, minio_root_password]
+    volumes:
+      - render-minio:/vault/render/minio:ro
     entrypoint:
       - /bin/sh
       - -c
       - |
         set -e
-        mc alias set local http://minio:9000 "$$(cat /run/secrets/minio_root_user)" "$$(cat /run/secrets/minio_root_password)"
+        mc alias set local http://minio:9000 "$$(cat /vault/render/minio/minio_root_user)" "$$(cat /vault/render/minio/minio_root_password)"
         mc mb --ignore-existing local/drawbridge-documents
         mc mb --ignore-existing local/drawbridge-archive
         mc version enable local/drawbridge-documents
         mc version enable local/drawbridge-archive
         # Object lock is what makes "immutable" true rather than aspirational: with
         # versioning alone, a credential that can write can also delete every version.
-        echo "buckets ready — versioned, and a correction writes a new object"
+        # It cannot be turned on after the fact — a bucket is created locked or is not
+        # locked — which is why the backup bucket is created separately and with the flag,
+        # and why `--ignore-existing` on a bucket made before week 15 leaves an unlocked
+        # one in place. retention.py's put_object fails loudly in that case rather than
+        # writing a deletable backup that reads as an immutable one.
+        mc mb --ignore-existing --with-lock local/drawbridge-backups
+        mc version enable local/drawbridge-backups
+        # No lifecycle expiry on the backup bucket. Retention is set per object by
+        # retention.py from the statutory obligation, and a bucket-level rule would be a
+        # second, quieter answer to "how long is this kept".
+        echo "buckets ready — versioned; backups locked, and a correction writes a new object"
     networks: [data]
 
   # -------------------------------------------------------------------- secrets
@@ -269,7 +296,7 @@ services:
   # the command line. Do not run a pilot on it — a restart loses every secret.
   vault:
     <<: [*hardening, *small]
-    image: hashicorp/vault:1.15
+    image: hashicorp/vault:1.15@sha256:0450896c43b13879b19442b204ce29dd19b5a10fce43d5cf38af17da20f56f4d
     profiles: [bootstrap]
     command: ["server", "-dev"]
     cap_add: [IPC_LOCK]
@@ -283,30 +310,101 @@ services:
       retries: 10
     networks: [data]
 
+  # Vault Agent — what removed ./secrets.
+  #
+  # Six credentials in this deployment are read by images we did not write. Postgres,
+  # MinIO and n8n take a password from a file and cannot be taught to call a manager, so
+  # until week 15 there were six plaintext files on the host next to this compose file:
+  # a second copy of every credential, living as long as the disk, rotated by nobody, and
+  # swept up by whatever backs the host up.
+  #
+  # This logs in with its own AppRole, renders the six values into four tmpfs volumes and
+  # keeps them current. Nothing lands on the host filesystem. One credential still has to
+  # arrive from outside — the AppRole's own secret_id, which is the chicken-and-egg every
+  # secrets manager has — and it comes from the environment rather than from a file, so
+  # the directory is gone rather than smaller.
+  #
+  # It reads a *different Vault path* from the API. `secret/drawbridge` is the
+  # application's; `secret/drawbridge-infra` is this one's, and they are disjoint. The API
+  # process has no business being able to read the Postgres owner password or the n8n
+  # encryption key, and it could not before this file existed — a move into a manager that
+  # quietly merged the two would be a downgrade wearing a manager's name.
+  vault-agent:
+    <<: [*hardening, *small]
+    image: hashicorp/vault:1.15@sha256:0450896c43b13879b19442b204ce29dd19b5a10fce43d5cf38af17da20f56f4d
+    # The agent needs to lock its memory so a rendered secret cannot be paged to disk,
+    # which is the one capability it genuinely cannot do without and the reason `cap_drop:
+    # [ALL]` above is followed by exactly one `cap_add`.
+    cap_add: [IPC_LOCK]
+    read_only: true
+    command: ["vault", "agent", "-config=/vault/config/agent.hcl"]
+    environment:
+      VAULT_ADDR: ${VAULT_ADDR:?set VAULT_ADDR}
+      # Interpolated by the templates, so one config file works against the bootstrap
+      # Vault and against the broker's own.
+      DRAWBRIDGE_VAULT_MOUNT: ${DRAWBRIDGE_VAULT_MOUNT:-secret}
+      DRAWBRIDGE_VAULT_INFRA_PATH: ${DRAWBRIDGE_VAULT_INFRA_PATH:-drawbridge-infra}
+    secrets: [vault_agent_role_id, vault_agent_secret_id]
+    tmpfs: ["/run/vault-agent:size=1m,mode=0700", "/home/vault:size=1m"]
+    volumes:
+      - ./infra/vault-agent/agent.hcl:/vault/config/agent.hcl:ro
+      - ./infra/vault-agent/templates:/vault/templates:ro
+      - render-postgres:/vault/render/postgres
+      - render-authentik:/vault/render/authentik
+      - render-minio:/vault/render/minio
+      - render-n8n:/vault/render/n8n
+    # Every consumer waits on this healthcheck, so it has to mean "the credentials are
+    # there and are credentials" rather than "the process is up". consul-template renders
+    # a missing key as the literal `<no value>`, which would otherwise reach Postgres as
+    # a password and fail as a wrong password rather than as a missing secret.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          for f in /vault/render/postgres/postgres_password \
+                   /vault/render/authentik/postgres_password \
+                   /vault/render/authentik/authentik_secret_key \
+                   /vault/render/minio/minio_root_user \
+                   /vault/render/minio/minio_root_password \
+                   /vault/render/n8n/postgres_password \
+                   /vault/render/n8n/n8n_encryption_key \
+                   /vault/render/n8n/service_token; do
+            [ -s "$$f" ] || exit 1
+            grep -q '<no value>' "$$f" && exit 1
+          done
+          exit 0
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks: [data]
+
   # ------------------------------------------------------------------- identity
   # Not behind a profile here. In development Authentik is optional because the API falls
   # back to a shared secret; on-prem there is no fallback, so the identity provider is
   # part of the deployment rather than an add-on to it.
   authentik-server:
     <<: *hardening
-    image: ghcr.io/goauthentik/server:2025.2
+    image: ghcr.io/goauthentik/server:2025.2@sha256:36233579415aa2e2e52a6b0c45736cb871fe71460bfe0cf95d83f67528fb1182
     command: server
     environment: &authentik-env
       AUTHENTIK_POSTGRESQL__HOST: postgres
       AUTHENTIK_POSTGRESQL__NAME: authentik
       AUTHENTIK_POSTGRESQL__USER: drawbridge
-      AUTHENTIK_POSTGRESQL__PASSWORD_FILE: /run/secrets/postgres_password
+      AUTHENTIK_POSTGRESQL__PASSWORD_FILE: /vault/render/authentik/postgres_password
       AUTHENTIK_REDIS__HOST: redis
       AUTHENTIK_REDIS__DB: 1
-      AUTHENTIK_SECRET_KEY_FILE: /run/secrets/authentik_secret_key
+      AUTHENTIK_SECRET_KEY_FILE: /vault/render/authentik/authentik_secret_key
       AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
       AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
       AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
-    secrets: [postgres_password, authentik_secret_key]
-    volumes: [authentik-media:/media]
+    volumes:
+      - render-authentik:/vault/render/authentik:ro
+      - authentik-media:/media
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      vault-agent: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "ak", "healthcheck"]
       interval: 30s
@@ -320,14 +418,16 @@ services:
 
   authentik-worker:
     <<: *hardening
-    image: ghcr.io/goauthentik/server:2025.2
+    image: ghcr.io/goauthentik/server:2025.2@sha256:36233579415aa2e2e52a6b0c45736cb871fe71460bfe0cf95d83f67528fb1182
     command: worker
     environment: *authentik-env
-    secrets: [postgres_password, authentik_secret_key]
-    volumes: [authentik-media:/media]
+    volumes:
+      - render-authentik:/vault/render/authentik:ro
+      - authentik-media:/media
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      vault-agent: { condition: service_healthy }
     networks: [edge, data]
     deploy:
       resources:
@@ -336,7 +436,7 @@ services:
   # -------------------------------------------------------------- observability
   jaeger:
     <<: *hardening
-    image: jaegertracing/all-in-one:1.62.0
+    image: jaegertracing/all-in-one:1.62.0@sha256:836e9b69c88afbedf7683ea7162e179de63b1f981662e83f5ebb68badadc710f
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     # No UI port. Traces are an hour of debugging; what has to survive four years is in
@@ -349,28 +449,37 @@ services:
   # ------------------------------------------------------------- orchestration
   n8n:
     <<: *hardening
-    image: n8nio/n8n:1.70.1
+    image: n8nio/n8n:1.70.1@sha256:6f9d7b46c1e7299a71aebdc31ae9928395fd2c2d8d9b459b1ae6f75c2b1f0d25
     read_only: false  # n8n writes its own config and task runner state under ~/.n8n
     environment:
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_DATABASE: n8n
       DB_POSTGRESDB_USER: drawbridge
-      DB_POSTGRESDB_PASSWORD_FILE: /run/secrets/postgres_password
+      DB_POSTGRESDB_PASSWORD_FILE: /vault/render/n8n/postgres_password
       N8N_PORT: 5678
-      N8N_ENCRYPTION_KEY_FILE: /run/secrets/n8n_encryption_key
+      N8N_ENCRYPTION_KEY_FILE: /vault/render/n8n/n8n_encryption_key
       N8N_DIAGNOSTICS_ENABLED: "false"
+      # n8n 2.x blocks `$env` inside nodes by default, and the workflows read the
+      # service token that way. Left at the default, every API call in the pipeline
+      # goes out with `Bearer ` and an empty token: the first live run logged
+      # "access to env vars denied" and would have failed on 401 at the first node
+      # that reached the API. Scoped rather than opened wide — the allowlist below
+      # is the only variable a workflow may read.
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      N8N_VARS_ALLOWLIST: DRAWBRIDGE_SERVICE_TOKEN
       N8N_HIRING_BANNER_ENABLED: "false"
       GENERIC_TIMEZONE: ${DRAWBRIDGE_TIMEZONE:-UTC}
       # Cross-tenant by design: one workflow runs whichever tenant its trigger names.
       # This is the most valuable secret in the deployment; see services/api/src/auth.py.
-      DRAWBRIDGE_SERVICE_TOKEN_FILE: /run/secrets/service_token
-    secrets: [postgres_password, n8n_encryption_key, service_token]
+      DRAWBRIDGE_SERVICE_TOKEN_FILE: /vault/render/n8n/service_token
     volumes:
+      - render-n8n:/vault/render/n8n:ro
       - n8n-data:/home/node/.n8n
       - ./n8n/workflows:/workflows:ro
     depends_on:
       postgres: { condition: service_healthy }
+      vault-agent: { condition: service_healthy }
     networks: [edge, data]
     deploy:
       resources:
@@ -432,6 +541,42 @@ services:
     deploy:
       resources:
         limits: { cpus: "2.0", memory: 2G }
+
+  # The retention job: a nightly pg_dump into object-locked storage, and the ledger's
+  # hash chain recomputed hourly. Weeks 10 through 14 each closed with the same sentence —
+  # `postgres-data` is a volume on one host and a volume is not a backup. This is it.
+  #
+  # It connects as the **owner**, which is the one place in this deployment that is
+  # correct rather than a shortcut. `pg_dump` of a database under row-level security run
+  # as `drawbridge_app` silently produces a dump of the rows that role can see, which is
+  # none of them: a backup that restores to an empty database and reports success. The
+  # ledger verification has the same shape — "is the chain intact" cannot be answered by a
+  # connection that can only see one tenant.
+  #
+  # Its own image because of `pg_dump`; see services/backup/Dockerfile.
+  backup:
+    <<: [*hardening, *small]
+    image: drawbridge/backup:${DRAWBRIDGE_VERSION:?set DRAWBRIDGE_VERSION}
+    read_only: true
+    # The dump is written here before it is hashed and uploaded, so this has to be big
+    # enough to hold one compressed dump of the whole database. It is a tmpfs: a backup
+    # of a customs record set should not be left on the host's disk after it has been
+    # stored somewhere with a retention lock on it.
+    tmpfs: ["/tmp:size=${DRAWBRIDGE_BACKUP_TMP_SIZE:-4g},mode=1777"]
+    environment:
+      <<: *python-env
+      DRAWBRIDGE_OWNER_DATABASE_URL: postgresql+psycopg://drawbridge:@postgres:5432/drawbridge
+      # Five years, from 19 CFR 163.4 and GCC Art. 175. Raising it is safe; lowering it
+      # does nothing to objects already written, because that is what COMPLIANCE mode is.
+      DRAWBRIDGE_BACKUP_RETENTION_DAYS: ${DRAWBRIDGE_BACKUP_RETENTION_DAYS:-1830}
+    networks: [data]
+    depends_on:
+      postgres: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+      migrate: { condition: service_completed_successfully }
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 1G }
 
   # ---------------------------------------------------------------- MCP plane
   mcp-ace:
@@ -512,21 +657,44 @@ services:
 # These files must exist on the host with mode 0400. `infra/vault_bootstrap.py` does not
 # write them: a secret that Vault holds and a file on the deployment host are two copies,
 # and the point of the file is that these three images cannot be taught to read Vault.
+# Two values, and neither is on the host filesystem. Everything that used to be here now
+# lives in Vault and reaches its container through vault-agent.
+#
+# These two are the bootstrap credential — the one thing a secrets manager cannot hand you,
+# because it is what you use to ask it for things. `environment:` rather than `file:` so
+# ./secrets does not exist at all; Docker still delivers the value as a file on a tmpfs
+# inside the container, so it stays out of `docker inspect` and out of the process
+# environment where a crash dump or a child process would find it.
+#
+# role_id is configuration and may be committed. secret_id is a credential, is revocable,
+# and is what `python infra/vault_bootstrap.py --infra --rotate` reissues.
 secrets:
-  postgres_password:
-    file: ./secrets/postgres_password
-  minio_root_user:
-    file: ./secrets/minio_root_user
-  minio_root_password:
-    file: ./secrets/minio_root_password
-  authentik_secret_key:
-    file: ./secrets/authentik_secret_key
-  n8n_encryption_key:
-    file: ./secrets/n8n_encryption_key
-  service_token:
-    file: ./secrets/service_token
+  vault_agent_role_id:
+    environment: DRAWBRIDGE_VAULT_AGENT_ROLE_ID
+  vault_agent_secret_id:
+    environment: DRAWBRIDGE_VAULT_AGENT_SECRET_ID
 
 volumes:
+  # Rendered credentials, one volume per consumer group, all four in RAM. `tmpfs` is the
+  # whole point: a credential that never touches a disk cannot be recovered from one, and
+  # a host restart leaves nothing behind for the next boot to pick up stale.
+  #
+  # Per group rather than one shared mount, because a rendered secret should be reachable
+  # by the containers that need it and no others. Postgres has no reason to be able to
+  # read the n8n encryption key, and one volume for everything would have given it that
+  # for the sake of four fewer lines.
+  #
+  # The files are mode 0644 inside these mounts. That is not weaker than what it replaced
+  # — Docker mounts its own secrets 0444 — and the isolation doing the work here is the
+  # volume boundary, not the file mode: every process inside a consumer container runs as
+  # that service anyway.
+  render-postgres: &render
+    driver: local
+    driver_opts: { type: tmpfs, device: tmpfs, o: "size=1m" }
+  render-authentik: *render
+  render-minio: *render
+  render-n8n: *render
+
   postgres-data:
   redis-data:
   minio-data:

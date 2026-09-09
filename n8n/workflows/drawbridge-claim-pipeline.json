@@ -1,4 +1,5 @@
 {
+  "id": "drawbridgeClaim1",
   "name": "drawbridge-claim-pipeline",
   "meta": {
     "description": "Ingest -> extract -> classify -> match -> triage -> persist -> approve or suspend -> package. The Postgres claim state machine is authoritative; this workflow fires transitions and never holds business state (docs/ARCHITECTURE.md section 4)."
@@ -6,7 +7,7 @@
   "settings": {
     "executionOrder": "v1",
     "saveManualExecutions": true,
-    "errorWorkflow": "drawbridge-pipeline-error"
+    "errorWorkflow": "drawbridgeError1"
   },
   "nodes": [
     {
@@ -28,7 +29,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Fail fast on a malformed batch. A claim reaching the matcher without its jurisdiction\n// would be matched under whichever statute happens to be the default, which is exactly\n// the failure that looks plausible all the way to a filing.\n//\n// `claimant` is required here rather than at the packaging step because that step runs\n// twenty minutes and one analyst decision later, and discovering then that the filing\n// identity was never supplied means the run is lost, not delayed.\nconst b = $input.first().json;\nconst REQUIRED = ['tenant_id', 'jurisdiction', 'documents', 'imports', 'exports', 'claimant'];\nfor (const f of REQUIRED) {\n  if (!b[f]) throw new Error('ingest payload missing required field: ' + f);\n}\nif (!['us', 'ksa'].includes(b.jurisdiction)) {\n  throw new Error('unknown jurisdiction: ' + b.jurisdiction);\n}\nif (!b.imports.length || !b.exports.length) {\n  throw new Error('a claim needs at least one import line and one export line');\n}\nreturn [{ json: Object.assign({}, b, {\n  as_of: b.as_of || new Date().toISOString().slice(0, 10),\n}) }];"
+        "jsCode": "// Fail fast on a malformed batch. A claim reaching the matcher without its jurisdiction\n// would be matched under whichever statute happens to be the default, which is exactly\n// the failure that looks plausible all the way to a filing.\n//\n// `claimant` is required here rather than at the packaging step because that step runs\n// twenty minutes and one analyst decision later, and discovering then that the filing\n// identity was never supplied means the run is lost, not delayed.\n// The Webhook node hands on the whole HTTP request — { headers, params, query, body } —\n// not the body. Every node after this one reads the claim fields at the top level, so the\n// unwrap happens here, once, and this node returns the payload itself.\n//\n// Found by running it. The first live execution failed at this line with \"ingest payload\n// missing required field: tenant_id\" against a payload that had one: the field was at\n// `$json.body.tenant_id` and had been for as long as the workflow existed. The fallback to\n// `$json` is for `n8n execute` and the editor's \"test step\", which pass a bare object.\nconst b = $input.first().json.body || $input.first().json;\nconst REQUIRED = ['tenant_id', 'jurisdiction', 'documents', 'imports', 'exports', 'claimant'];\nfor (const f of REQUIRED) {\n  if (!b[f]) throw new Error('ingest payload missing required field: ' + f);\n}\nif (!['us', 'ksa'].includes(b.jurisdiction)) {\n  throw new Error('unknown jurisdiction: ' + b.jurisdiction);\n}\nif (!b.imports.length || !b.exports.length) {\n  throw new Error('a claim needs at least one import line and one export line');\n}\nreturn [{ json: Object.assign({}, b, {\n  as_of: b.as_of || new Date().toISOString().slice(0, 10),\n}) }];"
       },
       "id": "validate-payload",
       "name": "Validate Payload",
@@ -85,7 +86,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, documents: $json.stored.map(function (d) { return d.document_id; }) }) }}",
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').first().json.tenant_id, documents: $json.stored.map(function (d) { return d.document_id; }) }) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -131,7 +132,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ jurisdiction: $('Validate Payload').item.json.jurisdiction, lines: $('Validate Payload').item.json.imports.map(function (l) { return { line_id: l.line_id, description: l.description, declared_code: l.hts.code }; }) }) }}",
+        "jsonBody": "={{ JSON.stringify({ jurisdiction: $('Validate Payload').first().json.jurisdiction, lines: $('Validate Payload').first().json.imports.map(function (l) { return { line_id: l.line_id, description: l.description, declared_code: l.hts.code }; }) }) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -177,7 +178,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ jurisdiction: $('Validate Payload').item.json.jurisdiction, imports: $('Validate Payload').item.json.imports, exports: $('Validate Payload').item.json.exports, as_of: $('Validate Payload').item.json.as_of }) }}",
+        "jsonBody": "={{ JSON.stringify({ jurisdiction: $('Validate Payload').first().json.jurisdiction, imports: $('Validate Payload').first().json.imports, exports: $('Validate Payload').first().json.exports, as_of: $('Validate Payload').first().json.as_of }) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -210,7 +211,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ match_result: $json, confidences: $('Confidence Gate').item.json.confidences, as_of: $('Validate Payload').item.json.as_of }) }}",
+        "jsonBody": "={{ JSON.stringify({ match_result: $json, confidences: $('Confidence Gate').first().json.confidences, as_of: $('Validate Payload').first().json.as_of }) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -243,7 +244,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, jurisdiction: $('Validate Payload').item.json.jurisdiction, imports: $('Validate Payload').item.json.imports, exports: $('Validate Payload').item.json.exports, matches: $('Match').item.json.matches, total_refund: $('Match').item.json.total_refund, requires_review: $('Triage').item.json.requires_review }) }}",
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').first().json.tenant_id, jurisdiction: $('Validate Payload').first().json.jurisdiction, imports: $('Validate Payload').first().json.imports, exports: $('Validate Payload').first().json.exports, matches: $('Match').first().json.matches, total_refund: $('Match').first().json.total_refund, requires_review: $('Triage').first().json.requires_review }) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -275,10 +276,10 @@
               "id": "c1",
               "operator": {
                 "type": "boolean",
-                "operation": "true"
+                "operation": "true",
+                "singleValue": true
               },
-              "leftValue": "={{ $('Triage').item.json.requires_review }}",
-              "rightValue": ""
+              "leftValue": "={{ $('Triage').first().json.requires_review }}"
             }
           ],
           "combinator": "and"
@@ -307,7 +308,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').item.json.tenant_id, claim_id: $('Persist Claim').item.json.claim_id, workflow_run_id: $execution.id, items: $('Triage').item.json.items }) }}",
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').first().json.tenant_id, claim_id: $('Persist Claim').first().json.claim_id, workflow_run_id: String($execution.id), items: $('Triage').first().json.items }) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -330,7 +331,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://api:8000/review/draft?tenant_id={{ $('Validate Payload').item.json.tenant_id }}",
+        "url": "http://api:8000/review/draft?tenant_id={{ $('Validate Payload').first().json.tenant_id }}",
         "options": {
           "response": {
             "response": {
@@ -374,7 +375,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// An analyst may approve, correct, reject or defer. Only the first two continue; a\n// rejected claim stops here with its reason recorded rather than proceeding quietly.\n// A deferred one also stops \u2014 it is still open, and the dispatcher will bring it back.\nconst r = $input.first().json;\nconst proceed = ['approved', 'corrected'].indexOf(r.resolution) !== -1;\nreturn [{ json: Object.assign({}, r, {\n  halt: !proceed,\n  next_state: proceed ? 'approved' : 'rejected',\n}) }];"
+        "jsCode": "// An analyst may approve, correct, reject or defer. Only the first two continue; a\n// rejected claim stops here with its reason recorded rather than proceeding quietly.\n// A deferred one also stops — it is still open, and the dispatcher will bring it back.\nconst r = $input.first().json;\nconst proceed = ['approved', 'corrected'].indexOf(r.resolution) !== -1;\nreturn [{ json: Object.assign({}, r, {\n  halt: !proceed,\n  next_state: proceed ? 'approved' : 'rejected',\n}) }];"
       },
       "id": "apply-resolution",
       "name": "Apply Resolution",
@@ -397,10 +398,10 @@
               "id": "c1",
               "operator": {
                 "type": "boolean",
-                "operation": "false"
+                "operation": "false",
+                "singleValue": true
               },
-              "leftValue": "={{ $json.halt }}",
-              "rightValue": ""
+              "leftValue": "={{ $json.halt }}"
             }
           ],
           "combinator": "and"
@@ -429,7 +430,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, to_state: 'approved', actor: 'pipeline', reason: 'pipeline run ' + $execution.id }) }}",
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').first().json.claim_id, to_state: 'approved', actor: 'pipeline', reason: 'pipeline run ' + $execution.id }) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -462,7 +463,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, to_state: 'rejected', actor: 'analyst', reason: $('Apply Resolution').item.json.resolution_note || 'analyst did not approve' }) }}",
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').first().json.claim_id, to_state: 'rejected', actor: 'analyst', reason: $('Apply Resolution').first().json.resolution_note || 'analyst did not approve' }) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -495,7 +496,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, claimant: $('Validate Payload').item.json.claimant, include_artifacts: false }) }}",
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').first().json.claim_id, claimant: $('Validate Payload').first().json.claimant, include_artifacts: false }) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -528,7 +529,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, to_state: 'packaged', actor: 'pipeline', reason: 'packet rendered by run ' + $execution.id }) }}",
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').first().json.claim_id, to_state: 'packaged', actor: 'pipeline', reason: 'packet rendered by run ' + $execution.id }) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -551,7 +552,7 @@
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, state: $json.state, refund: $('Persist Claim').item.json.total_refund, transmittable: $('Build Packet').item.json.transmittable, artifacts: $('Build Packet').item.json.manifest.artifacts }) }}",
+        "responseBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').first().json.claim_id, state: $json.state, refund: $('Persist Claim').first().json.total_refund, transmittable: $('Build Packet').first().json.transmittable, artifacts: $('Build Packet').first().json.manifest.artifacts }) }}",
         "options": {}
       },
       "id": "respond",
@@ -566,7 +567,7 @@
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').item.json.claim_id, state: 'rejected', resolution: $('Apply Resolution').item.json.resolution }) }}",
+        "responseBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').first().json.claim_id, state: 'rejected', resolution: $('Apply Resolution').first().json.resolution }) }}",
         "options": {}
       },
       "id": "respond-halted",
@@ -815,13 +816,5 @@
       ]
     }
   },
-  "pinData": {},
-  "tags": [
-    {
-      "name": "drawbridge"
-    },
-    {
-      "name": "pipeline"
-    }
-  ]
+  "pinData": {}
 }

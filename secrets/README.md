@@ -1,49 +1,67 @@
-# `./secrets` — the six files the on-prem deployment reads directly
+# `./secrets` — gone as of week 15
 
-Everything Drawbridge's own services need comes from Vault. These six exist because three
-images we did not write — Postgres, MinIO and n8n — read credentials from a file or from
-the environment and cannot be taught to call a secrets manager. A file is the better of
-the two: it is not in `docker inspect`, not inherited by child processes, and not in
-`/proc/<pid>/environ`.
+This directory used to hold six plaintext credentials, because three images we did not
+write — Postgres, MinIO and n8n — read their passwords from a file and cannot be taught to
+call a secrets manager. It was the honest arrangement available at the time and it was
+still two copies of every credential: one in Vault, one on the host's disk, living as long
+as the disk, rotated by nobody, and swept up by whatever backs the host up.
 
-The directory is gitignored except for this file. Nothing here is committed, ever.
-
-| File | Read by | Notes |
-|---|---|---|
-| `postgres_password` | postgres, authentik, n8n | the **owner** role's password |
-| `minio_root_user` | minio, minio-init | |
-| `minio_root_password` | minio, minio-init | |
-| `authentik_secret_key` | authentik server and worker | rotating it invalidates every session |
-| `n8n_encryption_key` | n8n | rotating it makes stored workflow credentials unreadable |
-| `service_token` | n8n | cross-tenant; the most valuable credential in the deployment |
-
-## Creating them
+**Nothing goes here now. If these files exist on a deployment, delete them.**
 
 ```sh
-mkdir -p secrets && cd secrets
-for f in postgres_password minio_root_user minio_root_password \
-         authentik_secret_key n8n_encryption_key; do
-  head -c 32 /dev/urandom | base64 | tr -d '\n=+/' > "$f"
-done
-chmod 400 *
+shred -u secrets/postgres_password secrets/minio_root_user secrets/minio_root_password \
+        secrets/authentik_secret_key secrets/n8n_encryption_key secrets/service_token
 ```
 
-`service_token` is not random — it is a JWT the API's own issuer signs. Mint it with
-`scripts/mint_token.py --service` against the deployment's identity provider and write the
-output here.
+## What replaced them
 
-**No trailing newline.** Postgres and MinIO read the file verbatim, so a newline becomes
-part of the password and the failure looks like a wrong password rather than a wrong file.
-`printf '%s' "$value" > secrets/postgres_password` if you are pasting one in.
+`vault-agent`, a sidecar in `docker-compose.onprem.yml`. It logs in with its own AppRole,
+renders the six values into four tmpfs volumes, and keeps them current. The host filesystem
+never holds them; a host restart leaves nothing behind.
 
-Mode `0400`, owned by the user the Docker daemon runs as. Docker copies the contents into
-a tmpfs inside the container at `/run/secrets/<name>`; the host file is the durable copy
-and is the one that has to be protected.
+| What | Where |
+|---|---|
+| The sidecar's config and templates | `infra/vault-agent/` |
+| The Vault path, policy and role | `python infra/vault_bootstrap.py --infra` |
+| Which consumer sees which file | one tmpfs volume per consumer group, `docker-compose.onprem.yml` |
 
-## These are duplicates, and that is the trade
+**A different path and a different role from the API's.** The application reads
+`secret/drawbridge`; vault-agent reads `secret/drawbridge-infra`, and the two policies are
+disjoint. That separation existed by accident before — the API could not read the Postgres
+owner password because it was not in `.secrets.json` — and moving the credentials into a
+manager had to preserve it or the move would have been a downgrade with a better name.
+Verified against a live Vault: the infra role is denied both `secret/drawbridge` and `list`
+on the mount.
 
-The same values are in Vault, where the application reads them from. Two copies of a
-secret is worse than one, and it is the price of running three images that cannot read a
-manager. The alternative is a sidecar that templates them out of Vault at start
-(`vault agent`), which removes the durable copy and adds a process to every one of those
-three containers. That is the right end state and it is not built.
+## The one credential that cannot come from the manager
+
+`DRAWBRIDGE_VAULT_AGENT_SECRET_ID`, because it is what you use to ask the manager for
+things. It arrives through the environment as a Docker secret sourced with
+`environment:` rather than `file:`, so it is delivered to the container on a tmpfs and this
+directory does not need to exist. `role_id` is configuration and may be committed;
+`secret_id` is the credential, is revocable, and is reissued by
+`python infra/vault_bootstrap.py --infra --rotate`.
+
+## Rotation, and what it costs
+
+Rotation is deliberate: write the new value to Vault, then restart the consumer. Nothing
+automates it, and `infra/vault-agent/agent.hcl` deliberately declares no `command` on its
+templates — Postgres reads its password once at initdb and MinIO reads its root credentials
+at start, so a template that rewrote the file and signalled the process would change the
+file and not the credential in force. A rendered file that disagrees with what the service
+is actually using is worse than a stale one you know is stale.
+
+Three of the six do not survive rotation quietly:
+
+| Secret | What rotating it breaks |
+|---|---|
+| `postgres_password` | the owner role's password; `ALTER ROLE` it in the same maintenance window |
+| `authentik_secret_key` | every stored session, and every user is logged out |
+| `n8n_encryption_key` | every credential stored inside n8n becomes unreadable |
+
+`python infra/vault_bootstrap.py --infra` is safe to re-run for exactly this reason: it
+generates only what is missing and never replaces a value already in force.
+
+`service_token` is not generated at all — it is a JWT the identity provider signs. Mint it
+with `scripts/mint_token.py --service` and pass it as `--service-token`, or leave it and
+Vault keeps the one it has.

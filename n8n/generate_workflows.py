@@ -38,6 +38,48 @@ def node(
     return result
 
 
+#: Every call this workflow makes to the API carries the service token, and it is applied
+#: here rather than per node.
+#:
+#: Week 12 made the token decide the tenant and added this header to the three generated
+#: JSON files by hand, without touching this generator. It went unnoticed for three commits
+#: because nobody ran the generator: regenerating would have silently stripped the bearer
+#: token from all eight API calls, and the pipeline would have started failing on 401 with
+#: a diff that looked like formatting. A header applied in one place cannot be forgotten
+#: from one node, which is the actual fix — the original defect was not the missing lines,
+#: it was that they were per-node lines at all.
+#:
+#: `$env` rather than an n8n credential: the token is mounted into the container by the
+#: deployment (`DRAWBRIDGE_SERVICE_TOKEN_FILE` on-prem), so it rotates with a restart and
+#: never enters n8n's own encrypted credential store, where it would be a second copy with
+#: its own lifecycle and its own encryption key to lose.
+_AUTH_HEADER = {
+    "sendHeaders": True,
+    "headerParameters": {
+        "parameters": [
+            {"name": "Authorization", "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"}
+        ]
+    },
+}
+
+
+#: Cross-node references use `$('Node').first().json`, never `$('Node').item.json`.
+#:
+#: `.item` resolves through n8n's *item pairing* — it answers "the input item that produced
+#: the item I am currently processing". Pairing survives a node that maps one item to one
+#: item and is lost across a Code node that builds a fresh array, which this pipeline does
+#: at every gate. When it is lost, `.item` does not raise: it yields undefined, and
+#: `JSON.stringify` then omits the key entirely, so the request goes out *missing a field*
+#: rather than carrying a wrong one.
+#:
+#: The first live run through n8n is what surfaced it. `/review/suspend` returned 422
+#: "Field required: body.tenant_id" against a payload whose tenant_id was present three
+#: nodes upstream, and `workflow_run_id` had picked up the workflow's name. Every node in
+#: this pipeline emits exactly one item — one claim per run — so `.first()` is not a
+#: workaround for the pairing, it is the accessor that matches what these nodes actually
+#: produce.
+
+
 def http(name: str, x: int, y: int, method: str, url: str, body: str | None = None) -> dict:
     params: dict = {
         "method": method,
@@ -46,6 +88,7 @@ def http(name: str, x: int, y: int, method: str, url: str, body: str | None = No
     }
     if body is not None:
         params |= {"sendBody": True, "specifyBody": "json", "jsonBody": body}
+    params |= _AUTH_HEADER
     return node(name, "n8n-nodes-base.httpRequest", x, y, params, tv=4.2)
 
 
@@ -54,11 +97,28 @@ def code(name: str, x: int, y: int, js: str) -> dict:
 
 
 def boolean_if(name: str, x: int, y: int, left: str, operation: str, right: str = "") -> dict:
+    """One condition, on one field.
+
+    `true` and `false` are *single-operand* operators and must say so. Without
+    `singleValue`, n8n still reads `rightValue` — which was the empty string — and a
+    version-2 If node refuses it: "Wrong type: '' is a string but was expecting a boolean
+    [condition 0, item 0]". The gate that decides whether a claim needs an analyst failed
+    on the shape of an operand it does not have. Found on the first live run that reached
+    it, eleven nodes deep.
+
+    `looseTypeValidation` stays off. Turning it on would have made this error disappear by
+    coercing whatever arrived, and the whole point of this node is to branch on a boolean
+    the API actually returned rather than on the truthiness of something.
+    """
+    single = operation in {"true", "false", "exists", "notExists", "empty", "notEmpty"}
     op = (
-        {"type": "boolean", "operation": operation}
+        {"type": "boolean", "operation": operation, "singleValue": True}
         if operation in {"true", "false"}
         else {"type": "string", "operation": operation}
     )
+    condition: dict = {"id": "c1", "operator": op, "leftValue": left}
+    if not single:
+        condition["rightValue"] = right
     return node(
         name,
         "n8n-nodes-base.if",
@@ -67,9 +127,7 @@ def boolean_if(name: str, x: int, y: int, left: str, operation: str, right: str 
         {
             "conditions": {
                 "options": {"caseSensitive": True, "version": 2},
-                "conditions": [
-                    {"id": "c1", "operator": op, "leftValue": left, "rightValue": right}
-                ],
+                "conditions": [condition],
                 "combinator": "and",
             },
             "options": {},
@@ -105,7 +163,15 @@ VALIDATE_JS = """
 // `claimant` is required here rather than at the packaging step because that step runs
 // twenty minutes and one analyst decision later, and discovering then that the filing
 // identity was never supplied means the run is lost, not delayed.
-const b = $input.first().json;
+// The Webhook node hands on the whole HTTP request — { headers, params, query, body } —
+// not the body. Every node after this one reads the claim fields at the top level, so the
+// unwrap happens here, once, and this node returns the payload itself.
+//
+// Found by running it. The first live execution failed at this line with "ingest payload
+// missing required field: tenant_id" against a payload that had one: the field was at
+// `$json.body.tenant_id` and had been for as long as the workflow existed. The fallback to
+// `$json` is for `n8n execute` and the editor's "test step", which pass a bare object.
+const b = $input.first().json.body || $input.first().json;
 const REQUIRED = ['tenant_id', 'jurisdiction', 'documents', 'imports', 'exports', 'claimant'];
 for (const f of REQUIRED) {
   if (!b[f]) throw new Error('ingest payload missing required field: ' + f);
@@ -220,6 +286,26 @@ return [{ json: {
 """
 
 
+#: Every workflow carries a stable `id` and no `tags`, and both halves of that were found
+#: by finally running `n8n import:workflow` — six weeks after these files were first
+#: written and validated as JSON.
+#:
+#: **The id.** Without one, n8n's importer inserts a NULL primary key and the import fails
+#: outright: `null value in column "id" of relation "workflow_entity"`. A stable id is
+#: also what makes a re-import an update rather than a second copy, which is the property
+#: a workflow definition kept in version control actually needs — otherwise every deploy
+#: leaves another inactive duplicate behind and the one that is running is whichever was
+#: activated last.
+#:
+#: **The tags.** All three carried `{"name": "drawbridge"}`. `tag_entity.name` is uniquely
+#: indexed, and the importer creates tags per workflow rather than reconciling them, so
+#: importing the directory failed on the second file with a duplicate key. Tags are how a
+#: person organises a workflow list in the n8n UI; they are not part of what the workflow
+#: does, and putting UI state in the artefact is what made the artefact un-importable.
+#:
+#: Validating that these files were JSON is what let this sit for six weeks. It is the
+#: same shape as the ruling scorer in week 14 and the embedding text this week: a check
+#: that passes on the artefact's form and never on its use.
 def pipeline() -> dict:
     """The closed loop: a document goes in, a filing packet comes out.
 
@@ -243,6 +329,7 @@ def pipeline() -> dict:
     work.
     """
     return {
+        "id": "drawbridgeClaim1",
         "name": "drawbridge-claim-pipeline",
         "meta": {
             "description": (
@@ -255,7 +342,13 @@ def pipeline() -> dict:
         "settings": {
             "executionOrder": "v1",
             "saveManualExecutions": True,
-            "errorWorkflow": "drawbridge-pipeline-error",
+            # By id, not by name. n8n resolves this field as a workflow id and the name
+            # here silently matched nothing: the first failing run logged "Could not find
+            # workflow \"drawbridge-pipeline-error\"" and the handler that exists to
+            # record a failed run did not run. An error handler that is never reached is
+            # worse than none, because the absence of an alert reads as the absence of a
+            # problem.
+            "errorWorkflow": "drawbridgeError1",
         },
         "nodes": [
             node(
@@ -288,7 +381,7 @@ def pipeline() -> dict:
                 "POST",
                 API + "/extraction/run",
                 "={{ JSON.stringify({ "
-                "tenant_id: $('Validate Payload').item.json.tenant_id, "
+                "tenant_id: $('Validate Payload').first().json.tenant_id, "
                 "documents: $json.stored.map(function (d) { return d.document_id; }) }) }}",
             ),
             code("Confidence Gate", -400, 300, CONFIDENCE_JS),
@@ -299,8 +392,8 @@ def pipeline() -> dict:
                 "POST",
                 API + "/classification/run",
                 "={{ JSON.stringify({ "
-                "jurisdiction: $('Validate Payload').item.json.jurisdiction, "
-                "lines: $('Validate Payload').item.json.imports.map(function (l) { "
+                "jurisdiction: $('Validate Payload').first().json.jurisdiction, "
+                "lines: $('Validate Payload').first().json.imports.map(function (l) { "
                 "return { line_id: l.line_id, description: l.description, "
                 "declared_code: l.hts.code }; }) }) }}",
             ),
@@ -312,10 +405,10 @@ def pipeline() -> dict:
                 "POST",
                 API + "/matching/run",
                 "={{ JSON.stringify({ "
-                "jurisdiction: $('Validate Payload').item.json.jurisdiction, "
-                "imports: $('Validate Payload').item.json.imports, "
-                "exports: $('Validate Payload').item.json.exports, "
-                "as_of: $('Validate Payload').item.json.as_of }) }}",
+                "jurisdiction: $('Validate Payload').first().json.jurisdiction, "
+                "imports: $('Validate Payload').first().json.imports, "
+                "exports: $('Validate Payload').first().json.exports, "
+                "as_of: $('Validate Payload').first().json.as_of }) }}",
             ),
             http(
                 "Triage",
@@ -324,8 +417,8 @@ def pipeline() -> dict:
                 "POST",
                 API + "/triage/evaluate",
                 "={{ JSON.stringify({ match_result: $json, "
-                "confidences: $('Confidence Gate').item.json.confidences, "
-                "as_of: $('Validate Payload').item.json.as_of }) }}",
+                "confidences: $('Confidence Gate').first().json.confidences, "
+                "as_of: $('Validate Payload').first().json.as_of }) }}",
             ),
             http(
                 "Persist Claim",
@@ -334,19 +427,19 @@ def pipeline() -> dict:
                 "POST",
                 API + "/claims/persist",
                 "={{ JSON.stringify({ "
-                "tenant_id: $('Validate Payload').item.json.tenant_id, "
-                "jurisdiction: $('Validate Payload').item.json.jurisdiction, "
-                "imports: $('Validate Payload').item.json.imports, "
-                "exports: $('Validate Payload').item.json.exports, "
-                "matches: $('Match').item.json.matches, "
-                "total_refund: $('Match').item.json.total_refund, "
-                "requires_review: $('Triage').item.json.requires_review }) }}",
+                "tenant_id: $('Validate Payload').first().json.tenant_id, "
+                "jurisdiction: $('Validate Payload').first().json.jurisdiction, "
+                "imports: $('Validate Payload').first().json.imports, "
+                "exports: $('Validate Payload').first().json.exports, "
+                "matches: $('Match').first().json.matches, "
+                "total_refund: $('Match').first().json.total_refund, "
+                "requires_review: $('Triage').first().json.requires_review }) }}",
             ),
             boolean_if(
                 "Needs Review",
                 680,
                 300,
-                "={{ $('Triage').item.json.requires_review }}",
+                "={{ $('Triage').first().json.requires_review }}",
                 "true",
             ),
             http(
@@ -356,17 +449,23 @@ def pipeline() -> dict:
                 "POST",
                 API + "/review/suspend",
                 "={{ JSON.stringify({ "
-                "tenant_id: $('Validate Payload').item.json.tenant_id, "
-                "claim_id: $('Persist Claim').item.json.claim_id, "
-                "workflow_run_id: $execution.id, "
-                "items: $('Triage').item.json.items }) }}",
+                "tenant_id: $('Validate Payload').first().json.tenant_id, "
+                "claim_id: $('Persist Claim').first().json.claim_id, "
+                # String(), because n8n's execution id is a number and
+                # SuspendRequest.workflow_run_id is `str | None`. Pydantic v2 does not
+                # coerce int to str, so this posted an integer and came back 422
+                # "Input should be a valid string" — on the one node whose whole job is to
+                # record that a run needs a human. The two lines below concatenate it, so
+                # JavaScript coerces them and they were never affected.
+                "workflow_run_id: String($execution.id), "
+                "items: $('Triage').first().json.items }) }}",
             ),
             http(
                 "Draft Analyst Memos",
                 1060,
                 140,
                 "POST",
-                API + "/review/draft?tenant_id={{ $('Validate Payload').item.json.tenant_id }}",
+                API + "/review/draft?tenant_id={{ $('Validate Payload').first().json.tenant_id }}",
             ),
             node(
                 "Await Resolution",
@@ -386,7 +485,7 @@ def pipeline() -> dict:
                 "POST",
                 API + "/claims/transition",
                 "={{ JSON.stringify({ "
-                "claim_id: $('Persist Claim').item.json.claim_id, "
+                "claim_id: $('Persist Claim').first().json.claim_id, "
                 "to_state: 'approved', actor: 'pipeline', "
                 "reason: 'pipeline run ' + $execution.id }) }}",
             ),
@@ -397,9 +496,9 @@ def pipeline() -> dict:
                 "POST",
                 API + "/claims/transition",
                 "={{ JSON.stringify({ "
-                "claim_id: $('Persist Claim').item.json.claim_id, "
+                "claim_id: $('Persist Claim').first().json.claim_id, "
                 "to_state: 'rejected', actor: 'analyst', "
-                "reason: $('Apply Resolution').item.json.resolution_note "
+                "reason: $('Apply Resolution').first().json.resolution_note "
                 "|| 'analyst did not approve' }) }}",
             ),
             http(
@@ -409,8 +508,8 @@ def pipeline() -> dict:
                 "POST",
                 API + "/packaging/build",
                 "={{ JSON.stringify({ "
-                "claim_id: $('Persist Claim').item.json.claim_id, "
-                "claimant: $('Validate Payload').item.json.claimant, "
+                "claim_id: $('Persist Claim').first().json.claim_id, "
+                "claimant: $('Validate Payload').first().json.claimant, "
                 "include_artifacts: false }) }}",
             ),
             http(
@@ -420,7 +519,7 @@ def pipeline() -> dict:
                 "POST",
                 API + "/claims/transition",
                 "={{ JSON.stringify({ "
-                "claim_id: $('Persist Claim').item.json.claim_id, "
+                "claim_id: $('Persist Claim').first().json.claim_id, "
                 "to_state: 'packaged', actor: 'pipeline', "
                 "reason: 'packet rendered by run ' + $execution.id }) }}",
             ),
@@ -433,11 +532,11 @@ def pipeline() -> dict:
                     "respondWith": "json",
                     "responseBody": (
                         "={{ JSON.stringify({ "
-                        "claim_id: $('Persist Claim').item.json.claim_id, "
+                        "claim_id: $('Persist Claim').first().json.claim_id, "
                         "state: $json.state, "
-                        "refund: $('Persist Claim').item.json.total_refund, "
-                        "transmittable: $('Build Packet').item.json.transmittable, "
-                        "artifacts: $('Build Packet').item.json.manifest.artifacts }) }}"
+                        "refund: $('Persist Claim').first().json.total_refund, "
+                        "transmittable: $('Build Packet').first().json.transmittable, "
+                        "artifacts: $('Build Packet').first().json.manifest.artifacts }) }}"
                     ),
                     "options": {},
                 },
@@ -452,9 +551,9 @@ def pipeline() -> dict:
                     "respondWith": "json",
                     "responseBody": (
                         "={{ JSON.stringify({ "
-                        "claim_id: $('Persist Claim').item.json.claim_id, "
+                        "claim_id: $('Persist Claim').first().json.claim_id, "
                         "state: 'rejected', "
-                        "resolution: $('Apply Resolution').item.json.resolution }) }}"
+                        "resolution: $('Apply Resolution').first().json.resolution }) }}"
                     ),
                     "options": {},
                 },
@@ -488,12 +587,12 @@ def pipeline() -> dict:
             **chain("Approve Claim", "Build Packet", "Mark Packaged", "Respond"),
         },
         "pinData": {},
-        "tags": [{"name": "drawbridge"}, {"name": "pipeline"}],
     }
 
 
 def review_dispatcher() -> dict:
     return {
+        "id": "drawbridgeHitl1",
         "name": "drawbridge-review-dispatcher",
         "meta": {
             "description": (
@@ -545,12 +644,12 @@ def review_dispatcher() -> dict:
             **branch("Is Blocking", "Escalate", "Digest"),
         },
         "pinData": {},
-        "tags": [{"name": "drawbridge"}, {"name": "hitl"}],
     }
 
 
 def error_workflow() -> dict:
     return {
+        "id": "drawbridgeError1",
         "name": "drawbridge-pipeline-error",
         "meta": {
             "description": (
@@ -574,7 +673,6 @@ def error_workflow() -> dict:
         ],
         "connections": chain("Error Trigger", "Build Exception", "Queue Exception"),
         "pinData": {},
-        "tags": [{"name": "drawbridge"}],
     }
 
 

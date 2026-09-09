@@ -1,6 +1,7 @@
 .PHONY: help up down logs ps build lint fmt type test check clean rls-bootstrap \
 	token token-service pilot-seed pilot-run secrets-init secrets-show secrets-check \
-	secrets-push vault-up identity-up cross-ingest onprem-config
+	secrets-push vault-up vault-agent-up identity-up cross-ingest onprem-config \
+	pin-images pin-check reembed backup backup-verify n8n-import images
 
 help:
 	@echo "up      - bring the stack up"
@@ -21,6 +22,13 @@ help:
 	@echo "secrets-check - what a production start would refuse on"
 	@echo "secrets-push  - promote the local file into the configured manager"
 	@echo "vault-up      - dev-mode Vault, then configure it and verify the read path"
+	@echo "vault-agent-up- the infra path + AppRole vault-agent renders from"
+	@echo "reembed       - rewrite vectors whose stamp is not the current convention"
+	@echo "backup        - one pg_dump into object-locked storage"
+	@echo "backup-verify - recompute every tenant's ledger hash chain"
+	@echo "pin-check     - fail if any on-prem image drifted from its digest"
+	@echo "n8n-import    - import the workflows, activate them, restart n8n"
+	@echo "images        - build and tag the seven images the on-prem stack names"
 	@echo "identity-up   - Authentik, then provider + application + one RS256 round trip"
 	@echo "cross-ingest  - fetch a CROSS ruling sample, load it and embed it"
 	@echo "onprem-config - render and validate docker-compose.onprem.yml"
@@ -105,6 +113,68 @@ identity-up:
 		docker compose --profile identity up -d authentik-server authentik-worker
 	uv run python infra/authentik_bootstrap.py --tenant $(TENANT) --api-url http://localhost:8000
 
+# Build every image `docker-compose.onprem.yml` names, tagged with DRAWBRIDGE_VERSION.
+#
+# The deployment file has no `build:` sections on purpose — what is deployed should be an
+# image with a digest rather than whatever a host happened to compile — but until week 15
+# that left it naming seven images and nothing in the repository producing them. A
+# reproducible deploy needs both halves.
+#
+#   make images VERSION=1.2.3
+images:
+	@test -n "$(VERSION)" || (echo 'usage: make images VERSION=<tag>' && exit 2)
+	docker build -f services/api/Dockerfile -t drawbridge/api:$(VERSION) .
+	docker build -f services/backup/Dockerfile -t drawbridge/backup:$(VERSION) .
+	for s in ace hts docs claims ledger; do 		docker build -f mcp_servers/mcp_$$s/Dockerfile -t drawbridge/mcp-$$s:$(VERSION) . ; 	done
+	@echo "built 7 images at $(VERSION); set DRAWBRIDGE_VERSION=$(VERSION) in .env.onprem"
+
+# The credentials Postgres, MinIO and n8n read, and the role vault-agent uses to render
+# them. A separate path and role from the API's on purpose — see secrets/README.md.
+# Re-running is safe: it generates only what is missing and never replaces a value in
+# force, because rotating postgres_password or n8n_encryption_key breaks things that a
+# bootstrap command must not break by accident.
+vault-agent-up:
+	docker compose --profile secrets up -d vault
+	VAULT_ADDR=http://localhost:8200 VAULT_TOKEN=$${VAULT_DEV_ROOT_TOKEN_ID:-drawbridge-dev-root} \
+		uv run python infra/vault_bootstrap.py --infra
+
+# Rewrite every vector whose embedding_model_id is not the current backend and text
+# convention. Overwrites in place rather than nulling first, so search stays up while the
+# corpus converges. Idempotent: a second run over a converged corpus does nothing.
+reembed:
+	uv run python scripts/embed_corpus.py --reembed
+	uv run python scripts/embed_corpus.py --reembed --table rulings
+
+# One dump into the object-locked bucket. COMPLIANCE mode means this cannot be undone by
+# the operator, which is the point; see scripts/retention.py before pointing it anywhere
+# you would mind keeping for five years.
+backup:
+	uv run python scripts/retention.py backup
+
+backup-verify:
+	uv run python scripts/retention.py verify
+	uv run python scripts/retention.py catalogue
+
+# Resolve every third-party on-prem image against the registry. `pin-check` is the CI
+# form: it writes nothing and fails on drift, so a tag that moved under an unchanged
+# version number is something a person sees rather than something a deploy inherits.
+pin-images:
+	uv run python infra/pin_images.py
+
+pin-check:
+	uv run python infra/pin_images.py --check
+
+# Import, activate, restart. All three steps, because `n8n import:workflow` deactivates
+# what it imports and n8n reads neither the workflows nor the activation until it
+# restarts — which is how three un-importable files sat in the repo for six weeks.
+n8n-import:
+	docker compose exec -T n8n n8n import:workflow --separate --input=/workflows
+	for id in drawbridgeClaim1 drawbridgeError1 drawbridgeHitl1; do \
+		docker compose exec -T n8n n8n update:workflow --id=$$id --active=true >/dev/null; \
+	done
+	docker compose restart n8n
+	@echo 'workflows imported and active'
+
 # A term-drawn sample, not the corpus. CBP publishes no bulk export; see the script.
 cross-ingest:
 	uv run python -m scripts.ingest_cross fetch --limit $${LIMIT:-120} --load
@@ -117,6 +187,7 @@ onprem-config:
 	DRAWBRIDGE_VAULT_ROLE_ID=check DRAWBRIDGE_VAULT_SECRET_ID=check \
 	DRAWBRIDGE_OIDC_JWKS_URL=http://check/jwks DRAWBRIDGE_JWT_ISSUER=http://check/ \
 	DRAWBRIDGE_PREPARER_NAME=check DRAWBRIDGE_PUBLIC_HOST=check.example \
+	DRAWBRIDGE_VAULT_AGENT_ROLE_ID=check DRAWBRIDGE_VAULT_AGENT_SECRET_ID=check \
 		docker compose -f docker-compose.onprem.yml config -q && echo 'onprem stack is valid'
 
 token:

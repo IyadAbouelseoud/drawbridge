@@ -1,4 +1,5 @@
 {
+  "id": "drawbridgeError1",
   "name": "drawbridge-pipeline-error",
   "meta": {
     "description": "Error workflow for the pipeline. A crashed run leaves a blocking review row rather than a claim stranded mid-transition."
@@ -89,10 +90,5 @@
       ]
     }
   },
-  "pinData": {},
-  "tags": [
-    {
-      "name": "drawbridge"
-    }
-  ]
+  "pinData": {}
 }

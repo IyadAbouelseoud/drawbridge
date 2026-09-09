@@ -1658,10 +1658,280 @@ something somebody can revoke.
 ### 19.7 What this still does not do
 
 - **Back anything up.** `postgres-data` is a volume on one host. The retention obligation
-  is years and a volume is not a backup. The largest remaining hole.
-- **Classify.** 5 of 10 at hs6, unchanged. Nothing this week touched that path.
+  is years and a volume is not a backup. The largest remaining hole. *Closed in week 15 —
+  object-locked `pg_dump`, §20.4.*
+- **Classify.** 5 of 10 at hs6, unchanged. Nothing this week touched that path. *Week 15
+  found why: the corpus was embedded from text no query resembles — §20.1.*
 - **Carry CROSS.** 120 rulings drawn round-robin across twelve terms. A sample is not the
   corpus, and `scripts/ingest_cross.py` says so in its own docstring.
-- **Run n8n for real.** Carried from weeks 9–13.
+- **Run n8n for real.** Carried from weeks 9–13. *Closed in week 15, and it took seven
+  fixes to get there — §20.6.*
 - **File anything.** Both corpora are fiction; `assert_not_evidence` refuses to act on a
   `pilot-fixture` box.
+
+---
+
+## 20. What running it found (week 15)
+
+Week 15 set out to fix retrieval, add a Vault Agent sidecar, take backups, pin digests and
+run n8n for real. All five happened. But the week has one finding underneath it, and it is
+the same finding five times:
+
+> Every defect below was invisible to a check that passed. The embedding text was valid
+> text. The workflow files were valid JSON. The image tags were valid tags. The secret was
+> a valid secret. Each artefact was being verified for **form** and never for **use**, and
+> each survived for between three and seven weeks because the thing that would have caught
+> it — running it — is exactly what a roadmap item defers.
+
+### 20.1 The corpus and the queries were never in the same space
+
+The oldest number in this repository is *5 of 10 at hs6*. Week 13 measured it, week 14
+carried it, and the week 15 entry checklist said the model was now the suspect: "a
+384-dimension multilingual MiniLM over 29,000 near-identical legal phrases is a thin
+representation".
+
+It is not the model. `scripts/embed_corpus.py` embedded `f"{code} {body}"`.
+
+Every one of the 28,899 US document vectors began with its own ten-digit tariff code — a
+token no analyst query has ever contained. The document side and the query side were in
+measurably different distributions, and had been since week 8.
+
+```
+stored vector vs. embed(code + " " + text)   cosine 1.000000
+stored vector vs. embed(text)                cosine 0.950
+```
+
+The intent was reasonable and is stated in the script's own docstring: a query like
+"8471.30 portable machines" should reach the line "by either half". It does not work that
+way. A query naming a code is a *lookup*, and hoping a subword tokeniser puts `8471300100`
+near `8471.30` is both worse retrieval and an answer nobody can defend in an audit.
+`search_tariff` now matches the digits (`search.py::code_prefix`), and a code hit is the
+one hit that does not need analyst confirmation — nothing was inferred.
+
+**And the benchmark had the same defect, which is why it survived.**
+`tests/golden/test_tariff_benchmark.py` embedded its fixture corpus as
+`f"{code} {description}"` too, under a docstring saying — correctly — that a benchmark
+embedding its corpus differently from production would measure a threshold nothing else
+uses. Both sides agreed, and both were wrong in the same way. The one test whose job is to
+catch a mismatch between the corpus and the queries was built to match.
+
+**Fixing the text did not fix retrieval, and the direction of the change says so.**
+Re-measured over the fixture corpus with the prefix removed:
+
+| | code + description | description alone |
+|---|---|---|
+| Worst true positive | 0.625 | **0.635** (further) |
+| Nearest hard negative | 0.508 | **0.497** (closer) |
+
+The overlap got *wider*. The convenient reading of week 15 is that a string bug was hiding
+a working classifier; it is not supported. What the fix bought is that every measurement
+from here is over a corpus the queries can actually reach — the numbers before it were
+unsound, not merely worse. `vector_ceiling` at 0.68 still clears the worst positive with
+0.045 of headroom, and the finding this file has asserted since week 9 stands: the two
+ranges overlap, so no single distance threshold delivers precision at any value.
+
+**What the model measurements were worth.** Before the cause was found, two first-stage
+replacements and two rerankers were measured. Recording them because they are the reason
+the retrieval work stopped where it did rather than continuing into a model swap:
+
+| Approach | rank-1 | top-10 | Cost |
+|---|---|---|---|
+| Baseline (multilingual MiniLM) | 2/10 | 5/10 | — |
+| `+ Xenova/ms-marco-MiniLM-L-6-v2` rerank @200 | 1/10 | 5/10 | 1.1 s/query |
+| `+ jinaai/jina-reranker-v2-base-multilingual` @200 | 1/10 | 6/10 | 4.2 s/query, 1.1 GB |
+
+The English cross-encoder is *worse*, and it is worse in the way that matters: the Arabic
+smartphone query went from rank 1 to rank 12. A bilingual corpus needs a bilingual
+reranker, and the bilingual one buys one position out of ten for four seconds a query. So
+no reranker ships. That was measured against a corpus in the wrong space, which makes the
+comparison less useful than it looks — but it is the reason to fix the space before buying
+a model, and the numbers are here so the next attempt starts from evidence.
+
+### 20.2 The invariant that had no column
+
+`services/classifier/src/embeddings.py` has said since week 8:
+
+> Every backend records `model_id` on the rows it writes. A corpus is queryable only by the
+> backend that wrote it, and mixing them is a data error the ingest can detect.
+
+There was no column. Nothing recorded it, nothing detected anything, and the sentence
+described an intention. Seven weeks later the corpus turned out to be unreachable by its
+own queries and there was no way to ask a row what had produced it — the diagnosis took a
+cosine comparison against three candidate texts.
+
+`tariff_lines.embedding_model_id` and `tariff_rulings.embedding_model_id` exist now
+(`a3f81c22d907`), and the stamp names the **text convention** as well as the model:
+
+```
+fastembed:sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/desc
+```
+
+Because the failure that happened was one model over two texts. A column holding only
+`model_id` would have recorded the same string for the broken corpus and the fixed one and
+caught nothing. `embed_corpus.py --reembed` selects rows whose stamp is not the current
+convention and overwrites them in place, so the corpus converges rather than emptying and
+search is never dark. The migration is additive for the same reason: nulling 29,000 vectors
+would have taken classification offline for the length of a re-embed.
+
+### 20.3 Vault Agent, and the split worth preserving
+
+Six credentials reached Postgres, MinIO and n8n as plaintext files under `./secrets`,
+because those three images read a `_FILE` variant and cannot call a manager. That directory
+is gone. `vault-agent` logs in with its own AppRole and renders the six into four tmpfs
+volumes, one per consumer group.
+
+The part worth stating is not the sidecar, it is the **path split**. The API reads
+`secret/drawbridge`; vault-agent reads `secret/drawbridge-infra`; the policies are
+disjoint. That separation existed by accident before — the API could not read the Postgres
+owner password or the n8n encryption key because they were not in `.secrets.json` — and a
+move into a manager that merged the two would have been a downgrade with a better name.
+
+Verified against a live Vault, from inside a container:
+
+```
+8/8 files rendered, no <no value> holes, no trailing newline
+same postgres_password to postgres, authentik and n8n     sha256 27cb9a1073749f46
+/run/vault-agent empty                                    no token on a shared volume
+infra role -> secret/drawbridge                           denied
+infra role -> list on the mount                           denied
+```
+
+One credential still arrives from outside — the AppRole's own `secret_id`, which is the
+chicken-and-egg every secrets manager has. It comes from the environment as a Docker
+secret sourced with `environment:` rather than `file:`, so the directory does not need to
+exist at all.
+
+**No template declares a `command`.** Postgres reads its password once at initdb; MinIO
+reads its root credentials at start. A template that rewrote the file and signalled the
+process would change the file and not the credential in force, and a rendered file that
+disagrees with what the service is using is worse than a stale one you know is stale.
+
+### 20.4 Backups, and what "immutable" costs
+
+`scripts/retention.py` takes a `pg_dump` into MinIO under **S3 object lock, COMPLIANCE
+mode**, and recomputes every tenant's ledger hash chain on its own interval.
+
+COMPLIANCE and not GOVERNANCE, because GOVERNANCE can be lifted by anyone holding
+`s3:BypassGovernanceRetention` — on a single-tenant on-prem MinIO, the operator. A
+retention control the operator can lift is a retention policy. The threat is not disk
+failure; it is a dispute in year four in which the party holding the records is also the
+party who could have changed them.
+
+The cost is real and is the point: **nothing prunes.** Storage grows monotonically for five
+years. Proven live — a 52 MB dump written, then attacked with root credentials:
+
+```
+mc retention info      COMPLIANCE, expiring in 29 days
+mc rb --force          Failed ... is WORM protected and cannot be overwritten
+mc retention set 1d    Unable to find any object/version to set its retention
+```
+
+**And one thing the probe found that the design had not.** `mc rm` on a locked object
+*succeeds*: it writes a delete marker. The protected version survives underneath and cannot
+be removed, but the object vanishes from an ordinary listing. Object lock protects the
+bytes and says nothing about visibility. So the failure to guard against is not losing a
+backup — it is looking for backups during an incident, seeing an empty bucket, and
+concluding there are none. `retention.py catalogue` enumerates *versions* and names any key
+a delete marker is masking.
+
+Verification does not write to the ledger. Recording the result as an `audit_ledger` event
+would extend the chain being verified and put the attestation inside the structure it
+attests to; an altered ledger would carry an altered record of having been checked.
+
+### 20.5 Digests
+
+Every third-party image in the on-prem stack carries a SHA-256 digest.
+`infra/pin_images.py` resolves them against the registry — `buildx imagetools inspect`, not
+`docker image inspect`, because the latter reports what happens to be in the local cache.
+`make pin-check` is the CI form and fails on drift.
+
+The tag stays beside the digest. Docker resolves the digest and ignores the tag, so the tag
+is documentation and is not load-bearing — which is the point: `redis@sha256:ff02b5...`
+alone tells a reviewer nothing, and a digest nobody can read is a digest nobody checks.
+
+Images this repository builds are *not* pinned. They carry `${DRAWBRIDGE_VERSION}` and come
+from the same commit that deploys them; a digest would pin them to whenever somebody last
+ran the script.
+
+What this does not give you is provenance. A digest says the bytes have not changed since
+somebody wrote it down, not that they were trustworthy then. Signature verification is the
+control that answers that and it is not here.
+
+### 20.6 n8n ran, and seven things were wrong with it
+
+"Import the workflows into n8n and run one for real" has been on the roadmap since week 9.
+It is done: a webhook POST produced a claim in `packaged`, a refund of `25092.14`, and a
+13 KB CBP 7551.
+
+```
+POST /webhook/drawbridge/ingest                                    200
+  documents/batch 201 · extraction 200 · classification 200 · matching 200
+  triage 200 · claims/persist 201 · claims/transition 200
+  packaging/build 200 · claims/transition 200
+{"state":"packaged","refund":"25092.14","transmittable":true,
+ "artifacts":[{"filename":"cbp7551-....pdf","bytes":13345}]}
+```
+
+Getting there took seven fixes, and none of them was findable without running it:
+
+| # | Defect | Effect |
+|---|---|---|
+| 1 | No `id` on any workflow | `null value in column "id"` — import failed outright |
+| 2 | All three carried the tag `drawbridge` | `tag_entity.name` is unique; batch import failed on the second file |
+| 3 | The `Authorization` header was in the JSON but not in the generator | regenerating strips the bearer token from all twelve API calls |
+| 4 | `N8N_BLOCK_ENV_ACCESS_IN_NODE` unset | "access to env vars denied" — every call goes out with an empty token |
+| 5 | `Validate Payload` read `$json`, not `$json.body` | the webhook hands on the whole request; every field looked missing |
+| 6 | `errorWorkflow` referenced by name | n8n resolves it as an id; the error handler never ran |
+| 7 | `$('Node').item` throughout, and `workflow_run_id: $execution.id` | see below |
+
+Number 7 is the one worth reading twice. `$('Node').item` resolves through n8n's *item
+pairing*, which this pipeline loses at every Code node that builds a fresh array. When it
+fails it does not raise — it yields `undefined`, `JSON.stringify` drops the key, and the
+request goes out **missing a field rather than carrying a wrong one**. `/review/suspend`
+returned 422 "Field required: body.tenant_id" against a payload whose `tenant_id` was
+present three nodes upstream. Every node in this pipeline emits exactly one item, so
+`.first()` is not a workaround for the pairing — it is the accessor that matches what these
+nodes produce. Alongside it, `workflow_run_id: $execution.id` sent an integer into a
+`str | None` field and Pydantic v2 correctly refused it, on the one node whose whole job is
+to record that a run needs a human.
+
+Number 3 deserves a note of its own. Week 12 added the service-token header to the three
+generated JSON files by hand and did not touch `n8n/generate_workflows.py`. It survived
+three commits because nobody ran the generator. The fix is not the missing lines — it is
+that they were per-node lines at all; the header is applied once in `http()` now, where it
+cannot be forgotten from one node.
+
+`tests/unit/test_week15.py` pins all seven against the generated files, including a test
+that runs the generator and asserts it reproduces what is committed.
+
+### 20.7 Two more, found on the way
+
+**MinIO was unreachable from the API, in development, for weeks.** `s3_secret_key` is in
+`GENERATED_FIELDS`, so `make secrets-init` mints a random one — while `docker-compose.yml`
+hardcoded MinIO's root password as `drawbridge` and had no way to learn the new value. The
+two disagreed by construction from the moment a secrets file was generated, and every
+document write failed with a bare 403 from `HeadObject`. It survived because nothing in the
+suite talks to a real MinIO and the pilot runs against fixtures already in the bucket. Both
+halves now read the same two variables. On-prem was never affected: both sides read the
+same value from Vault.
+
+**The pipeline cannot fail.** Every HTTP node sets `neverError: true`, so a 500 from
+`/claims/persist` became `{data: "Internal Server Error"}` and the run continued through
+packaging, returned HTTP 200 to the caller, and recorded `success`. There are gates after
+extraction and classification and none after persist. Not fixed this week — it is a
+structural change to a 22-node graph and it wants doing deliberately. It is the first item
+on the week 16 checklist.
+
+### 20.8 The agent worker, and what is still blocked
+
+`worker.py` was run against the live queue. It connects, selects the three open undrafted
+rows, and stops at the model boundary reporting `unavailable=3` — correct behaviour, since
+`AgentUnavailableError` breaks the batch rather than burning a call per row.
+
+**No `anthropic_api_key` is configured in this deployment, so the drafting itself has still
+never run live.** With a stub standing in for the model — everything Drawbridge owns
+running for real: the queue select, `build_facts`, the grounding check, the `_ATTACH`
+update, the per-row commit — all three rows drafted and committed with `agent_memo`,
+`agent_model` and `agent_drafted_at` populated. The stub memos were reverted afterwards.
+So the write path is proven and the model call is not, and no amount of further work here
+substitutes for a key.
