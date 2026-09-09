@@ -2167,3 +2167,193 @@ Four things about its shape:
 
 The number the recovery plan actually needed: **15 seconds**, 12.75 of it `pg_restore`, on
 a 52 MB dump of a 28,908-line corpus.
+
+---
+
+## 22. Fifty queries, and a repair that did not do what it was for (week 17)
+
+Week 16 left a diagnosis on the roadmap: 596 leaf lines had lost their ancestor chain,
+that was "the ceiling on retrieval", and repairing it was a data fix worth a week. Week 17
+did the repair and then measured it, and the diagnosis does not survive the measurement.
+The repair is still right. It is right for a smaller reason than the one it was scheduled
+for, and the number it was supposed to move did not move.
+
+### 22.1 What was actually broken
+
+`retrieval_text` builds what a line embeds from: the leaf, then ancestors, leaf-first,
+until `RETRIEVAL_TEXT_CAP` is reached. The cap exists because of mean pooling — a heading
+shared verbatim by hundreds of lines drowns the twenty characters that distinguish them,
+which week 13 measured at 1 of 10 correct.
+
+The cap was applied to the whole string including the leaf, so a leaf long enough to spend
+the budget on its own left nothing for a single ancestor. 1,821 lines of the published
+schedule are that shape — not 596; that count was of ten-digit lines only and the same
+defect runs through the six- and eight-digit rows. The worst is 0301.93.02.90:
+
+```
+leaf    "Other"                                                   5 characters
+parent  "Carp (Cyprinus spp., Carassius spp., ... Megalobrama spp.)"  213 characters
+result  "Other"
+```
+
+Five characters of budget spent, 208 refused, and the line embedded as the word "Other"
+into a corpus holding thousands of leaves reading "Other". They are all the same point.
+No ceiling, no reranker and no query separates a point from itself.
+
+### 22.2 The obvious fix is half wrong, and the half matters
+
+Exempting the immediate parent from the cap fixes the carp line and 1,820 others. It also
+does this to 8471.30.01.00:
+
+```
+before  Portable automatic data processing machines, weighing not more than 10 kg,
+        consisting of at least a central processing unit, a keyboard and a display
+after   ...same, then: Automatic data processing machines and units thereof; magnetic or
+        optical readers, machines for transcribing data onto data media in coded form...
+```
+
+The leaf already identifies a laptop. The 190 characters added are the heading, shared
+verbatim by every line under 8471, and prepending them is precisely the dilution the cap
+was introduced against — week 13's defect re-entered through the exemption. For 1,079 of
+the 1,821, the chain is only two deep, so the "parent" *is* the heading.
+
+Measured over the 50-query benchmark, at depth 50 with the reranker:
+
+| corpus | top-10 | rank-1 |
+|---|---|---|
+| unrepaired | 42/50 | 24/50 |
+| parent exempt unconditionally (1,821 lines) | 41/50 | 24/50 |
+| parent exempt only when proximate (742 lines) | 41/50 | 24/50 |
+
+So the shipped rule exempts the parent **unless the parent is the root of the chain**. An
+intermediate ancestor exists to discriminate between siblings, which is exactly what a
+leaf reading "Other" cannot do for itself. A heading exists to name the group they all
+belong to, which every sibling already carries. 742 lines gain a discriminator; 1,079 keep
+their self-sufficient leaf undiluted.
+
+### 22.3 The repair does not move retrieval, and that is the finding
+
+All three columns above are the same number to within one query. The week 16 roadmap
+called this defect the ceiling on retrieval; it is not the ceiling on anything the
+benchmark measures.
+
+The reason is structural, and it is about the benchmark rather than the repair.
+Calibration matches at six digits, and a subheading counts as found when **any** of its
+descendants ranks. Sixteen of the fifty answers are among the repaired lines, and for all
+sixteen some sibling under the same hs6 already carried the full text. An orphaned
+ten-digit leaf reading "Other" never mattered to an hs6-level score, because 8471.30.01.00
+was reachable whether or not its siblings were.
+
+Which leaves the repair worth shipping for what it actually is: 742 ten-digit lines that
+could not be told apart from each other now can be. That matters to an analyst choosing a
+statistical suffix, and choosing the suffix is the step this fixture explicitly does not
+measure — `expects_vs_expects_hs6` says a goods description does not determine one. So the
+benefit is real and lands in the one place the benchmark declines to look. No number here
+demonstrates it, and the honest version of that sentence is that no number here can.
+
+### 22.4 A corpus that invalidates its own index
+
+The repair exposed a defect worth more than the repair. `_UPSERT_LINE` updated
+`search_text` and left `embedding` alone, and `embed_corpus.py --reembed` re-embeds rows
+whose `embedding_model_id` differs from the current model. The model had not changed. So
+a re-ingest that rewrote the text of 1,821 lines would have left all 1,821 vectors in
+place, pointing at text that no longer existed, and reported 100% coverage.
+
+The upsert now nulls `embedding` and `embedding_model_id` when and only when
+`search_text` actually changes. That is what made the re-embed in this week surgical —
+742 rows, not 28,899 — and it means the corpus can no longer be updated without the index
+noticing.
+
+### 22.5 Fifty queries
+
+Week 16 reported 4/10 against 3/10 at rank one and had to note in the same paragraph that
+one query is not a difference. The fixture now holds 50 positives and 15 negatives.
+
+The forty new positives were resolved out of `data/hts_2026_full.json` rather than written
+from memory: every `expects` is a subheading that exists in the schedule and every
+`description_en` is that subheading's own resolved chain, so a fixture distance stays
+comparable to a production one. Four were rewritten during the week because they collided
+with a line the fixture already held — black tea at 0902.40 against 0902.30, an engine at
+8407.34 against a car at 8703.23 — and a collision like that produces a *confirmed wrong
+answer*, which the corpus is built to avoid rather than to contain. A fifth kind was
+added: `verbatim`, a query quoting the schedule's own words, as a control. Without one, a
+broken retrieval path and a hard query set look identical.
+
+Five negatives were added, and they are the only ones that mean anything at volume.
+Nine of the original ten name goods the 24-line corpus lacks and the published schedule
+carries, so against the full HTSA they are positives with no recorded answer. The new five
+are services — customs brokerage, a software licence, warehouse handling — and no number
+of tariff lines makes an invoice line for storage into a good. `survives_full_schedule` is
+now a field in the fixture rather than a query string hardcoded in
+`calibrate_thresholds.py`.
+
+### 22.6 What the reranker is worth on a set big enough to argue with
+
+Same pipeline as week 16, five times the queries:
+
+```
+44/50 retrieved in the top 10   ·   26/50 at rank 1
+one stage was 34/50 in the top 10 and 17/50 at rank 1
+reranked query latency: median 2761 ms, max 7517 ms
+```
+
+The second stage is worth **+10 in the top ten and +9 at rank one**. Week 16 measured +3
+and +2 on ten queries and could not claim much; the direction was right and the magnitude
+holds up.
+
+Against the week 17 entry criterion, plainly: the target was **rank-1 above 85%** and the
+measured figure is **52%**. Top-ten recall is 88%, which does clear 85%, but they are not
+the same claim and reporting the one that passed would be choosing the metric after seeing
+it. Nothing in the previous weeks predicted 85% — the ten-query set said 50%, so 52% on
+fifty is the earlier number confirmed rather than an underperformance against it.
+
+Rank-1 above 85% is not reachable by ranking alone from here, and the eighteen queries
+that are in the top ten but not first say why. Fourteen of the eighteen are outranked by a
+**sibling subheading under the same heading**, and in almost every case the sibling differs
+on a qualifier the query stated explicitly:
+
+| query says | ranked first | correct |
+|---|---|---|
+| bottled red wine, 750 ml | 2204.22 — containers over 2 litres | 2204.21 |
+| hot rolled steel coil, 2 mm thick | 7208.36 — exceeding 10 mm | 7208.39 |
+| motorboat, 10 m hull | 8903.31 — not exceeding 7.5 m | 8903.32 |
+| grey portland cement (Arabic) | 2523.21 — white cement | 2523.29 |
+| glazed floor tiles | 6907.22 — different absorption band | 6907.21 |
+| toughened safety glass | 7007.21 — laminated | 7007.11 |
+
+Every one of those is a number or a negation — 750 ml against 2 litres, 2 mm against
+10 mm, grey against white — sitting inside otherwise near-identical text. A bi-encoder
+averages tokens and a cross-encoder reads the pair, and neither of them does arithmetic or
+resolves a negation reliably. That is a different problem from ranking, it will not yield
+to a third stage of the same kind, and it is the honest ceiling on this architecture.
+
+The consolation is that the system's behaviour is already right: it returns the sibling
+and marks it `needs_analyst_confirmation`, which is the correct answer to "I have narrowed
+this to two lines that differ on a measurement". Rank-1 is the wrong headline number for
+that design. Recall at ten, where the correct line is on the analyst's screen, is 88%.
+
+### 22.7 The ceiling holds, on five times the evidence
+
+`vector_ceiling` stays 0.68, `CONFIRMATION_LEXICAL_FLOOR` 0.20, `LEXICAL_FLOOR` 0.15 —
+the fourth week running that nothing has moved, and the first week where that is a
+result rather than an absence of one. The worst true positive in the fixture corpus is
+still "desktop tower PC sold with its monitor and keyboard in one unit" at 0.6348, with
+0.0452 of headroom. It is now the worst of fifty rather than the worst of ten, so the
+same value rests on five times the evidence.
+
+### 22.8 Two things the bigger corpus exposed
+
+**Nothing is auto-confirmed in production.** All fifty calibration queries come back
+vector-only against the 28,899-line schedule; the lexical path contributes to none of
+them. `needs_analyst_confirmation` is therefore true for every classification the system
+currently produces. That is the safe direction to be wrong in and it means the
+confirmation rule has never actually been exercised at volume.
+
+**One integration test was measuring the fixture, not the rule.** The week 9 defect —
+"wooden lead pencils" reaching wooden office furniture on both paths at a lexical 0.157 —
+was asserted by running the query and inspecting what came back. Growing the corpus from
+24 lines to 64 made the case vanish, because `search_tariff` takes ten hits, ten of
+twenty-four is most of a corpus and ten of sixty-four is not, so the two paths stopped
+overlapping at all. No query in the fixture now produces a `both` hit. The corpus had been
+manufacturing the agreement it was being used to measure. The test now constructs the hit
+and asserts the rule, which is what was at issue.

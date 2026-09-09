@@ -66,9 +66,16 @@ BENCHMARK = (
 )
 DEFAULT_DSN = "postgresql+psycopg://drawbridge:drawbridge@localhost:5432/drawbridge"
 
-#: The only benchmark negative that stays a negative against the full schedule: it is not
-#: a good, so no tariff line answers it however many lines there are.
-STILL_A_NEGATIVE = "marine cargo insurance brokerage arranged for a shipper"
+
+#: Which negatives still mean something once the corpus is the whole schedule.
+#:
+#: This was one hardcoded query string until week 17. The fixture now carries the flag
+#: itself, because the property is a property of the case — is this a good the schedule
+#: could ever carry? — and a script matching on prose could not be extended without
+#: editing two files and could not be checked at all.
+def _survives(case: dict[str, Any]) -> bool:
+    """Negatives predating the flag default to void, which is what week 15 measured."""
+    return bool(case.get("survives_full_schedule", False))
 
 
 def _dsn() -> str:
@@ -166,7 +173,7 @@ def measure(
 
     noise: list[dict[str, Any]] = []
     for case in data["negatives"]:
-        if case["query"] != STILL_A_NEGATIVE:
+        if not _survives(case):
             continue
         vector = embedder.embed([case["query"]])[0]
         hits, _ = search_tariff(
@@ -199,9 +206,7 @@ def measure(
         "rerank_depth": RERANK_DEPTH if reranker is not None else None,
         "positives": positives,
         "surviving_negatives": noise,
-        "voided_negatives": [
-            case["query"] for case in data["negatives"] if case["query"] != STILL_A_NEGATIVE
-        ],
+        "voided_negatives": [case["query"] for case in data["negatives"] if not _survives(case)],
     }
 
 

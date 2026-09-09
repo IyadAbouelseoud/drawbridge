@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 16 |
+| Current week | 17 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | **The second stage** — a reranker that moves the number, and a backup that has been restored |
+| Current milestone | **A set big enough to argue with** — fifty labelled queries, and an ingest repair measured rather than assumed |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -32,6 +32,7 @@
 | 14 | Broker white-label packaging + on-prem compose | Reproducible `.onprem.yml` deploy |
 | 15 | Debug, review, harden | Backups under object lock; every committed artefact executed at least once |
 | 16 | Retrieve-then-rerank; restore drill | 9/10 at hs6 in the top ten; a backup restored and its ledger re-verified |
+| 17 | Ingest hierarchy; fifty-query benchmark | 44/50 at hs6 in the top ten, 26/50 at rank one; the ancestor-chain theory refuted |
 
 ---
 
@@ -1270,13 +1271,19 @@ correct engineering response is to leave the gap visible.
 1. **A pipeline that can fail.** Third week on this list. Remove `neverError` or gate on
    status after every HTTP node; today a run that 500s reports success and packages a claim
    built on nothing.
-2. **Repair `search_text`.** The ancestor chain is missing on 596 leaf lines, which is
+2. ~~**Repair `search_text`.**~~ *Done in week 17 — and the claim below is wrong. It
+   was 1,821 lines, not 596, and repairing them changed retrieval by one query in fifty.
+   See §22.3: hs6 scoring counts a subheading found if any descendant ranks, and every
+   repaired line had a sibling carrying the full text.* The ancestor chain is missing on 596 leaf lines, which is
    exactly where the two unreachable benchmark queries land — 8471.41 is what a desktop PC
    classifies under and its text never says it is a computer. Re-ingest with the chain
    intact, re-embed, re-measure. This is the ceiling on retrieval and it is a data fix.
-3. **Then re-measure the reranker over the repaired corpus.** The 8/10 pool ceiling is a
-   property of the corpus, not of the model, so it should move.
-4. **A bigger labelled set.** Every number in §21 rests on ten queries. 4/10 versus 3/10 is
+3. ~~**Then re-measure the reranker over the repaired corpus.**~~ *Done, and it did not
+   move for that reason. It moved because the query set got five times bigger and more
+   honest.* The 8/10 pool ceiling is a property of the corpus, not of the model, so it
+   should move.
+4. ~~**A bigger labelled set.**~~ *Done in week 17 — fifty positives, fifteen
+   negatives, every label resolved out of the published schedule.* Every number in §21 rests on ten queries. 4/10 versus 3/10 is
    one query, and the honest reading of a one-query difference is that it is not a
    difference. Fifty labelled queries would make the next threshold decision defensible.
 5. **Reranker latency.** 2.2 s median and 8.5 s worst case is fine for an analyst looking
@@ -1286,6 +1293,88 @@ correct engineering response is to leave the gap visible.
 6. **An Anthropic key in a deployment**, so the agent worker's drafting runs live.
 7. **Start the on-prem file.** Still only ever `docker compose config`-ed.
 8. **More of CROSS**, and **signed images**.
+
+## Week 17 task breakdown
+
+- [x] **Repaired the ingest hierarchy.** `retrieval_text` capped the whole string
+      including the leaf, so 1,821 lines (not the 596 estimated — that count was
+      ten-digit rows only) embedded with no ancestor at all. 0301.93.02.90 embedded as
+      the word "Other".
+- [x] **And found the obvious fix half wrong.** Exempting the parent unconditionally
+      re-adds the shared heading to 1,079 lines whose leaf already identifies the good,
+      which is the week 13 dilution defect coming back through the exemption. The shipped
+      rule exempts the parent only when it is not the root of the chain: 742 lines gain a
+      discriminator, 1,079 keep their leaf undiluted.
+- [x] **Measured it, and it does not move retrieval.** Unrepaired 42/50 top-ten,
+      unconditional 41/50, proximate-only 41/50. The week 16 roadmap called this defect
+      "the ceiling on retrieval" and it is not the ceiling on anything the benchmark
+      measures — hs6 scoring counts a subheading found if any descendant ranks, and every
+      repaired line had a sibling carrying the full text.
+- [x] **A real defect found on the way**: the upsert rewrote `search_text` and left
+      `embedding` alone, and `--reembed` keys on the model id, which had not changed. A
+      corpus could be updated and its index silently not. Now nulled on text change, which
+      is also what made this week's re-embed 742 rows instead of 28,899.
+- [x] **Fifty positives, fifteen negatives.** Every new label resolved out of the
+      published schedule rather than written from memory. Four rewritten mid-week for
+      colliding with a line the fixture already held. Five service negatives added — the
+      only kind that survives a change of corpus. `survives_full_schedule` is a field now,
+      not a query string hardcoded in a script.
+- [x] **Reranker re-measured at five times the evidence**: +10 in the top ten and +9 at
+      rank one, against week 16's +3 and +2 on ten queries.
+- [ ] **Rank-1 above 85%.** Not met, and not close: **52%**. See below.
+- [ ] **Thresholds.** Not moved, fourth week running. See below.
+
+### What week 17 deliberately did not do
+
+- **Hit the 85% rank-1 target.** Measured 52%, with top-ten recall at 88%. Nothing in the
+  previous weeks predicted 85% — the ten-query set said 50%, so 52% on fifty confirms the
+  earlier number rather than falling short of it. The gap is not a ranking problem:
+  fourteen of the eighteen queries that land in the top ten but not first are outranked by
+  a **sibling subheading differing on a stated qualifier** — 750 ml against 2 litres, 2 mm
+  against 10 mm, grey cement against white. Neither a bi-encoder nor a cross-encoder does
+  arithmetic or resolves a negation, and a third stage of the same kind will not fix it.
+- **Move a threshold.** `vector_ceiling` stays 0.68, `CONFIRMATION_LEXICAL_FLOOR` 0.20,
+  `LEXICAL_FLOOR` 0.15. The worst true positive is still 0.6348 with 0.0452 of headroom —
+  but it is now the worst of fifty rather than the worst of ten, so the same value rests
+  on five times the evidence.
+- **Fix the pipeline's inability to fail.** Still every n8n HTTP node with
+  `neverError: true`. Fourth week on this list. It is now unambiguously the oldest
+  outstanding defect in the repository and it should go first in week 18.
+- **Anything about auto-confirmation.** See below — it turns out there is nothing to
+  measure yet.
+
+### What the bigger corpus exposed
+
+1. **Nothing is auto-confirmed in production.** All fifty calibration queries return
+   vector-only against the 28,899-line schedule; the lexical path contributes to none of
+   them, so `needs_analyst_confirmation` is true for every classification the system
+   currently produces. That is the safe direction to be wrong in, and it means the
+   confirmation rule — three weeks of design, its own benchmark, its own tests — has never
+   been exercised at volume.
+2. **One integration test was measuring the fixture rather than the rule.** Growing the
+   corpus from 24 lines to 64 made the week 9 "wooden lead pencils" case vanish: ten hits
+   out of twenty-four is most of a corpus and ten out of sixty-four is not, so the lexical
+   and vector paths stopped overlapping at all. No query in the fixture now produces a
+   `both` hit. The test constructs the hit now and asserts the rule.
+
+## Week 18 entry checklist
+
+1. **A pipeline that can fail.** Fourth week on this list. Remove `neverError` or gate on
+   status after every HTTP node; today a run that 500s reports success and packages a
+   claim built on nothing. Nothing else on this list is as old or as cheap.
+2. **Find out why the lexical path never fires at volume.** Item 1 above is either a
+   tuning problem, a query-preprocessing problem, or evidence that trigram similarity over
+   28,899 lines cannot reach the top ten — and it decides whether the confirmation rule is
+   a working safety property or a decoration.
+3. **Sibling disambiguation, if anything is to be done about rank-1.** The failure is
+   numeric and negation-shaped, not semantic. A rule that extracts stated quantities from
+   the query and filters candidates whose text contradicts them would address fourteen of
+   the eighteen near misses; a bigger model would address none of them.
+4. **Latency.** 2.8 s median and 7.5 s worst case, unchanged. Batch the forward passes,
+   cache per (query, code), or declare reranking interactive-only in the API.
+5. **An Anthropic key in a deployment**, so the agent worker's drafting runs live.
+6. **Start the on-prem file.** Still only ever `docker compose config`-ed.
+7. **More of CROSS**, and **signed images**.
 
 ## Sequencing rationale
 

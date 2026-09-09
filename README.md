@@ -101,12 +101,16 @@ Classification is two-stage as of week 16: pgvector narrows 28,899 lines to 50 i
 20 ms, then a multilingual cross-encoder re-scores those 50 and its confidence is blended
 70/30 against the retrieval score. The blend is the part that matters — taking the
 cross-encoder's order outright is no better than retrieval alone, because it demotes as
-many answers as it rescues. `make calibrate-rerank` prints one stage beside two.
+many answers as it rescues. `make calibrate-rerank` prints one stage beside two, over the
+fifty labelled queries week 17 expanded the benchmark to.
 
 ```
-9/10 retrieved in the top 10   ·   5/10 at rank 1
-one stage was 6/10 in the top 10 and 3/10 at rank 1
+44/50 retrieved in the top 10   ·   26/50 at rank 1
+one stage was 34/50 in the top 10 and 17/50 at rank 1
 ```
+
+The second stage is worth +10 in the top ten and +9 at rank one — measured on fifty
+queries, against +3 and +2 on the ten it had in week 16.
 
 The workflows are imported and run:
 
@@ -253,22 +257,28 @@ make pilot-run                    # both corpora end to end against the deployed
 Stated here rather than discovered later. The full list, with the reasoning, is in
 `docs/ROADMAP.md`.
 
-- **Classify reliably.** Week 16 took it from 6 of 10 to **9 of 10** correct subheadings
-  at six digits against the full 28,899-line HTSA, by adding a cross-encoder over the fifty
-  nearest candidates. That is real movement and it is still ten queries — a demonstration,
-  not a validation, and 5 of 10 at rank one is not a classifier an analyst can stop reading.
-  Two queries fail at any retrieval depth because 596 leaf lines lost their ancestor chain
-  during ingest, so 8471.41 — what a desktop PC classifies under — carries text that never
-  says it is a computer. A larger labelled set and that ingest fix are week 17.
+- **Classify to a single line.** On the fifty labelled queries week 17 expanded the
+  benchmark to, the correct subheading is in the top ten **44 times** and first **26**.
+  The gap is not a ranking problem: fourteen of the eighteen near misses are outranked by
+  a sibling subheading differing on a qualifier the query stated — 750 ml against 2
+  litres, 2 mm against 10 mm, grey cement against white — and neither a bi-encoder nor a
+  cross-encoder does arithmetic or resolves a negation. The system returns the sibling and
+  asks for an analyst, which is the right answer to "narrowed to two lines that differ on
+  a measurement" and is not classification.
+- **Auto-confirm anything.** All fifty calibration queries come back vector-only against
+  the full schedule, so `needs_analyst_confirmation` is true for every classification the
+  system currently produces. The confirmation rule has three weeks of design, its own
+  benchmark and its own tests, and has never fired at volume. Week 18 finds out why.
 - **Carry the ruling corpus.** CBP publishes no bulk export; `scripts/ingest_cross.py`
   draws a term-sampled ~120 rulings. A sample is not CROSS.
 - **Fail a pipeline run.** Every n8n HTTP node sets `neverError: true`, so a 500 from
   `/claims/persist` becomes `{data: "Internal Server Error"}`, the run continues through
   packaging, returns HTTP 200 and records `success`. Understood, reproduced, and not yet
   fixed — it is a structural change to a 22-node graph and it has been the first item on
-  the entry checklist for two weeks running, which is the argument for doing it next.
-- **Classify a whole entry interactively.** Reranking costs ~2.2 s a line, so a 200-line
-  entry is a seven-minute request. It is opt-in for exactly that reason; batching it is
-  week 17.
+  the entry checklist for three weeks running, which is the argument for doing it next
+  rather than a reason it keeps being deferred.
+- **Classify a whole entry interactively.** Reranking costs ~2.8 s a line, so a 200-line
+  entry is a nine-minute request. It is opt-in for exactly that reason; batching it is
+  still outstanding.
 - **File anything.** Both pilot corpora are fiction, every figure carries a
   `pilot-fixture` provenance box, and `assert_not_evidence` refuses to act on one.

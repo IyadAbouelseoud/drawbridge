@@ -58,7 +58,7 @@ WORST_TRUE_POSITIVE = 0.635
 # It removed a defect that made every prior measurement unsound; the overlap this file has
 # asserted since week 9 is still here, and a single distance threshold still cannot deliver
 # precision at any value.
-NEAREST_HARD_NEGATIVE = 0.497
+NEAREST_HARD_NEGATIVE = 0.439
 
 
 def _load() -> dict[str, Any]:
@@ -125,23 +125,43 @@ def _cases(rows: list[dict[str, Any]]) -> list[Any]:
 class TestTheBenchmarkIsWellFormed:
     """A benchmark nobody checked is a benchmark that measures whatever it happens to."""
 
-    def test_it_holds_ten_of_each(self) -> None:
-        assert len(POSITIVES) == 10
-        assert len(NEGATIVES) == 10
+    def test_it_holds_enough_of_each_to_mean_something(self) -> None:
+        """Fifty positives, because ten made every query worth ten percentage points.
+
+        Week 16 reported 4/10 against 3/10 at rank one and had to add, in the same
+        paragraph, that one query is not a difference. Forty were added in week 17 and
+        the negatives went from ten to fifteen. Five of the new negatives are services
+        rather than absent goods, which is the only kind of negative that stays a
+        negative once the corpus is the whole published schedule.
+        """
+        assert len(POSITIVES) == 50
+        assert len(NEGATIVES) == 15
+        surviving = [n for n in NEGATIVES if n.get("survives_full_schedule")]
+        assert len(surviving) == 6
 
     def test_every_positive_names_a_code_the_corpus_actually_holds(self) -> None:
         codes = {row["code"] for row in CORPUS}
         missing = [p["query"] for p in POSITIVES if p["expects"] not in codes]
         assert not missing
 
-    def test_the_positives_cover_all_three_query_kinds(self) -> None:
-        """Paraphrase, typo and multilingual fail differently.
+    def test_the_positives_cover_all_four_query_kinds(self) -> None:
+        """Paraphrase, typo, multilingual and verbatim fail differently.
 
         A set of paraphrases alone would prove the model handles synonyms and say nothing
         about a misspelled invoice line or an Arabic *Bayan* description, which are the
         two forms real input actually arrives in.
+
+        `verbatim` joined them in week 17 as the control. A query quoting the schedule's
+        own words should be the easiest case there is, so a verbatim query that misses is
+        evidence about the pipeline rather than about the language of the query — and
+        without any in the set, a broken retrieval path and a hard query set look alike.
         """
-        assert {p["kind"] for p in POSITIVES} == {"paraphrase", "typo", "multilingual"}
+        assert {p["kind"] for p in POSITIVES} == {
+            "paraphrase",
+            "typo",
+            "multilingual",
+            "verbatim",
+        }
 
     def test_no_negative_is_answerable_from_the_corpus(self) -> None:
         """Hard negatives are absent goods, not adjacent subheadings.
@@ -204,9 +224,12 @@ class TestTheCeilingIsCalibratedForRecall:
             for p in POSITIVES
         )
         assert worst <= WORST_TRUE_POSITIVE
-        # 0.0452 of headroom at the time of measuring. The bound is loose enough to
-        # survive a re-measure and tight enough to catch a ceiling raised to make
-        # something pass.
+        # 0.0452 of headroom, unchanged in week 17 — and that is the result, not an
+        # absence of one. The worst positive is still "desktop tower PC sold with its
+        # monitor and keyboard in one unit" at 0.6348, but it is now the worst of fifty
+        # rather than the worst of ten, so 0.68 rests on five times the evidence at the
+        # same value. The bound below is loose enough to survive a re-measure and tight
+        # enough to catch a ceiling raised to make something pass.
         assert CALIBRATED_CEILING - worst < 0.10
 
 

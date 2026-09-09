@@ -6,7 +6,9 @@
     "embedded_text": "'{code} {description_en}' — identical to scripts/embed_corpus.py, so a benchmark distance is the same number production would see.",
     "negatives_are_absent_goods_not_adjacent_codes": "A hard negative here is a good the corpus does not carry, phrased like one it does. Deliberately NOT an adjacent 8-digit subheading of a line that is present: 8482.10 ball bearings and 8482.20 roller bearings are semantically near-identical, and no distance threshold separates them. That case is real, and it is handled by TariffHit.needs_analyst_confirmation rather than by a ceiling. Asserting a threshold could do it would be asserting something false.",
     "expects_vs_expects_hs6": "`expects` is the exact line in THIS fixture's 24-line corpus, which is what tests/integration/test_tariff_benchmark.py measures against. `expects_hs6` is the six-digit subheading, and it is what scripts/calibrate_thresholds.py measures against the published schedule. The two differ because the real HTSA subdivides each subheading into statistical suffixes that a goods description cannot determine: 0901.21 splits eight ways on organic certification, Arabica versus Robusta, and container size, none of which appears in 'roasted cofee beans, not decafinated'. Scoring a plain-language query against a ten-digit code would be scoring the model on facts the query does not contain. Six digits is the level a description supports, and it is also the level that is harmonised internationally, which is why tariff_lines.hs6 exists as the cross-jurisdiction join key.",
-    "negatives_against_the_full_schedule": "Nine of the ten negatives below are negatives only relative to this fixture's 24-line corpus. Live cattle, cut roses, raw sugar, printed books and wooden pencils are all real headings in the published HTSA, so against the full schedule they are positives whose answer was never recorded here. Only 'marine cargo insurance brokerage' stays a negative at any volume, because it is not a good. scripts/calibrate_thresholds.py scores that one and says plainly that it is ignoring the rest; counting them would measure this fixture going stale and report it as precision."
+    "negatives_against_the_full_schedule": "Nine of the ten negatives below are negatives only relative to this fixture's 24-line corpus. Live cattle, cut roses, raw sugar, printed books and wooden pencils are all real headings in the published HTSA, so against the full schedule they are positives whose answer was never recorded here. Only 'marine cargo insurance brokerage' stays a negative at any volume, because it is not a good. scripts/calibrate_thresholds.py scores that one and says plainly that it is ignoring the rest; counting them would measure this fixture going stale and report it as precision.",
+    "week_17_expansion": "Week 16 reported 4/10 against 3/10 at rank one and had to add that one query is not a difference. Fifty positives is what it takes for a single query to stop being worth 10 percentage points. The forty added here were resolved out of data/hts_2026_full.json rather than written from memory: `expects` is a subheading that exists in the published schedule and `description_en` is that subheading's resolved ancestor chain, so a fixture distance stays comparable to a production one. They are labelled at the subheading rather than the statistical suffix for the reason `expects_vs_expects_hs6` already gives - a goods description does not determine a suffix, and labelling one would be labelling a coin toss.",
+    "negatives_are_now_flagged": "`survives_full_schedule` replaces the hardcoded string in calibrate_thresholds.py. Nine of the original ten negatives are goods the 24-line corpus lacks and the published schedule carries, so against the full HTSA they are positives with no recorded answer. Five services were added because that is the shape of negative that survives any corpus: a customs brokerage fee is not a good, and no number of tariff lines makes it one."
   },
   "corpus": [
     {
@@ -104,6 +106,166 @@
     {
       "code": "4011100000",
       "description_en": "New pneumatic tyres of rubber, of a kind used on motor cars, including station wagons and racing cars"
+    },
+    {
+      "code": "020130",
+      "description_en": "Meat of bovine animals, fresh or chilled:, Boneless:"
+    },
+    {
+      "code": "03061700",
+      "description_en": "Crustaceans, whether in shell or not, live, fresh, chilled, frozen, dried, salted or in brine; smoked crustaceans, whether in shell or not, whether or not cooked before or during the smoking process; crustaceans, in shell, cooked by steaming or by boiling in water, whether or not chilled, frozen, dried, salted or in brine:, Frozen:, Other shrimps and prawns"
+    },
+    {
+      "code": "040690",
+      "description_en": "Cheese and curd:, Other cheese:"
+    },
+    {
+      "code": "08039000",
+      "description_en": "Bananas and plantains, fresh or dried:, Other"
+    },
+    {
+      "code": "071333",
+      "description_en": "Dried leguminous vegetables, shelled, whether or not skinned or split:, Beans (Vigna spp., Phaseolus spp.):, Kidney beans, including white pea beans (Phaseolus vulgaris):"
+    },
+    {
+      "code": "10019900",
+      "description_en": "Wheat and meslin:, Other:, Other"
+    },
+    {
+      "code": "180690",
+      "description_en": "Chocolate and other food preparations containing cocoa:, Other:"
+    },
+    {
+      "code": "22030000",
+      "description_en": "Beer made from malt"
+    },
+    {
+      "code": "220421",
+      "description_en": "Wine of fresh grapes, including fortified wines; grape must other than that of heading 2009:, Other wine; grape must with fermentation prevented or arrested by the addition of alcohol:, In containers holding 2 liters or less:"
+    },
+    {
+      "code": "240220",
+      "description_en": "Cigars, cheroots, cigarillos and cigarettes, of tobacco or of tobacco substitutes:, Cigarettes containing tobacco:"
+    },
+    {
+      "code": "2501000000",
+      "description_en": "Salt (including table salt and denatured salt) and pure sodium chloride, whether or not in aqueous solution or containing added anti-caking or free-flowing agents; sea water"
+    },
+    {
+      "code": "92011000",
+      "description_en": "Pianos, including player pianos; harpsichords and other keyboard stringed instruments:, Upright pianos"
+    },
+    {
+      "code": "30042000",
+      "description_en": "Medicaments (excluding goods of heading 3002, 3005 or 3006) consisting of mixed or unmixed products for therapeutic or prophylactic uses, put up in measured doses (including those in the form of transdermal administration systems) or in forms or packings for retail sale:, Other, containing antibiotics"
+    },
+    {
+      "code": "330300",
+      "description_en": "Perfumes and toilet waters:"
+    },
+    {
+      "code": "340111",
+      "description_en": "Soap; organic surface-active products and preparations for use as soap, in the form of bars, cakes, molded pieces or shapes, whether or not containing soap; organic surface-active products and preparations for washing the skin, in the form of liquid or cream and put up for retail sale, whether or not containing soap; paper, wadding, felt and nonwovens, impregnated, coated or covered with soap or detergent:, Soap and organic surface-active products and preparations, in the form of bars, cakes, molded pieces or shapes, and paper, wadding, felt and nonwovens, impregnated, coated or covered with soap or detergent:, For toilet use (including medicated products):"
+    },
+    {
+      "code": "380892",
+      "description_en": "Insecticides, rodenticides, fungicides, herbicides, antisprouting products and plant-growth regulators, disinfectants and similar products, put up in forms or packings for retail sale or as preparations or articles (for example, sulfur-treated bands, wicks and candles, and flypapers):, Other:, Fungicides:"
+    },
+    {
+      "code": "390120",
+      "description_en": "Polymers of ethylene, in primary forms:, Polyethylene having a specific gravity of 0.94 or more:"
+    },
+    {
+      "code": "420221",
+      "description_en": "Trunks, suitcases, vanity cases, attache cases, briefcases, school satchels, spectacle cases, binocular cases, camera cases, musical instrument cases, gun cases, holsters and similar containers; traveling bags, insulated food or beverage bags, toiletry bags, knapsacks and backpacks, handbags, shopping bags, wallets, purses, map cases, cigarette cases, tobacco pouches, tool bags, sports bags, bottle cases, jewelry boxes, powder cases, cutlery cases and similar containers, of leather or of composition leather, of sheeting of plastics, of textile materials, of vulcanized fiber or of paperboard, or wholly or mainly covered with such materials or with paper:, Handbags, whether or not with shoulder strap, including those without handle:, With outer surface of leather or of composition leather:"
+    },
+    {
+      "code": "441231",
+      "description_en": "Plywood, veneered panels and similar laminated wood:, Other plywood consisting solely of sheets of wood (other than bamboo), each ply not exceeding 6 mm in thickness:, With at least one outer ply of tropical wood:"
+    },
+    {
+      "code": "480256",
+      "description_en": "Uncoated paper and paperboard, of a kind used for writing, printing or other graphic purposes, and non perforated punch-cards and punch tape paper, in rolls or rectangular (including square) sheets, of any size, other than paper of heading 4801 or 4803; hand-made paper and paperboard:, Other paper and paperboard, not containing fibers obtained by a mechanical or chemi-mechanical process or of which not more than 10 percent by weight of the total fiber content consists of such fibers:, Weighing 40 g/m² or more but not more than 150 g/m², in sheets with one side not exceeding 435 mm and the other side not exceeding 297 mm in the unfolded state:"
+    },
+    {
+      "code": "520100",
+      "description_en": "Cotton, not carded or combed:"
+    },
+    {
+      "code": "620342",
+      "description_en": "Men's or boys' suits, ensembles, suit-type jackets, blazers, trousers, bib and brace overalls,   breeches and shorts (other than swimwear):, Trousers, bib and brace overalls, breeches and shorts:, Of cotton:"
+    },
+    {
+      "code": "690721",
+      "description_en": "Ceramic flags and paving, hearth or wall tiles; ceramic mosaic cubes and the like, whether or not on a backing; finishing ceramics:, Flags and paving, hearth or wall tiles, other than those of subheading 6907.30 and 6907.40:, Of a water absorption coefficient by weight not exceeding 0.5%:"
+    },
+    {
+      "code": "70071100",
+      "description_en": "Safety glass, consisting of toughened (tempered) or laminated glass:, Toughened (tempered) safety glass:, Of size and shape suitable for incorporation in vehicles, aircraft, spacecraft or vessels"
+    },
+    {
+      "code": "72083900",
+      "description_en": "Flat-rolled products of iron or nonalloy steel, of a width of 600 mm or more, hot-rolled, not clad, plated or coated:, Other, in coils, not further worked than hot-rolled:, Of a thickness of less than 3 mm"
+    },
+    {
+      "code": "730630",
+      "description_en": "Other tubes, pipes and hollow profiles (for example, open seamed or welded, riveted or similarly closed), of iron or steel:, Other, welded, of circular cross section, of iron or nonalloy steel:"
+    },
+    {
+      "code": "841370",
+      "description_en": "Pumps for liquids, whether or not fitted with a measuring device; liquid elevators; part thereof:, Other centrifugal pumps:"
+    },
+    {
+      "code": "841112",
+      "description_en": "Turbojets, turbopropellers and other gas turbines, and parts thereof:, Turbojets:, Of a thrust exceeding 25 kN:"
+    },
+    {
+      "code": "84501100",
+      "description_en": "Household- or laundry-type washing machines, including machines which both wash and dry; parts thereof:, Machines, each of a dry linen capacity not exceeding 10 kg:, Fully automatic machines"
+    },
+    {
+      "code": "850440",
+      "description_en": "Electrical transformers, static converters (for example, rectifiers) and inductors; parts thereof:, Static converters:"
+    },
+    {
+      "code": "852872",
+      "description_en": "Monitors and projectors, not incorporating television reception apparatus; reception apparatus for television, whether or not incorporating radio-broadcast receivers or sound or video recording or reproducing apparatus:, Reception apparatus for television, whether or not incorporating radio-broadcast receivers or sound or video recording or reproducing apparatus:, Other, color:"
+    },
+    {
+      "code": "8523510000",
+      "description_en": "Discs, tapes, solid-state non-volatile storage devices, \"smart cards\" and other media for the recording of sound or of other phenomena, whether or not recorded, including matrices and masters for the production of discs, but excluding products of Chapter 37:, Semiconductor media:, Solid-state non-volatile storage devices"
+    },
+    {
+      "code": "85423100",
+      "description_en": "Electronic integrated circuits; parts thereof:, Electronic integrated circuits:, Processors and controllers, whether or not combined with memories, converters, logic circuits, amplifiers, clock and timing circuits, or other circuits"
+    },
+    {
+      "code": "87032401",
+      "description_en": "Motor cars and other motor vehicles principally designed for the transport of persons (other than those of heading 8702), including station wagons and racing cars:, Other vehicles, with only spark-ignition internal combustion piston engines:, Of a cylinder capacity exceeding 3,000 cc"
+    },
+    {
+      "code": "871200",
+      "description_en": "Bicycles and other cycles (including delivery tricycles), not motorized:"
+    },
+    {
+      "code": "89033200",
+      "description_en": "Yachts and other vessels for pleasure or sports; row boats and canoes:, Motorboats, other than inflatable, not including outboard motorboats:, Of a length exceeding 7.5 m but not exceeding 24 m"
+    },
+    {
+      "code": "9004100000",
+      "description_en": "Spectacles, goggles and the like, corrective, protective or other:, Sunglasses"
+    },
+    {
+      "code": "940161",
+      "description_en": "Seats (other than those of heading 9402), whether or not convertible into beds, and parts thereof:, Other seats, with wooden frames:, Upholstered:"
+    },
+    {
+      "code": "9504500000",
+      "description_en": "Video game consoles and machines, table or parlor games, including pinball machines, billiards, special tables for casino games and automatic bowling equipment, amusement machines operated by coins, banknotes, bank cards, tokens or by any other means of payment:, Video game consoles and machines, other than those of subheading 9504.30, and parts and accessories thereof"
+    },
+    {
+      "code": "961900",
+      "description_en": "Sanitary pads (towels) and tampons, diapers (napkins), diaper liners and similar articles, of any material:"
     }
   ],
   "positives": [
@@ -169,54 +331,374 @@
       "expects": "9403300000",
       "kind": "paraphrase",
       "expects_hs6": "940330"
+    },
+    {
+      "query": "fresh chilled boneless beef cuts for restaurant supply",
+      "expects": "020130",
+      "kind": "paraphrase",
+      "note": "Commercial phrasing. The schedule says 'Boneless' and never says beef in the leaf.",
+      "expects_hs6": "020130"
+    },
+    {
+      "query": "frozen raw shrimp, peeled, farmed",
+      "expects": "03061700",
+      "kind": "paraphrase",
+      "note": "'Other shrimps and prawns' under a frozen heading; 'peeled' and 'farmed' are absent.",
+      "expects_hs6": "030617"
+    },
+    {
+      "query": "aged cheddar cheese in 20 kg blocks",
+      "expects": "040690",
+      "kind": "paraphrase",
+      "note": "Cheddar is named further down the tree; the subheading leaf is 'Other cheese'.",
+      "expects_hs6": "040690"
+    },
+    {
+      "query": "fresh bananas, boxed for retail sale",
+      "expects": "08039000",
+      "kind": "paraphrase",
+      "note": "Leaf reads 'Other'. Only the parent says bananas.",
+      "expects_hs6": "080390"
+    },
+    {
+      "query": "dried red kidney beans in 25 kg sacks",
+      "expects": "071333",
+      "kind": "paraphrase",
+      "note": "Leaf names the bean; the parent supplies 'dried leguminous vegetables'.",
+      "expects_hs6": "071333"
+    },
+    {
+      "query": "milling wheat in bulk, not durum, not seed",
+      "expects": "10019900",
+      "kind": "paraphrase",
+      "note": "Leaf is 'Other' under 'Other'. Two levels of nothing; the chain is all there is.",
+      "expects_hs6": "100199"
+    },
+    {
+      "query": "filled milk chocolate confectionery bars",
+      "expects": "180690",
+      "kind": "paraphrase",
+      "note": "Leaf 'Other'; parent names cocoa rather than chocolate bars.",
+      "expects_hs6": "180690"
+    },
+    {
+      "query": "beer brewed from malt, in cans",
+      "expects": "22030000",
+      "kind": "paraphrase",
+      "note": "Short heading, plain good. Tests that easy cases stay easy.",
+      "expects_hs6": "220300"
+    },
+    {
+      "query": "bottled red wine, 750 ml, 13 percent alcohol",
+      "expects": "220421",
+      "kind": "paraphrase",
+      "note": "The schedule discriminates on container size, not on colour or strength.",
+      "expects_hs6": "220421"
+    },
+    {
+      "query": "cigarettes containing tobacco",
+      "expects": "240220",
+      "kind": "verbatim",
+      "note": "Verbatim heading text. The control: if this misses, the pipeline is broken.",
+      "expects_hs6": "240220"
+    },
+    {
+      "query": "edible table salt, iodised",
+      "expects": "2501000000",
+      "kind": "paraphrase",
+      "note": "'Iodised' appears nowhere; 'table salt' is parenthetical in the heading.",
+      "expects_hs6": "250100"
+    },
+    {
+      "query": "upright acoustic piano for a music school",
+      "expects": "92011000",
+      "kind": "paraphrase",
+      "note": "Leaf 'Upright pianos'; the parent supplies the keyboard-instrument group.",
+      "expects_hs6": "920110"
+    },
+    {
+      "query": "antibiotic tablets in retail blister packs",
+      "expects": "30042000",
+      "kind": "paraphrase",
+      "note": "Shares 'antibiotics' only; the rest of the heading is 200 characters of scope.",
+      "expects_hs6": "300420"
+    },
+    {
+      "query": "eau de parfum in glass bottles for retail",
+      "expects": "330300",
+      "kind": "paraphrase",
+      "note": "French trade term against 'Perfumes and toilet waters'.",
+      "expects_hs6": "330300"
+    },
+    {
+      "query": "bar soap for toilet use, retail wrapped",
+      "expects": "340111",
+      "kind": "paraphrase",
+      "note": "'For toilet use' is the leaf; 'soap' is only in the parent.",
+      "expects_hs6": "340111"
+    },
+    {
+      "query": "agricultural fungicide concentrate, retail packed",
+      "expects": "380892",
+      "kind": "paraphrase",
+      "note": "Leaf 'Fungicides' sits under 'Other' under a 300-character heading.",
+      "expects_hs6": "380892"
+    },
+    {
+      "query": "high density polyethylene resin pellets",
+      "expects": "390120",
+      "kind": "paraphrase",
+      "note": "The schedule expresses density as specific gravity 0.94 or more.",
+      "expects_hs6": "390120"
+    },
+    {
+      "query": "ladies handbags with outer surface of leather",
+      "expects": "420221",
+      "kind": "paraphrase",
+      "note": "Near-verbatim on the leaf, but heading 4202 is one of the longest in the book.",
+      "expects_hs6": "420221"
+    },
+    {
+      "query": "tropical hardwood faced plywood panels, 18 mm",
+      "expects": "441231",
+      "kind": "paraphrase",
+      "note": "'Tropical wood' matches; the 6 mm ply limit in the parent is a distractor.",
+      "expects_hs6": "441231"
+    },
+    {
+      "query": "uncoated A4 copier paper, 80 gsm, in reams",
+      "expects": "480256",
+      "kind": "paraphrase",
+      "note": "A4 is 210x297 mm and the schedule states the bound as 435 mm by 297 mm.",
+      "expects_hs6": "480256"
+    },
+    {
+      "query": "raw cotton, not carded or combed, in bales",
+      "expects": "520100",
+      "kind": "verbatim",
+      "note": "Verbatim apart from 'raw' and 'in bales'.",
+      "expects_hs6": "520100"
+    },
+    {
+      "query": "mens cotton denim trousers",
+      "expects": "620342",
+      "kind": "paraphrase",
+      "note": "Leaf is 'Of cotton'; 'trousers' is the parent; 'denim' appears below.",
+      "expects_hs6": "620342"
+    },
+    {
+      "query": "glazed ceramic floor tiles for building interiors",
+      "expects": "690721",
+      "kind": "paraphrase",
+      "note": "The leaf discriminates on water absorption, which no buyer would write.",
+      "expects_hs6": "690721"
+    },
+    {
+      "query": "toughened safety glass windscreens for cars",
+      "expects": "70071100",
+      "kind": "paraphrase",
+      "note": "'Windscreen' never appears; the schedule says 'suitable for incorporation in vehicles'.",
+      "expects_hs6": "700711"
+    },
+    {
+      "query": "hot rolled steel coil, not clad, 2 mm thick",
+      "expects": "72083900",
+      "kind": "paraphrase",
+      "note": "Thickness is the only discriminator between 7208.36 and 7208.39. Deliberately stated.",
+      "expects_hs6": "720839"
+    },
+    {
+      "query": "welded steel tube, circular section, for scaffolding",
+      "expects": "730630",
+      "kind": "paraphrase",
+      "note": "Scaffolding is an end use the schedule does not recognise at this level.",
+      "expects_hs6": "730630"
+    },
+    {
+      "query": "centrifugal water pump for irrigation",
+      "expects": "841370",
+      "kind": "paraphrase",
+      "note": "'Other centrifugal pumps'; irrigation is an end use the schedule ignores here.",
+      "expects_hs6": "841370"
+    },
+    {
+      "query": "turbojet aircraft engine, thrust over 25 kN",
+      "expects": "841112",
+      "kind": "verbatim",
+      "note": "Verbatim on thrust. A control at the specific end of the schedule.",
+      "expects_hs6": "841112"
+    },
+    {
+      "query": "fully automatic household washing machine, 8 kg load",
+      "expects": "84501100",
+      "kind": "paraphrase",
+      "note": "Capacity is expressed as dry linen capacity not exceeding 10 kg.",
+      "expects_hs6": "845011"
+    },
+    {
+      "query": "static frequency converter for industrial motors",
+      "expects": "850440",
+      "kind": "paraphrase",
+      "note": "'Static converters' matches; 'frequency' and 'motors' are not in the heading.",
+      "expects_hs6": "850440"
+    },
+    {
+      "query": "colour LCD television receivers, 55 inch",
+      "expects": "852872",
+      "kind": "paraphrase",
+      "note": "'Reception apparatus for television'; neither LCD nor a size appears.",
+      "expects_hs6": "852872"
+    },
+    {
+      "query": "usb flash memory drives, solid state, 64 gb",
+      "expects": "8523510000",
+      "kind": "paraphrase",
+      "note": "'Solid-state non-volatile storage devices'. USB and flash are absent.",
+      "expects_hs6": "852351"
+    },
+    {
+      "query": "electronic integrated circuit processor chips",
+      "expects": "85423100",
+      "kind": "paraphrase",
+      "note": "'Processors and controllers' inside a leaf that lists six other circuit types.",
+      "expects_hs6": "854231"
+    },
+    {
+      "query": "petrol saloon car, 3500 cc engine, seats five",
+      "expects": "87032401",
+      "kind": "paraphrase",
+      "note": "3,500 cc is unambiguously 'exceeding 3,000 cc'; the corpus also holds 8703.23.",
+      "expects_hs6": "870324"
+    },
+    {
+      "query": "adult road bicycles, non motorised, two wheels",
+      "expects": "871200",
+      "kind": "paraphrase",
+      "note": "Verbatim on 'not motorized' but the heading leads with delivery tricycles.",
+      "expects_hs6": "871200"
+    },
+    {
+      "query": "pleasure cabin cruiser motorboat, 10 m hull, inboard engine",
+      "expects": "89033200",
+      "kind": "paraphrase",
+      "note": "Length decides 8903.31 from 8903.32; 'inboard' is the schedule's 'not outboard'.",
+      "expects_hs6": "890332"
+    },
+    {
+      "query": "polarised sunglasses for retail sale",
+      "expects": "9004100000",
+      "kind": "verbatim",
+      "note": "One-word leaf, no ancestors needed. The easiest line in the set.",
+      "expects_hs6": "900410"
+    },
+    {
+      "query": "upholstered armchairs with wooden frames",
+      "expects": "940161",
+      "kind": "verbatim",
+      "note": "Leaf 'Upholstered' plus parent 'with wooden frames'. Needs the chain and only the chain.",
+      "expects_hs6": "940161"
+    },
+    {
+      "query": "home video game consoles with controllers",
+      "expects": "9504500000",
+      "kind": "paraphrase",
+      "note": "Near-verbatim, but 9504.30 is excluded in the leaf and is the obvious confusion.",
+      "expects_hs6": "950450"
+    },
+    {
+      "query": "disposable baby diapers, cellulose wadding",
+      "expects": "961900",
+      "kind": "paraphrase",
+      "note": "'Diapers (napkins)' is parenthetical inside a heading that leads with sanitary pads.",
+      "expects_hs6": "961900"
     }
   ],
   "negatives": [
     {
       "query": "portable cordless electric hand drill with a lithium-ion battery",
       "confusable_with": "8471300100",
-      "note": "Portable, powered, hand-carried — every adjective the ADP heading uses. Chapter 84 tools, absent from the corpus."
+      "note": "Portable, powered, hand-carried — every adjective the ADP heading uses. Chapter 84 tools, absent from the corpus.",
+      "survives_full_schedule": false
     },
     {
       "query": "unwrought aluminium in ingot form for remelting",
       "confusable_with": "7207200000",
-      "note": "Reads as semi-finished base metal; chapter 76, absent."
+      "note": "Reads as semi-finished base metal; chapter 76, absent.",
+      "survives_full_schedule": false
     },
     {
       "query": "live pure-bred breeding cattle for dairy herds",
-      "confusable_with": null
+      "confusable_with": null,
+      "survives_full_schedule": false
     },
     {
       "query": "fresh cut roses and flower buds for bouquets",
-      "confusable_with": null
+      "confusable_with": null,
+      "survives_full_schedule": false
     },
     {
       "query": "raw cane sugar in solid form for refining",
-      "confusable_with": null
+      "confusable_with": null,
+      "survives_full_schedule": false
     },
     {
       "query": "mechanical wristwatches with gold cases and jewelled movements",
       "confusable_with": "8483409000",
-      "note": "Toothed gearing is what a mechanical movement is; chapter 91, absent."
+      "note": "Toothed gearing is what a mechanical movement is; chapter 91, absent.",
+      "survives_full_schedule": false
     },
     {
       "query": "liquefied natural gas carried in bulk",
       "confusable_with": "2710192590",
-      "note": "Chapter 27 like the lubricating oils, different heading, absent."
+      "note": "Chapter 27 like the lubricating oils, different heading, absent.",
+      "survives_full_schedule": false
     },
     {
       "query": "printed books, brochures and similar printed matter, bound",
-      "confusable_with": null
+      "confusable_with": null,
+      "survives_full_schedule": false
     },
     {
       "query": "wooden lead pencils and coloured crayons",
       "confusable_with": "9403300000",
-      "note": "Wooden articles, chapter 96, absent."
+      "note": "Wooden articles, chapter 96, absent.",
+      "survives_full_schedule": false
     },
     {
       "query": "marine cargo insurance brokerage arranged for a shipper",
       "confusable_with": null,
-      "note": "Not a good at all. If a tariff schedule answers this, the ceiling is not doing anything."
+      "note": "Not a good at all. If a tariff schedule answers this, the ceiling is not doing anything.",
+      "survives_full_schedule": true
+    },
+    {
+      "query": "customs brokerage and freight forwarding services, per shipment",
+      "confusable_with": null,
+      "note": "A service. No tariff line answers it at any corpus size.",
+      "survives_full_schedule": true
+    },
+    {
+      "query": "software licence renewal, twelve months, delivered by download",
+      "confusable_with": null,
+      "note": "Intangible, no physical good crossing a border, and heading 8523 is the near miss.",
+      "survives_full_schedule": true
+    },
+    {
+      "query": "marine hull insurance premium for a chartered vessel",
+      "confusable_with": null,
+      "note": "A financial product. Chapter 89 is full of vessels and none of them is a premium.",
+      "survives_full_schedule": true
+    },
+    {
+      "query": "engineering consultancy hours for a plant commissioning",
+      "confusable_with": null,
+      "note": "Labour. The schedule classifies goods and this is the shape of an invoice line that keeps arriving on entries.",
+      "survives_full_schedule": true
+    },
+    {
+      "query": "warehouse storage and handling charge, per pallet per month",
+      "confusable_with": null,
+      "note": "A logistics charge. It appears on commercial invoices beside goods, which is exactly why a classifier must decline it rather than guess.",
+      "survives_full_schedule": true
     }
   ]
 }

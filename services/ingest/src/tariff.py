@@ -250,17 +250,56 @@ def retrieval_text(parts: Sequence[str]) -> str:
     further up: ancestors nearer the leaf are the more specific ones, and reaching past a
     parent to include a grandparent would add breadth exactly where precision was wanted.
 
+    **The immediate parent is exempt from the cap unless it is the root of the chain**,
+    and week 17 is the reason for both halves of that sentence.
+
+    The cap used to be measured against the leaf as well, so a leaf long enough to spend
+    the budget on its own left nothing for a single ancestor and the line embedded with no
+    context at all. 1,821 lines of the published schedule are that shape. The worst is
+    0301.93.02.90, whose leaf reads "Other" and whose parent is a 213-character list of
+    carp species: five characters of budget were spent, 208 were refused, and the line
+    embedded as the word "Other" into a corpus holding 2,400 other lines reading "Other".
+
+    Exempting the parent outright fixes that and breaks something else, which is the part
+    worth recording. For 1,079 of those 1,821 the chain is only two deep, so the
+    "parent" is the heading — and a heading is the one ancestor guaranteed to be shared
+    verbatim by every line beneath it. 8471.30.01.00 already read "Portable automatic data
+    processing machines, weighing not more than 10 kg, consisting of at least a central
+    processing unit, a keyboard and a display", which identifies a laptop without help;
+    prepending 190 characters of "Automatic data processing machines and units thereof;
+    magnetic or optical readers..." adds nothing that distinguishes it from the other
+    hundreds of lines under heading 8471. That is precisely the dilution the cap was
+    introduced against in week 13, re-entered through the exemption. Measured over the
+    50-query benchmark, exempting the parent unconditionally scored 41/50 in the top ten
+    against 42/50 for leaving it alone: a fix that made retrieval very slightly worse.
+
+    So the exemption is for *proximate* ancestors only. An intermediate ancestor exists to
+    discriminate between siblings, which is exactly what a leaf reading "Other" cannot do
+    for itself; a root heading exists to name the group they all belong to, which every
+    sibling already carries. 742 lines gain a discriminator, 1,079 keep their
+    self-sufficient leaf undiluted, and the cap goes on governing everything above.
+
+    The cap was never a length limit in any useful sense — the leaf has always been taken
+    whole however long it was, and the longest single-segment `search_text` in the
+    schedule was already 1,685 characters before any of this. Bounding the parent instead
+    would mean truncating it, and half a clause reads as a different clause.
+
     Trailing colons go. The schedule punctuates a heading that continues into its children
     with one, which is typography rather than meaning, and it is a token the model spends
     attention on in every single line.
     """
-    cleaned = [part.strip().rstrip(":").strip() for part in parts]
+    present = [part.strip().rstrip(":").strip() for part in parts]
+    present = [part for part in present if part]
     chosen: list[str] = []
     used = 0
-    for part in reversed(cleaned):
-        if not part:
-            continue
-        if chosen and used + len(part) > RETRIEVAL_TEXT_CAP:
+    for depth, part in enumerate(reversed(present)):
+        # depth 0 is the leaf and is never refused; depth 1 is the immediate parent, exempt
+        # from the cap only when the chain runs deeper than the heading. `len(present) >= 3`
+        # is what says "this parent discriminates between siblings" rather than "this parent
+        # is the heading every sibling already carries". Everything above pays the cap as it
+        # always has, so a line that already carried two segments is unchanged to the byte.
+        proximate_parent = depth == 1 and len(present) >= 3
+        if chosen and not proximate_parent and used + len(part) > RETRIEVAL_TEXT_CAP:
             break
         chosen.append(part)
         used += len(part)
@@ -284,6 +323,18 @@ _UPSERT_LINE = text("""
     ON CONFLICT (jurisdiction, source, code, revision) DO UPDATE SET
         description_en    = EXCLUDED.description_en,
         search_text       = EXCLUDED.search_text,
+        -- A re-ingest that changes the text a line embeds from must invalidate the vector
+        -- built from the old text, or the corpus is updated and the index quietly is not.
+        -- Week 17 found this by fixing the parser: 1,821 lines got their ancestor chain
+        -- back, and `--reembed` would not have touched one of them, because it keys on the
+        -- model id and the model had not changed. Nulling the embedding here is what makes
+        -- `embed_corpus.py` pick up exactly the repaired rows and nothing else.
+        embedding         = CASE
+                              WHEN tariff_lines.search_text IS DISTINCT FROM EXCLUDED.search_text
+                              THEN NULL ELSE tariff_lines.embedding END,
+        embedding_model_id = CASE
+                              WHEN tariff_lines.search_text IS DISTINCT FROM EXCLUDED.search_text
+                              THEN NULL ELSE tariff_lines.embedding_model_id END,
         description_ar    = COALESCE(EXCLUDED.description_ar, tariff_lines.description_ar),
         unit_of_quantity  = EXCLUDED.unit_of_quantity,
         duty_rate_general = EXCLUDED.duty_rate_general,

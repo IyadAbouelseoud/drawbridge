@@ -19,13 +19,18 @@ from __future__ import annotations
 
 import json
 import pathlib
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy import text
 
 from services.classifier.src.embeddings import EmbeddingError, FastEmbedEmbedder, to_pgvector
-from services.classifier.src.search import CONFIRMATION_LEXICAL_FLOOR, search_tariff
+from services.classifier.src.search import (
+    CONFIRMATION_LEXICAL_FLOOR,
+    TariffHit,
+    search_tariff,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -157,21 +162,49 @@ class TestTheConfirmationRuleIsWhatDoesIt:
     happens to be small, and nobody would know which mechanism earned it.
     """
 
-    def test_weak_agreement_between_both_paths_is_not_confirmation(
-        self, loaded: Session, embedder: FastEmbedEmbedder
-    ) -> None:
-        """The defect week 9 found, named.
+    def test_weak_agreement_between_both_paths_is_not_confirmation(self) -> None:
+        """The defect week 9 found, named — and no longer left to a coincidence.
 
-        "wooden lead pencils" reaches wooden office furniture on both paths — a trigram
-        coincidence on the word wooden at 0.157, and a mediocre vector distance. Under the
-        old rule (`matched_by == "both"`) that came back as an answer needing no analyst.
+        "wooden lead pencils" reached wooden office furniture on both paths: a trigram
+        coincidence on the word wooden at 0.157, with a mediocre vector distance agreeing.
+        Under the old rule (`matched_by == "both"`) that came back as an answer needing no
+        analyst.
+
+        This used to run that query against the fixture corpus and assert on whatever came
+        back. Week 17 grew the corpus from 24 lines to 64 and the case disappeared — not
+        because the defect was fixed but because `_search` takes ten hits, ten of
+        twenty-four is most of a corpus and ten of sixty-four is not, so the two paths
+        stopped overlapping at all. **No query in the fixture now produces a `both` hit**,
+        which means the corpus was manufacturing the agreement it was being used to
+        measure. The same is true in production for a different reason: all fifty
+        calibration queries come back vector-only against the 28,899-line schedule.
+
+        So the rule is asserted directly. `needs_analyst_confirmation` is a pure function
+        of the lexical score and the code flag, and constructing the hit tests the rule
+        that was actually at issue rather than the corpus's ability to reproduce a
+        coincidence. The retrieval-side claim it used to make is covered by
+        `test_no_confirmed_answer_is_wrong` over the whole positive set.
         """
-        hits = _search(loaded, embedder, "wooden lead pencils and coloured crayons")
-        agreed = [h for h in hits if h.matched_by == "both"]
-        assert agreed, "the fixture no longer exercises the case it exists for"
-        assert all(h.lexical_score is not None for h in agreed)
-        assert all(h.lexical_score < CONFIRMATION_LEXICAL_FLOOR for h in agreed)
-        assert all(h.needs_analyst_confirmation for h in agreed)
+        agreed_but_weak = TariffHit(
+            code="9403300000",
+            description_en="Wooden furniture of a kind used in offices",
+            description_ar=None,
+            jurisdiction="us",
+            source="usitc_hts",
+            revision=REVISION,
+            duty_rate_general="Free",
+            score=0.5,
+            lexical_score=0.157,  # the measured week 9 value
+            vector_distance=0.42,
+        )
+        assert agreed_but_weak.matched_by == "both"
+        assert agreed_but_weak.lexical_score < CONFIRMATION_LEXICAL_FLOOR
+        assert agreed_but_weak.needs_analyst_confirmation
+
+        # 0.216 was the weakest lexical score behind a correct corroborated answer in the
+        # week 9 set, so the floor has to sit below it and above 0.157.
+        strong_enough = replace(agreed_but_weak, lexical_score=0.216)
+        assert not strong_enough.needs_analyst_confirmation
 
     def test_a_vector_only_hit_is_never_confirmed(
         self, loaded: Session, embedder: FastEmbedEmbedder
