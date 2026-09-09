@@ -235,10 +235,12 @@ Stated here rather than discovered later. The full list, with the reasoning, is 
   against the full 28,899-line HTSA, and week 15 found why: the corpus had been embedded
   from `f"{code} {body}"`, so every document vector carried a ten-digit tariff code that no
   analyst query contains. The document side and the query side were never in the same
-  distribution. That is fixed and the corpus is being re-embedded, but **the thresholds
-  have not been re-measured and the classifier is not yet known to work**. Every number in
-  this repository about retrieval quality was measured against the broken space and should
-  be treated as void until week 16 re-runs them.
+  distribution. That is fixed, the corpus is re-embedded, and re-measuring it moved
+  nothing: **6 of 10 in the top ten and 3 of 10 at rank one.** The distance ranges have
+  crossed — the worst true positive now sits further away (0.529) than the nearest thing
+  the corpus cannot answer (0.467) — so no vector ceiling separates them at any value. The
+  prefix had to go before any measurement over it could be believed; it was not what was
+  wrong with the classifier.
 - **Carry the ruling corpus.** CBP publishes no bulk export; `scripts/ingest_cross.py`
   draws a term-sampled ~120 rulings. A sample is not CROSS.
 - **Fail a pipeline run.** Every n8n HTTP node sets `neverError: true`, so a 500 from

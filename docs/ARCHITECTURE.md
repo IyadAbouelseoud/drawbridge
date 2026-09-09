@@ -1730,6 +1730,30 @@ unsound, not merely worse. `vector_ceiling` at 0.68 still clears the worst posit
 0.045 of headroom, and the finding this file has asserted since week 9 stands: the two
 ranges overlap, so no single distance threshold delivers precision at any value.
 
+**And the full-corpus number, after the re-embed converged.** 28,899 lines, all on the
+`.../desc` convention, `stale: 0`:
+
+| | code + description | description alone |
+|---|---|---|
+| Retrieved in top 10 | 5/10 | **6/10** |
+| At rank 1 | 4/10 | **3/10** |
+| Worst top-hit distance | 0.475 | 0.529 |
+| Nearest non-good | 0.492 | 0.467 |
+
+One better on recall at ten, one worse at rank one, on a ten-query benchmark — which is to
+say: **no measurable improvement.** And the two ranges have now crossed. Before the fix the
+worst true positive (0.475) sat *nearer* than the nearest non-good (0.492), which looked
+like a threshold might separate them. After it the worst positive is at 0.529 and the noise
+at 0.467, so the non-good is closer than the answer. `vector_ceiling` at 0.68 admits both.
+
+That is the same result the fixture corpus gave, at 1,200× the scale, and it is worth being
+blunt about: seven weeks of "5 of 10" was measured over a corpus the queries could not
+reach, and correcting that did not move the number. The defect was real and had to be
+fixed — every measurement before it was unsound — but the classifier's problem was never
+the code prefix. `2 of 10 typo queries` and `1 of 2 Arabic queries` retrieved at all is
+what a 384-dimension multilingual encoder over 29,000 near-identical legal phrases does,
+and week 16 gets to test that claim against measurements that finally mean something.
+
 **What the model measurements were worth.** Before the cause was found, two first-stage
 replacements and two rerankers were measured. Recording them because they are the reason
 the retrieval work stopped where it did rather than continuing into a model swap:

@@ -1165,15 +1165,25 @@ correct engineering response is to leave the gap visible.
       packaged claim with a CBP 7551. Seven defects fixed to get there.
 - [x] **The agent worker against live rows** — connects and selects; drafting proven with
       the model stubbed. Still blocked on an API key.
+- [x] **Re-embed converged** — 28,908 lines and 117 rulings on the `.../desc` convention,
+      `stale: 0`, and a second run embeds nothing.
+- [x] **Re-calibrated against the full corpus.** 6/10 in the top ten (was 5/10) and 3/10 at
+      rank one (was 4/10): **no measurable improvement.** The two distance ranges have
+      crossed — the worst true positive is now at 0.529 and the nearest non-good at 0.467,
+      so the noise is closer than the answer and `vector_ceiling` at 0.68 admits both.
+      Correcting the embedding text made every future measurement sound and did not move
+      the classifier. That is the finding, not a disappointment: the prefix had to go
+      before anything measured over it could be believed.
 - [ ] **Thresholds.** Deliberately not moved. See below.
 
 ### What week 15 deliberately did not do
 
 - **Move a threshold.** `vector_ceiling` and `CONFIRMATION_LEXICAL_FLOOR` are still week
-  8's numbers and `LEXICAL_FLOOR` is still 0.15. Every measurement that would justify
-  moving one was taken against a corpus in the wrong embedding space, so all of them are
-  void. Re-measuring needs the re-embed to finish; tuning before that would be fitting
-  constants to an artefact of the defect.
+  8's numbers and `LEXICAL_FLOOR` is still 0.15. The re-measurement is now in hand and it
+  says no single value works: the worst true positive (0.529) sits *further* than the
+  nearest thing the corpus cannot answer (0.467), so any ceiling that keeps recall admits
+  the noise. That is not a number to tune, it is a retrieval problem to fix, and moving a
+  constant would only decide which of the two failures to have.
 - **Fix the pipeline's inability to fail.** Every n8n HTTP node sets `neverError: true`, so
   a 500 from `/claims/persist` became `{data: "Internal Server Error"}`, the run continued
   through packaging, returned 200 and recorded `success`. Real, understood, and a
@@ -1188,12 +1198,16 @@ correct engineering response is to leave the gap visible.
 1. **A pipeline that can fail.** Remove `neverError` or gate on status after every HTTP
    node. Today a run that 500s reports success and packages a claim built on nothing.
    Largest correctness hole in the repository.
-2. **Re-measure every threshold**, now that the corpus and the queries are in one space.
-   `scripts/calibrate_thresholds.py`, then decide on `vector_ceiling`,
-   `CONFIRMATION_LEXICAL_FLOOR` and `LEXICAL_FLOOR` together and in one commit.
-3. **Then, and only then, revisit the model.** The reranker numbers in `ARCHITECTURE.md`
-   §20.1 were measured against the broken space and should be re-run before they are
-   trusted.
+2. **The model, on evidence that now means something.** Retrieval is 6/10 at ten and 3/10
+   at rank one over a corpus the queries can finally reach, and the distance ranges have
+   crossed — noise nearer than the answer. No threshold fixes that. Re-run the reranker
+   comparison in `ARCHITECTURE.md` §20.1 against the corrected space, and test the standing
+   claim directly: that a 384-dimension multilingual encoder is too thin for 29,000
+   near-identical legal phrases. Two typo queries and one of two Arabic queries retrieve
+   nothing at all, which is the shape of an encoder problem rather than a threshold one.
+3. **Thresholds last, and only if retrieval moves.** `vector_ceiling`,
+   `CONFIRMATION_LEXICAL_FLOOR` and `LEXICAL_FLOOR` together, in one commit, with the
+   measurement in the message.
 4. **A restore drill.** A backup nobody has restored is a file. `pg_restore` into a scratch
    database, run the golden fixtures against it, and record how long it took.
 5. **An Anthropic key in a deployment**, so the agent worker's drafting runs live rather
