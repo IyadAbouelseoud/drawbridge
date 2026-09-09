@@ -14,23 +14,37 @@ Running both and reporting which contributed is the point. A hit both paths agre
 worth more than either alone, and a hit only the vector path produced is exactly the case
 an analyst should look at rather than accept.
 
-No embedding model is called here. Embeddings arrive as vectors from the caller, so this
-module stays a pure function of its input and a classification can be re-run years later
-without depending on a model endpoint that may no longer exist.
+**Reranking is a third stage, and it is opt-in.** Retrieval answers "what is near",
+which over 29,000 near-identical legal phrases is a weaker question than it sounds. Week 16
+measured the gap: the correct subheading is inside the fifty nearest candidates for 8 of 10
+benchmark queries but inside the nearest ten for only 6 — the answer is in the pool and
+ordered wrong. That is the one condition a cross-encoder can fix, because it reads the query
+and the candidate together instead of comparing two points that were embedded apart.
+
+No model is called here, reranker included. Embeddings arrive as vectors and the reranker
+arrives as an object with a `score` method, so this module stays a pure function of its
+inputs and a classification can be re-run years later without depending on a model endpoint
+that may no longer exist. A reranker cannot be reduced to a vector the caller precomputes —
+its whole value is that it sees the pair — so it is passed in whole, and the hit records
+which model produced the score.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import text
+
+from services.classifier.src.embeddings import confidence
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from sqlalchemy.orm import Session
+
+    from services.classifier.src.embeddings import Reranker
 
 # Below this trigram similarity a lexical hit is noise rather than a match.
 LEXICAL_FLOOR = 0.15
@@ -74,6 +88,42 @@ CODE_SCORE = 1.0
 LEXICAL_WEIGHT = 0.55
 VECTOR_WEIGHT = 0.45
 
+# How many candidates the first stage hands the reranker.
+#
+# Measured, not guessed. Recall over the published HTSA at the week 16 re-embed:
+#
+#     depth   10    25    50   100   200   500
+#     found  6/10  6/10  8/10  8/10  8/10  8/10
+#
+# Fifty is where recall stops improving and it is also where it starts: at 25 the pool is
+# still missing two answers, and past 50 nothing more is ever found because the two queries
+# that miss ("desktop tower PC...", "roasted cofee beans") are absent at depth 500 as well.
+# Those are a first-stage failure and no reranking depth reaches them.
+#
+# Depth is the whole cost of this stage. Every candidate is a forward pass through a
+# cross-encoder — about 2 seconds for fifty on CPU, against 20 milliseconds for the
+# pgvector query that produced them. Doubling the depth doubles the latency and, here,
+# buys nothing.
+RERANK_DEPTH = 50
+
+# How much of the final score the reranker owns, against the retrieval score it is
+# re-ordering.
+#
+# Not 1.0, and that is the measurement rather than a hedge. Pure reranker order scores
+# 8/10 in the top ten and 3/10 at rank one; blending recovers a fourth rank-1 because two
+# queries the first stage already had at rank 1 ("hex head steel bolts", the Arabic
+# smartphone) are pushed down by a cross-encoder that has no notion of tariff text. The
+# blend keeps what retrieval got right and takes what reranking fixes:
+#
+#     w       0.0   0.4   0.5   0.7   0.85   1.0
+#     rank-1  3/10  4/10  4/10  4/10  4/10   3/10
+#     top-10  6/10  7/10  8/10  8/10  8/10   8/10
+#
+# 0.70 sits mid-plateau. The plateau is broad (0.50–0.85 all score the same) which is worth
+# more than the value at its centre: a constant that only works at one setting is fitted to
+# ten queries, and this one is not.
+RERANK_WEIGHT = 0.70
+
 
 @dataclass(frozen=True, slots=True)
 class TariffHit:
@@ -89,6 +139,21 @@ class TariffHit:
     score: float
     lexical_score: float | None
     vector_distance: float | None
+
+    rerank_score: float | None = None
+    """The cross-encoder's confidence for this candidate, 0-1, or None if none ran.
+
+    Kept beside the retrieval scores rather than replacing them. The final `score` is a
+    blend, and an analyst asking why a line ranked where it did needs to see which stage
+    put it there — a hit the reranker rescued from position 28 and a hit retrieval had at
+    position 1 are different kinds of answer and should not look identical."""
+
+    reranker_id: str | None = None
+    """Which cross-encoder produced `rerank_score`.
+
+    The same reason `embedding_model_id` is on the corpus: a score is meaningless outside
+    the model that produced it, and a stored classification has to stay explicable after
+    the default has moved on."""
 
     code_matched: bool = False
     """Whether the caller named this line's code in the query.
@@ -155,6 +220,10 @@ class TariffHit:
             "duty_rate_general": self.duty_rate_general,
             "score": round(self.score, 4),
             "matched_by": self.matched_by,
+            "rerank_score": (
+                round(self.rerank_score, 4) if self.rerank_score is not None else None
+            ),
+            "reranker_id": self.reranker_id,
             "code_matched": self.code_matched,
             "lexical_score": round(self.lexical_score, 4) if self.lexical_score else None,
             "vector_distance": (
@@ -193,9 +262,22 @@ def code_prefix(query: str) -> str | None:
     return digits if len(digits) >= 6 else None
 
 
-_CODE_SQL = text("""
+#: The text a candidate is reranked against. Identical to the expression
+#: `scripts/embed_corpus.py` embeds, and identical for the same reason: the reranker has
+#: to read the text the retrieval stage matched on, or the second stage is judging a
+#: different document from the one the first stage found.
+#:
+#: It matters here more than it looks. `description_en` on a leaf line is the *heading*
+#: text — 8471.30.01 reads "Automatic data processing machines and units thereof", which is
+#: shared with every other line under the heading and describes a laptop no better than it
+#: describes a mainframe. `search_text` carries the leaf: "Portable automatic data
+#: processing machines, weighing not more than 10 kg...". Reranking on the heading would
+#: hand the cross-encoder fifty near-identical strings and ask it to choose.
+_BODY_SQL = "coalesce(nullif(search_text, ''), nullif(description_en, ''), description_ar, '')"
+
+_CODE_SQL = text(f"""
     SELECT code, description_en, description_ar, jurisdiction, source, revision,
-           duty_rate_general
+           duty_rate_general, {_BODY_SQL} AS body
     FROM tariff_lines
     WHERE jurisdiction = :jurisdiction
       AND (CAST(:revision AS text) IS NULL OR revision = CAST(:revision AS text))
@@ -204,9 +286,9 @@ _CODE_SQL = text("""
     LIMIT :limit
 """)
 
-_LEXICAL_SQL = text("""
+_LEXICAL_SQL = text(f"""
     SELECT code, description_en, description_ar, jurisdiction, source, revision,
-           duty_rate_general,
+           duty_rate_general, {_BODY_SQL} AS body,
            similarity(description_en, :q) AS lex
     FROM tariff_lines
     WHERE jurisdiction = :jurisdiction
@@ -216,9 +298,9 @@ _LEXICAL_SQL = text("""
     LIMIT :limit
 """)
 
-_VECTOR_SQL = text("""
+_VECTOR_SQL = text(f"""
     SELECT code, description_en, description_ar, jurisdiction, source, revision,
-           duty_rate_general,
+           duty_rate_general, {_BODY_SQL} AS body,
            embedding <=> CAST(:embedding AS vector) AS dist
     FROM tariff_lines
     WHERE jurisdiction = :jurisdiction
@@ -281,6 +363,9 @@ def search_tariff(
     limit: int = 10,
     vector_ceiling: float = VECTOR_CEILING,
     confirmation_lexical_floor: float = CONFIRMATION_LEXICAL_FLOOR,
+    reranker: Reranker | None = None,
+    rerank_depth: int = RERANK_DEPTH,
+    rerank_weight: float = RERANK_WEIGHT,
 ) -> tuple[list[TariffHit], str]:
     """Classify a goods description. Returns hits and which method answered.
 
@@ -297,6 +382,18 @@ def search_tariff(
     Week 15 removed the opposite arrangement — every document had its own code joined to
     the front of the text before embedding, so the corpus carried a token no query ever
     contains and the two sides were never in the same distribution.
+
+    Passing a `reranker` widens the vector shortlist to `rerank_depth` and re-scores it
+    with a cross-encoder. It costs about two seconds a query on CPU and it is the
+    difference between 6 and 8 of the ten benchmark queries retrieving their subheading at
+    all, because the pool at depth 50 already contains answers the top ten does not.
+    Passing none is fully supported and is not a degraded mode: the caller gets the week
+    15 behaviour exactly, which is what a bulk classification run over thousands of lines
+    should want.
+
+    A reranker never overturns a code lookup. `CODE_SCORE` is the ceiling of the score
+    range and the code path is excluded from reranking entirely — the caller named the
+    line, and a model is not entitled to an opinion about whether they meant it.
     """
     by_code: dict[str, dict[str, Any]] = {}
     prefix = code_prefix(query)
@@ -325,6 +422,12 @@ def search_tariff(
     ).mappings():
         lexical[row["code"]] = dict(row)
 
+    # The reranker's shortlist is the vector shortlist. Widening it is the whole cost of
+    # the second stage and the whole source of its benefit: candidates it never sees cannot
+    # be rescued, and week 16 measured two of the ten benchmark answers living between
+    # position 10 and position 50.
+    vector_limit = max(rerank_depth, limit * 2) if reranker is not None else limit * 2
+
     vector: dict[str, dict[str, Any]] = {}
     if embedding is not None:
         for row in session.execute(
@@ -335,7 +438,7 @@ def search_tariff(
                 "embedding": "[" + ",".join(str(float(x)) for x in embedding) + "]",
                 "jurisdiction": jurisdiction,
                 "revision": revision,
-                "limit": limit * 2,
+                "limit": vector_limit,
             },
         ).mappings():
             if row["dist"] <= vector_ceiling:
@@ -353,6 +456,14 @@ def search_tariff(
         else "lexical"
     )
     hits = _merge(lexical, vector, confirmation_lexical_floor, by_code)
+    if reranker is not None:
+        bodies = {
+            code: str(row["body"])
+            for source in (by_code, lexical, vector)
+            for code, row in source.items()
+            if row.get("body")
+        }
+        hits = _rerank(hits, query=query, bodies=bodies, reranker=reranker, weight=rerank_weight)
     # Score first, then the code itself. Every code hit scores exactly CODE_SCORE, so
     # without a tiebreak a prefix lookup would return its lines in whatever order a set
     # iterated — a different ranking for the same query on the same corpus. Shorter codes
@@ -362,6 +473,56 @@ def search_tariff(
     # that starts with the same query returning the same first row twice.
     hits.sort(key=lambda h: (-h.score, len(h.code), h.code))
     return hits[:limit], method
+
+
+def _rerank(
+    hits: list[TariffHit],
+    *,
+    query: str,
+    bodies: dict[str, str],
+    reranker: Reranker,
+    weight: float,
+) -> list[TariffHit]:
+    """Re-score the shortlist with a cross-encoder, blending against what retrieval said.
+
+    Blended rather than replaced, because the two stages fail differently and measurably
+    so. The cross-encoder reads the query and the candidate together, which is how it
+    rescues an answer sitting at position 28; it also has no notion of tariff text, which
+    is how it demotes two answers the first stage already had at rank 1. Taking its order
+    outright scores 3 of 10 at rank one. Taking 70% of it scores 4. See `RERANK_WEIGHT`.
+
+    Code hits are excluded and keep `CODE_SCORE`. Reranking them would mean scoring a
+    lookup as if it were a guess, and — since the blend is bounded below 1.0 — would rank
+    the line the caller asked for underneath a paraphrase of it.
+
+    A candidate with no body text is passed through unreranked rather than sent to the
+    model as an empty string. An empty document scores arbitrarily, and an arbitrary score
+    at 70% weight is worse than no score at all.
+    """
+    scorable = [hit for hit in hits if not hit.code_matched and bodies.get(hit.code)]
+    if not scorable:
+        return hits
+
+    scores = reranker.score(query, [bodies[hit.code] for hit in scorable])
+    blended = {
+        hit.code: (
+            weight * confidence(score) + (1.0 - weight) * hit.score,
+            confidence(score),
+        )
+        for hit, score in zip(scorable, scores, strict=True)
+    }
+
+    return [
+        hit
+        if hit.code not in blended
+        else replace(
+            hit,
+            score=blended[hit.code][0],
+            rerank_score=blended[hit.code][1],
+            reranker_id=reranker.model_id,
+        )
+        for hit in hits
+    ]
 
 
 def _merge(

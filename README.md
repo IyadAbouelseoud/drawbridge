@@ -97,6 +97,17 @@ and the only way the agent layer reaches data:
 | `mcp-claims` | the claim state machine |
 | `mcp-ledger` | the audit ledger |
 
+Classification is two-stage as of week 16: pgvector narrows 28,899 lines to 50 in about
+20 ms, then a multilingual cross-encoder re-scores those 50 and its confidence is blended
+70/30 against the retrieval score. The blend is the part that matters — taking the
+cross-encoder's order outright is no better than retrieval alone, because it demotes as
+many answers as it rescues. `make calibrate-rerank` prints one stage beside two.
+
+```
+9/10 retrieved in the top 10   ·   5/10 at rank 1
+one stage was 6/10 in the top 10 and 3/10 at rank 1
+```
+
 The workflows are imported and run:
 
 ```
@@ -139,6 +150,8 @@ Optional profiles, both of which replace a development shortcut with the real th
 ```sh
 make vault-up                     # secrets from HashiCorp Vault over AppRole, not a file
 make vault-agent-up               # the infra path vault-agent renders Postgres/MinIO/n8n from
+make calibrate-rerank             # the labelled set, one stage beside two
+make restore-drill                # newest backup into a scratch database, then dropped
 make identity-up TENANT=<uuid>    # Authentik: OIDC provider, tenant claim, RS256 round trip
 make n8n-import                   # import the workflows, activate them, restart n8n
 ```
@@ -183,6 +196,15 @@ One nuance worth knowing before an incident: object lock protects the bytes, not
 listing. `DeleteObject` still succeeds by writing a delete marker, and the protected version
 survives underneath but disappears from an ordinary `ls`. `retention.py catalogue`
 enumerates versions and names anything a delete marker is masking.
+
+**And the backups have now been restored.** `retention.py restore` downloads the newest
+object, checks it against the digest recorded when it was written, restores into a scratch
+database it refuses to point at production, and recomputes every tenant's ledger hash chain
+inside the restored copy — because row counts prove `pg_restore` moved data and only the
+chain proves it is the data that went in. It runs weekly on the schedule loop rather than
+when somebody remembers. Measured: 28,908 tariff lines and 280 ledger entries back in **15
+seconds**, `pg_restore` clean. Its first run failed on a masked password, which is the only
+kind of defect this repository has been finding lately.
 
 **White label is a compliance surface, not a logo.** The preparer notice on a CBP form is a
 representation to a customs authority. A licensed broker running this prepares filings
@@ -231,24 +253,22 @@ make pilot-run                    # both corpora end to end against the deployed
 Stated here rather than discovered later. The full list, with the reasoning, is in
 `docs/ROADMAP.md`.
 
-- **Classify reliably.** The benchmark retrieved 5 of 10 correct subheadings at six digits
-  against the full 28,899-line HTSA, and week 15 found why: the corpus had been embedded
-  from `f"{code} {body}"`, so every document vector carried a ten-digit tariff code that no
-  analyst query contains. The document side and the query side were never in the same
-  distribution. That is fixed, the corpus is re-embedded, and re-measuring it moved
-  nothing: **6 of 10 in the top ten and 3 of 10 at rank one.** The distance ranges have
-  crossed — the worst true positive now sits further away (0.529) than the nearest thing
-  the corpus cannot answer (0.467) — so no vector ceiling separates them at any value. The
-  prefix had to go before any measurement over it could be believed; it was not what was
-  wrong with the classifier.
+- **Classify reliably.** Week 16 took it from 6 of 10 to **9 of 10** correct subheadings
+  at six digits against the full 28,899-line HTSA, by adding a cross-encoder over the fifty
+  nearest candidates. That is real movement and it is still ten queries — a demonstration,
+  not a validation, and 5 of 10 at rank one is not a classifier an analyst can stop reading.
+  Two queries fail at any retrieval depth because 596 leaf lines lost their ancestor chain
+  during ingest, so 8471.41 — what a desktop PC classifies under — carries text that never
+  says it is a computer. A larger labelled set and that ingest fix are week 17.
 - **Carry the ruling corpus.** CBP publishes no bulk export; `scripts/ingest_cross.py`
   draws a term-sampled ~120 rulings. A sample is not CROSS.
 - **Fail a pipeline run.** Every n8n HTTP node sets `neverError: true`, so a 500 from
   `/claims/persist` becomes `{data: "Internal Server Error"}`, the run continues through
   packaging, returns HTTP 200 and records `success`. Understood, reproduced, and not yet
-  fixed — it is a structural change to a 22-node graph and it is the first item on the week
-  16 list.
-- **Restore a backup.** Backups are taken and are provably immutable. Nobody has restored
-  one, and a backup nobody has restored is a file.
+  fixed — it is a structural change to a 22-node graph and it has been the first item on
+  the entry checklist for two weeks running, which is the argument for doing it next.
+- **Classify a whole entry interactively.** Reranking costs ~2.2 s a line, so a 200-line
+  entry is a seven-minute request. It is opt-in for exactly that reason; batching it is
+  week 17.
 - **File anything.** Both pilot corpora are fiction, every figure carries a
   `pilot-fixture` provenance box, and `assert_not_evidence` refuses to act on one.

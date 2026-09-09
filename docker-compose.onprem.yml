@@ -569,6 +569,14 @@ services:
       # Five years, from 19 CFR 163.4 and GCC Art. 175. Raising it is safe; lowering it
       # does nothing to objects already written, because that is what COMPLIANCE mode is.
       DRAWBRIDGE_BACKUP_RETENTION_DAYS: ${DRAWBRIDGE_BACKUP_RETENTION_DAYS:-1830}
+      # The scheduled loop also restores a backup into a scratch database once a week and
+      # re-verifies every hash chain inside the restored copy. Two consequences worth
+      # knowing before the first Sunday: the Postgres volume needs headroom for a second
+      # copy of the database for the length of a restore, and the role in the DSN above
+      # needs CREATEDB. It is the database owner, so it has it — but a deployment that
+      # narrows that role will see the drill fail and the backups keep succeeding, which
+      # is the wrong half to lose silently.
+      DRAWBRIDGE_BACKUP_DRILL_INTERVAL: ${DRAWBRIDGE_BACKUP_DRILL_INTERVAL:-604800}
     networks: [data]
     depends_on:
       postgres: { condition: service_healthy }

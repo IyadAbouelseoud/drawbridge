@@ -1959,3 +1959,211 @@ update, the per-row commit — all three rows drafted and committed with `agent_
 `agent_model` and `agent_drafted_at` populated. The stub memos were reverted afterwards.
 So the write path is proven and the model call is not, and no amount of further work here
 substitutes for a key.
+
+---
+
+## 21. The second stage (week 16)
+
+Week 15 ended with a number that had stopped moving and an untested explanation for it.
+Retrieval was 6 of 10 at hs6 in the top ten, the corpus and the queries were finally in
+one embedding space, and the standing claim — *a 384-dimension multilingual MiniLM is too
+thin for 29,000 near-identical legal phrases* — had been carried since week 14 without
+anyone measuring it.
+
+Week 16 measured it, and the claim is half right in a way that changes what to build.
+
+### 21.1 The answer is usually in the pool, and ranked wrong
+
+The measurement nobody had taken is recall at depth. One query, the fifty nearest lines,
+and the question of whether the correct subheading is anywhere among them:
+
+| depth | 10 | 25 | **50** | 100 | 200 | 500 |
+|---|---|---|---|---|---|---|
+| correct hs6 present | 6/10 | 6/10 | **8/10** | 8/10 | 8/10 | 8/10 |
+
+Two of the ten answers live between position 10 and position 50. That is not a
+representation too thin to find them — it found them — it is a first stage that cannot
+order what it retrieved. Cosine distance between a four-word commercial description and a
+tariff leaf is a weak ordering signal over a corpus where thousands of leaves differ by a
+qualifier, and it does not become a strong one at any threshold.
+
+It also puts a hard ceiling on the week: **8 of 10 is the most any reranker can score**,
+because a candidate the first stage never returns cannot be re-scored. The two it misses —
+"desktop tower PC sold with its monitor and keyboard in one unit" and "roasted cofee beans,
+not decafinated" — are absent at depth 500, and §21.5 is about why.
+
+### 21.2 What the cross-encoder is, and why it is not an embedder
+
+An `Embedder` maps one text to a point. That is what makes a corpus searchable: 29,000
+documents are embedded once, indexed, and every subsequent query is a distance computation
+the database can do. The query and the document are never in the same forward pass, which
+is exactly the property that makes it cheap and exactly the information that is lost.
+
+A `Reranker` scores a *pair*. It reads "ruggedised field laptop computer" and "Portable
+automatic data processing machines, weighing not more than 10 kg..." together, in one pass,
+and answers whether the second responds to the first. There is nothing to precompute and
+nothing to index: the cost is one model call per candidate, every time. On CPU, about two
+seconds for fifty.
+
+That asymmetry is the whole architecture. Retrieval narrows 29,000 to 50 for 20
+milliseconds; reranking orders 50 for 2 seconds. Reranking 29,000 would take nineteen
+hours a query.
+
+### 21.3 The measurement, and the model that did not ship
+
+Three cross-encoders over the corrected corpus, depth 50, against the ten labelled
+positives:
+
+| Reranker | rank-1 | top-10 | Cost |
+|---|---|---|---|
+| none (retrieval alone) | 3/10 | 6/10 | ~20 ms |
+| `BAAI/bge-reranker-base` | 2/10 | 6/10 | 2.1 s |
+| `jinaai/jina-reranker-v2-base-multilingual` | 3/10 | **8/10** | 2.2 s |
+| **jina-v2, blended at 0.70** | **4/10** | **8/10** | 2.2 s |
+
+`bge-reranker-base` is multilingual, a third of the size, and does not work here: it
+reorders confidently over tariff text it has no notion of, and rank-1 falls. Being
+multilingual is necessary and not sufficient — week 15 had already established the
+necessary half by watching an English cross-encoder move the Arabic smartphone query from
+rank 1 to rank 12.
+
+**And the blend is the finding, not the reranker.** Taking the cross-encoder's order
+outright scores 3 of 10 at rank one — no better than retrieval — because it demotes two
+queries the first stage already had right while rescuing two it did not. Blending
+`0.70 · confidence(logit) + 0.30 · retrieval_score` keeps both:
+
+| w | 0.0 | 0.4 | 0.5 | 0.7 | 0.85 | 1.0 |
+|---|---|---|---|---|---|---|
+| rank-1 | 3/10 | 4/10 | 4/10 | **4/10** | 4/10 | 3/10 |
+| top-10 | 6/10 | 7/10 | 8/10 | **8/10** | 8/10 | 8/10 |
+
+The plateau from 0.50 to 0.85 matters more than the value at its centre. A constant that
+only works at one setting has been fitted to ten queries; this one survives a 70% change
+in its own value.
+
+The two signals are blended after `confidence()` squashes the logit, because they are not
+otherwise commensurable: cosine similarity is bounded in [0, 1] by construction and a logit
+is unbounded in both directions. Weighting an unbounded score against a bounded one does
+not produce a weighted average, it produces whichever number was larger.
+
+### 21.4 End to end, against the published schedule
+
+`scripts/calibrate_thresholds.py --rerank`, full 28,899-line HTSA, both stages measured in
+the same run so the delta is on the page:
+
+```
+POSITIVES — does the right subheading still come back at volume?
+  9/10 retrieved in the top 10
+  5/10 at rank 1
+  one stage was 6/10 in the top 10 and 3/10 at rank 1
+  reranked query latency: median 2854 ms, max 8541 ms
+```
+
+Nine, not the eight §21.1 capped it at, because production merges the lexical path too and
+"roasted cofee beans, not decafinated" — invisible to the vector path at any depth — comes
+back through trigram similarity at rank 1. The hybrid design earns its keep on precisely
+the query the semantic half cannot see.
+
+Against the number this repository has carried since week 13:
+
+| | wk 13–14 | wk 15 (re-embed) | **wk 16 (two-stage)** |
+|---|---|---|---|
+| top-10 at hs6 | 5/10 | 6/10 | **9/10** |
+| rank-1 at hs6 | 4/10 | 3/10 | **5/10** |
+
+Ten queries is a small set and this is not a claim that classification is solved. It is the
+first time the number has moved for a reason that was measured before the change rather
+than after it.
+
+### 21.5 What is still wrong, and it is in the corpus
+
+The two queries that miss at depth 500 are one defect. `search_text` is the leaf
+description with its ancestor chain flattened onto the front, and the chain is not always
+there:
+
+```
+8471.49.00  "Other, entered in the form of systems, Other automatic data processing machines"
+8471.41.01  "Comprising in the same housing at least a central processing unit and an
+             input and output unit, whether or not..."
+```
+
+The second line is the one a desktop PC classifies under, and its text never says it is a
+computer. Its parent heading — *Other automatic data processing machines* — is present on
+its sibling and absent on it. No encoder retrieves that from "desktop tower PC sold with
+its monitor and keyboard in one unit", and no reranker can rescue what retrieval cannot
+return. 596 of the ten-digit US lines carry a single-segment `search_text`, which is the
+same shape of gap at ~3% of the leaves.
+
+That is an ingest defect, not a model one, and fixing it is a re-ingest and a re-embed
+rather than a constant. Week 17.
+
+### 21.6 The thresholds did not move, and one of them changed jobs
+
+`vector_ceiling` stays 0.68, `CONFIRMATION_LEXICAL_FLOOR` stays 0.20, `LEXICAL_FLOOR` stays
+0.15 — but for the first time there is a measured bound rather than an absence of one.
+
+Under reranking the ceiling stopped being the gate on what an analyst is shown and became
+the gate on what the cross-encoder is allowed to consider. A candidate cut here cannot be
+rescued, and rescuing distant candidates is what the second stage does: the correct
+subheading for "ruggedised field laptop computer" sits at distance **0.601**, position 28
+in the shortlist, and comes back at 6. Across the ten positives, 0.601 is the worst correct
+candidate anywhere in the depth-50 pool. So 0.68 clears it by 0.079, and **any value below
+about 0.61 is now demonstrably wrong** rather than merely tight. Raising it further buys
+nothing measured and admits more noise into a stage that costs two seconds a query.
+
+**And the reranker's confidence is not a precision threshold either**, which is worth
+recording because it is the obvious next thing to reach for. The one benchmark query that
+is genuinely unanswerable — "marine cargo insurance brokerage arranged for a shipper", not
+a good, no tariff line for it at any volume — scores the lowest confidence of all twenty
+queries at 0.0735. Encouraging, and it does not survive contact with the set: "ruggedised
+field laptop computer" is a *positive* and scores 0.0888. Two points 0.015 apart, on
+opposite sides of the only question a threshold would be asked. There is no floor there.
+
+### 21.7 A backup that has now been restored
+
+Week 15 shipped `scripts/retention.py`: `pg_dump` into MinIO under COMPLIANCE object lock,
+proven undeletable by root, verified against a live bucket. What it had never done was read
+one back. The week 16 checklist put it plainly — *a backup nobody has restored is a file* —
+and the first run of `retention.py restore` failed in thirty seconds:
+
+```
+FATAL:  password authentication failed for user "drawbridge"
+```
+
+`str(sqlalchemy.URL)` renders the password as `***`. That is the right default everywhere
+except when the string is going to be connected with, and the failure is a URL that reads
+correctly in the traceback and cannot connect. Nothing short of running it finds that,
+which is the week 15 finding wearing a different hat.
+
+The drill, once it ran:
+
+```json
+{"job": "restore", "pg_restore_exit": 0, "pg_restore_warnings": [],
+ "rows": {"audit_ledger": 280, "claims": 8, "entry_lines": 8, "tariff_lines": 28908},
+ "ledger": {"tenants": 2, "entries": 280, "ok": true, "broken": []},
+ "timings": {"download_seconds": 0.74, "restore_seconds": 12.75,
+             "count_seconds": 0.04, "verify_seconds": 0.07, "total_seconds": 14.97},
+ "ok": true}
+```
+
+Four things about its shape:
+
+- **It restores into a scratch database and refuses to restore into the source.** The
+  natural way to test a restore is to point it at the database you already have, and doing
+  that once replaces production with a copy of itself from last night. The guard is checked
+  before anything else runs, and is tested.
+- **It checks the bytes against the digest recorded when they were written**, not against
+  the object's ETag. An ETag is computed by the same party that stored the object, so
+  comparing an object to its own ETag proves the transfer worked and not that the bytes are
+  the ones `pg_dump` produced.
+- **It recomputes every tenant's hash chain inside the restored copy.** Row counts prove
+  `pg_restore` moved data; the chain proves the data that came back is the data that went
+  in. A backup that restores a corrupted ledger restores a record nobody can rely on, and
+  it passes every check short of this one.
+- **It runs weekly on the `schedule` loop.** The failure it guards against — a dump
+  silently unrestorable for months — is bounded only by how long it can go unnoticed, and a
+  drill that depends on being remembered stops after the incident it was added for. The
+  first drill waits a full interval, because on a cold start the bucket is empty.
+
+The number the recovery plan actually needed: **15 seconds**, 12.75 of it `pg_restore`, on
+a 52 MB dump of a 28,908-line corpus.

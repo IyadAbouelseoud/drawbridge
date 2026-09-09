@@ -7,9 +7,9 @@
 
 | | |
 |---|---|
-| Current week | 15 |
+| Current week | 16 |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | **Debug, review, harden** — run every artefact that had only been validated, and fix what running it found |
+| Current milestone | **The second stage** — a reranker that moves the number, and a backup that has been restored |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
 
 ---
@@ -31,6 +31,7 @@
 | 12–13 | Pilot: one US importer + one KSA re-exporter, backward-looking claims | Filed claim in each jurisdiction, refund in motion |
 | 14 | Broker white-label packaging + on-prem compose | Reproducible `.onprem.yml` deploy |
 | 15 | Debug, review, harden | Backups under object lock; every committed artefact executed at least once |
+| 16 | Retrieve-then-rerank; restore drill | 9/10 at hs6 in the top ten; a backup restored and its ledger re-verified |
 
 ---
 
@@ -1198,17 +1199,21 @@ correct engineering response is to leave the gap visible.
 1. **A pipeline that can fail.** Remove `neverError` or gate on status after every HTTP
    node. Today a run that 500s reports success and packages a claim built on nothing.
    Largest correctness hole in the repository.
-2. **The model, on evidence that now means something.** Retrieval is 6/10 at ten and 3/10
+2. ~~**The model, on evidence that now means something.**~~ *Done in week 16 — see
+   §21. The claim was half right: the encoder finds the answer and cannot order it, so the
+   fix was a second stage rather than a bigger first one.* Retrieval is 6/10 at ten and 3/10
    at rank one over a corpus the queries can finally reach, and the distance ranges have
    crossed — noise nearer than the answer. No threshold fixes that. Re-run the reranker
    comparison in `ARCHITECTURE.md` §20.1 against the corrected space, and test the standing
    claim directly: that a 384-dimension multilingual encoder is too thin for 29,000
    near-identical legal phrases. Two typo queries and one of two Arabic queries retrieve
    nothing at all, which is the shape of an encoder problem rather than a threshold one.
-3. **Thresholds last, and only if retrieval moves.** `vector_ceiling`,
+3. ~~**Thresholds last, and only if retrieval moves.**~~ *Retrieval moved; the
+   thresholds still did not, and week 16 recorded the measured bound instead.* `vector_ceiling`,
    `CONFIRMATION_LEXICAL_FLOOR` and `LEXICAL_FLOOR` together, in one commit, with the
    measurement in the message.
-4. **A restore drill.** A backup nobody has restored is a file. `pg_restore` into a scratch
+4. ~~**A restore drill.**~~ *Done in week 16 — `retention.py restore`, weekly on the
+   schedule loop, 15 seconds end to end.* A backup nobody has restored is a file. `pg_restore` into a scratch
    database, run the golden fixtures against it, and record how long it took.
 5. **An Anthropic key in a deployment**, so the agent worker's drafting runs live rather
    than to a stub.
@@ -1220,6 +1225,67 @@ correct engineering response is to leave the gap visible.
 8. **Signed images**, so "what is deployed" has a provenance answer and not just an
    identity one.
 9. **A *Bayan* header-block template** — as far as B3 allows, which is not far.
+
+## Week 16 task breakdown
+
+- [x] **Retrieve-then-rerank.** `Reranker` and `FastEmbedReranker` in `embeddings.py`,
+      a `_rerank` stage in `search.py`, opt-in on `/classification/run` and
+      `classify_with_embedding`. 50 candidates from pgvector, re-scored by
+      `jinaai/jina-reranker-v2-base-multilingual`, blended `0.70 / 0.30` against retrieval.
+- [x] **The depth and the weight are measured, not chosen.** Recall stops improving at
+      depth 50 (6/10 at 25, 8/10 from 50 to 500). The weight has a plateau from 0.50 to
+      0.85, all scoring 4/10 at rank one.
+- [x] **`BAAI/bge-reranker-base` measured and rejected** — multilingual, a third the
+      latency, and rank-1 falls from 3 to 2. Being multilingual is necessary and not
+      sufficient.
+- [x] **The number moved.** 9/10 at hs6 in the top ten and 5/10 at rank one, against 6/10
+      and 3/10 one-stage. First movement since week 13, and the first that was measured
+      before the change rather than after it.
+- [x] **Restore drill.** `retention.py restore` — newest object, digest checked against
+      what was recorded at write time, `pg_restore` into a scratch database, every tenant's
+      hash chain re-verified **inside the restored copy**, then dropped. Weekly on the
+      `schedule` loop. Run for real: 28,908 lines and 280 ledger entries back in 15 seconds.
+- [x] **A real defect found by running it**: `str(sqlalchemy.URL)` masks the password, so
+      the first drill could not connect using a URL that read correctly in the traceback.
+- [ ] **Thresholds.** Deliberately not moved, again. See below.
+
+### What week 16 deliberately did not do
+
+- **Move a threshold.** `vector_ceiling` stays 0.68, `CONFIRMATION_LEXICAL_FLOOR` 0.20,
+  `LEXICAL_FLOOR` 0.15. What changed is that the ceiling now has a measured lower bound:
+  under reranking it gates the *candidate pool* rather than the display, the worst correct
+  candidate in the depth-50 pool sits at 0.601, and anything below about 0.61 is
+  demonstrably wrong. The obvious new idea — a floor on reranker confidence — does not
+  survive the data: the one true non-good scores 0.0735 and a true positive scores 0.0888.
+- **Fix the pipeline's inability to fail.** Still every n8n HTTP node with
+  `neverError: true`. Carried from week 15 and now the oldest item on this list, which is
+  the argument for doing it first rather than a reason it keeps being deferred.
+- **Fix `search_text`.** 596 ten-digit US lines have no ancestor chain, and the two
+  benchmark queries that miss at any depth are that defect. It is a re-ingest, not a
+  constant.
+- **Sign anything, or load more of CROSS.** Unchanged from week 15.
+
+## Week 17 entry checklist
+
+1. **A pipeline that can fail.** Third week on this list. Remove `neverError` or gate on
+   status after every HTTP node; today a run that 500s reports success and packages a claim
+   built on nothing.
+2. **Repair `search_text`.** The ancestor chain is missing on 596 leaf lines, which is
+   exactly where the two unreachable benchmark queries land — 8471.41 is what a desktop PC
+   classifies under and its text never says it is a computer. Re-ingest with the chain
+   intact, re-embed, re-measure. This is the ceiling on retrieval and it is a data fix.
+3. **Then re-measure the reranker over the repaired corpus.** The 8/10 pool ceiling is a
+   property of the corpus, not of the model, so it should move.
+4. **A bigger labelled set.** Every number in §21 rests on ten queries. 4/10 versus 3/10 is
+   one query, and the honest reading of a one-query difference is that it is not a
+   difference. Fifty labelled queries would make the next threshold decision defensible.
+5. **Reranker latency.** 2.2 s median and 8.5 s worst case is fine for an analyst looking
+   at one line and impossible for a 200-line entry. Either batch the forward passes, cache
+   per (query, code), or accept that it is an interactive-only feature and say so in the
+   API.
+6. **An Anthropic key in a deployment**, so the agent worker's drafting runs live.
+7. **Start the on-prem file.** Still only ever `docker compose config`-ed.
+8. **More of CROSS**, and **signed images**.
 
 ## Sequencing rationale
 

@@ -29,6 +29,13 @@ and so tenant document text never leaves the deployment.
 
 Every backend records `model_id` on the rows it writes. A corpus is queryable only by the
 backend that wrote it, and mixing them is a data error the ingest can detect.
+
+**Rerankers are here too, and they are a different kind of object.** An `Embedder` maps
+one text to a point, so a corpus can be embedded once and searched forever. A `Reranker`
+scores a *pair* — this query against this document — which cannot be precomputed and
+cannot be indexed: the cost is one model call per candidate, at query time. That is why
+it is a second stage over a shortlist rather than a replacement for the first, and why
+`Reranker.score` takes the query text that `Embedder.embed` never sees.
 """
 
 from __future__ import annotations
@@ -203,6 +210,19 @@ class FastEmbedEmbedder(Embedder):
     # cargo insurance" sit at 0.74 and 0.80 and stay excluded. Everything admitted below
     # it is a candidate, not an answer. Precision is `search.CONFIRMATION_LEXICAL_FLOOR`'s
     # job, and it is measured separately.
+    #
+    # **Week 16 did not move it, and changed what it is for.** With a reranker attached
+    # this is no longer the gate on what an analyst is shown — it is the gate on what the
+    # cross-encoder is allowed to consider, applied before the second stage runs. A
+    # candidate cut here cannot be rescued, and rescuing distant candidates is exactly
+    # what the second stage turned out to do: the correct subheading for "ruggedised field
+    # laptop computer" sits at distance 0.601 and position 28 in the shortlist, and the
+    # reranker lifts it to 6. Across the ten benchmark positives the worst correct
+    # candidate anywhere in the depth-50 pool is that 0.601, so 0.68 clears it by 0.079 and
+    # any value below about 0.61 is now demonstrably wrong rather than merely tight.
+    # Raising it further has no measured benefit and admits more noise into a stage that
+    # costs two seconds a query, so it stays where week 9 put it — for a reason week 9
+    # could not have had.
     vector_ceiling = 0.68
 
     def __init__(
@@ -332,6 +352,147 @@ class OllamaEmbedder(Embedder):
             )
             raise EmbeddingError(msg)
         return _normalise([float(component) for component in vector])
+
+
+#: The default cross-encoder. Multilingual, and that is a requirement rather than a
+#: preference — the same reason `DEFAULT_FASTEMBED_MODEL` is multilingual. Week 15 measured
+#: `Xenova/ms-marco-MiniLM-L-6-v2`, an English cross-encoder, over this bilingual corpus and
+#: it moved the Arabic smartphone query from rank 1 to rank 12. An English reranker does not
+#: score Arabic badly; it has no basis for scoring it at all, so the order it returns is
+#: arbitrary rather than merely wrong.
+#:
+#: Week 16 also measured `BAAI/bge-reranker-base`, which is multilingual and a third of the
+#: latency. It did not help: top-10 stayed at 6/10 and rank-1 fell from 3 to 2. Being
+#: multilingual is necessary and not sufficient.
+DEFAULT_RERANK_MODEL = "jinaai/jina-reranker-v2-base-multilingual"
+
+
+class Reranker(ABC):
+    """One cross-encoder, scoring a query against a candidate document.
+
+    Deliberately not an `Embedder`. An embedder answers "where does this text sit", once
+    per document, and the answer survives in a column. A reranker answers "does this
+    document answer this query", which is a property of the pair and therefore has no
+    column to live in — it is recomputed on every search, for every candidate. The whole
+    design consequence follows from that: the shortlist has to be short.
+    """
+
+    model_id: str
+
+    @abstractmethod
+    def score(self, query: str, documents: Sequence[str]) -> list[float]:
+        """Relevance logits for each document against `query`, in the order given.
+
+        Logits, not probabilities, because that is what a cross-encoder emits and
+        squashing inside the backend would throw away the thing the raw scale is good
+        for — comparing two candidates. `confidence()` does the squashing where a bounded
+        number is actually wanted.
+        """
+
+
+def confidence(logit: float) -> float:
+    """A reranker logit as a 0–1 number that can be blended with a similarity.
+
+    The logistic, which is the function the cross-encoder was trained under, so this
+    recovers the probability the model was fitted to emit rather than imposing a new scale
+    on it.
+
+    Blending needs this because the two signals being combined are not commensurable:
+    cosine similarity is bounded in [0, 1] by construction and a logit is unbounded in both
+    directions. Weighting an unbounded score against a bounded one does not produce a
+    weighted average, it produces whichever number happened to be larger.
+    """
+    if logit >= 0:
+        return 1.0 / (1.0 + math.exp(-logit))
+    # The same value, arranged so the exponent is never large and positive. exp(800)
+    # overflows, and a large negative logit is exactly what a confidently-rejected
+    # candidate produces — which is the common case in a shortlist of fifty.
+    exponent = math.exp(logit)
+    return exponent / (1.0 + exponent)
+
+
+class FastEmbedReranker(Reranker):
+    """A quantised ONNX cross-encoder, in-process on CPU.
+
+    The same shape as `FastEmbedEmbedder` and for the same reasons: no server, no key, no
+    per-token cost, weights cached on disk after one download, and `cache_dir` so a
+    deployment can pre-seed it and run air-gapped.
+
+    **The cost is real and it is per candidate.** Roughly two seconds to score fifty
+    candidates on CPU, against about twenty milliseconds for the pgvector query that
+    produced them. A reranker is affordable over a shortlist and ruinous over a corpus,
+    which is the entire reason the pipeline retrieves first.
+
+    **Construction is lazy** — a gigabyte of weights should be fetched when someone asks
+    for a score, not as a side effect of importing a config module.
+    """
+
+    def __init__(
+        self,
+        model: str = DEFAULT_RERANK_MODEL,
+        cache_dir: str | None = None,
+        threads: int | None = None,
+    ) -> None:
+        self.model = model
+        self.model_id = f"fastembed-ce:{model}"
+        self.cache_dir = cache_dir
+        self.threads = threads
+        self._encoder: Any | None = None
+
+    def _load(self) -> Any:
+        if self._encoder is not None:
+            return self._encoder
+        try:
+            from fastembed.rerank.cross_encoder import TextCrossEncoder
+        except ImportError as exc:  # pragma: no cover - depends on the install extra
+            msg = (
+                "fastembed is not installed; it ships in the 'embed' extra (uv sync --extra embed)"
+            )
+            raise EmbeddingError(msg) from exc
+        try:
+            self._encoder = TextCrossEncoder(
+                model_name=self.model,
+                cache_dir=self.cache_dir,
+                threads=self.threads,
+            )
+        except Exception as exc:
+            msg = (
+                f"could not load cross-encoder {self.model!r}: {exc}. If this is a "
+                "first run, it needs one-time network access to fetch the weights; "
+                "afterwards set cache_dir to run offline."
+            )
+            raise EmbeddingError(msg) from exc
+        return self._encoder
+
+    def score(self, query: str, documents: Sequence[str]) -> list[float]:
+        if not documents:
+            return []
+        cleaned = [" ".join(document.split()) for document in documents]
+        if any(not document for document in cleaned):
+            msg = "cannot rerank against empty document text"
+            raise EmbeddingError(msg)
+
+        scores = [float(value) for value in self._load().rerank(query, cleaned)]
+        if len(scores) != len(cleaned):
+            msg = (
+                f"cross-encoder returned {len(scores)} scores for {len(cleaned)} "
+                "documents; the batch cannot be aligned back to its candidates"
+            )
+            raise EmbeddingError(msg)
+        return scores
+
+
+RERANKERS: dict[str, type[Reranker]] = {"fastembed": FastEmbedReranker}
+
+
+def build_reranker(name: str = "fastembed", **kwargs: object) -> Reranker:
+    """Construct a reranker by name. Raises on an unknown one, exactly as `build` does."""
+    try:
+        factory = RERANKERS[name]
+    except KeyError:
+        msg = f"unknown reranker backend {name!r}; known backends are {sorted(RERANKERS)}"
+        raise KeyError(msg) from None
+    return factory(**kwargs)
 
 
 BACKENDS: dict[str, type[Embedder]] = {

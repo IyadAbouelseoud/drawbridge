@@ -13,7 +13,10 @@ an analyst can act on and an auditor can follow.
 
 The embedding is computed here rather than taken from the caller, because the query and
 the corpus must come from the same model — `mcp-hts` takes a vector precisely so it can
-stay a pure function, and something has to be the place that produces one.
+stay a pure function, and something has to be the place that produces one. The same
+argument makes this the place that owns the reranker, and for a sharper reason: a
+cross-encoder scores the query against the candidate, so there is no vector a caller
+could precompute and hand over. It has to run where the search runs.
 """
 
 from __future__ import annotations
@@ -24,8 +27,18 @@ from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field
 
 from services.api.src.sync_db import in_thread
-from services.classifier.src.embeddings import BACKENDS, DEFAULT_BACKEND, EmbeddingError, build
-from services.classifier.src.search import LEXICAL_FLOOR, search_tariff
+from services.classifier.src.embeddings import (
+    BACKENDS,
+    DEFAULT_BACKEND,
+    EmbeddingError,
+    build,
+    build_reranker,
+)
+from services.classifier.src.search import (
+    LEXICAL_FLOOR,
+    RERANK_DEPTH,
+    search_tariff,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -49,6 +62,16 @@ class ClassifyRequest(BaseModel):
     revision: str | None = None
     backend: str = DEFAULT_BACKEND
     limit: Annotated[int, Field(ge=1, le=25)] = 5
+    rerank: bool = False
+    """Re-score each line's candidates with a cross-encoder.
+
+    Off by default, and the default is about arithmetic rather than about
+    doubt. Reranking costs roughly two seconds a line on CPU, so a 200-line
+    request — the maximum this endpoint accepts — turns a sub-minute job into
+    a seven-minute one. It buys 9 of 10 benchmark subheadings retrieved
+    against 6, which is worth paying for on the lines an analyst is actually
+    looking at and not on a nightly sweep of an entire entry.
+    """
 
 
 def _agreement(declared: str, candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -77,6 +100,10 @@ async def run_classification(body: ClassifyRequest) -> dict[str, Any]:
     """
     embedder = build(body.backend)
     ceiling = BACKENDS[body.backend].vector_ceiling
+    # Built once for the whole request, not once per line: the constructor is
+    # lazy but the model it loads is a gigabyte, and reloading it 200 times
+    # would dwarf the inference it exists to do.
+    reranker = build_reranker() if body.rerank else None
 
     def _work(session: Session) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
@@ -94,6 +121,7 @@ async def run_classification(body: ClassifyRequest) -> dict[str, Any]:
                 revision=body.revision,
                 limit=body.limit,
                 vector_ceiling=ceiling,
+                reranker=reranker,
             )
             candidates = [hit.as_dict() for hit in hits]
             agreement = _agreement(line.declared_code, candidates)
@@ -117,6 +145,8 @@ async def run_classification(body: ClassifyRequest) -> dict[str, Any]:
             "jurisdiction": body.jurisdiction,
             "backend": body.backend,
             "thresholds": {"lexical_floor": LEXICAL_FLOOR, "vector_ceiling": ceiling},
+            "reranker": reranker.model_id if reranker is not None else None,
+            "rerank_depth": RERANK_DEPTH if reranker is not None else None,
             "lines": results,
             "corroborated": sum(1 for r in results if r["corroborated"]),
             "unsupported": [r["line_id"] for r in results if r["unsupported"]],

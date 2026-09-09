@@ -1,4 +1,5 @@
 .PHONY: help up down logs ps build lint fmt type test check clean rls-bootstrap \
+	restore-drill calibrate calibrate-rerank \
 	token token-service pilot-seed pilot-run secrets-init secrets-show secrets-check \
 	secrets-push vault-up vault-agent-up identity-up cross-ingest onprem-config \
 	pin-images pin-check reembed backup backup-verify n8n-import images
@@ -154,6 +155,22 @@ backup:
 backup-verify:
 	uv run python scripts/retention.py verify
 	uv run python scripts/retention.py catalogue
+
+# Restore the newest backup into a scratch database, re-verify every hash chain inside the
+# restored copy, and drop it. A backup nobody has restored is a file; this is the command
+# that makes it a backup. It runs weekly inside `retention.py schedule` as well, because a
+# drill that depends on being remembered stops after the incident it was added for.
+restore-drill:
+	uv run python scripts/retention.py restore --drill
+
+# The labelled query set against the real schedule. `calibrate-rerank` runs the same set
+# through the two-stage pipeline and prints one stage beside two, so the second stage has
+# to justify its two seconds a query on the page rather than in a commit message.
+calibrate:
+	uv run python scripts/calibrate_thresholds.py
+
+calibrate-rerank:
+	uv run python scripts/calibrate_thresholds.py --rerank
 
 # Resolve every third-party on-prem image against the registry. `pin-check` is the CI
 # form: it writes nothing and fails on drift, so a tag that moved under an unchanged

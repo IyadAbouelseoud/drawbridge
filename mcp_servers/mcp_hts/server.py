@@ -23,7 +23,7 @@ from sqlalchemy import text
 from mcp_servers.mcp_claims.db import session_scope
 from services.api.src.config import get_settings
 from services.api.src.telemetry import configure_tracing
-from services.classifier.src.embeddings import BACKENDS, DEFAULT_BACKEND
+from services.classifier.src.embeddings import BACKENDS, DEFAULT_BACKEND, build_reranker
 from services.classifier.src.search import (
     CONFIRMATION_LEXICAL_FLOOR,
     LEXICAL_FLOOR,
@@ -100,6 +100,15 @@ def classify_with_embedding(
         str,
         Field(description="Backend that produced the embedding; sets the distance ceiling"),
     ] = DEFAULT_BACKEND,
+    rerank: Annotated[
+        bool,
+        Field(
+            description=(
+                "Re-score the shortlist with a cross-encoder. Costs ~2s and "
+                "retrieves 9 of 10 benchmark subheadings against 6."
+            )
+        ),
+    ] = False,
 ) -> dict[str, Any]:
     """Hybrid classification over lexical and vector search.
 
@@ -110,6 +119,11 @@ def classify_with_embedding(
     `backend` names which model produced it, and is what sets the distance ceiling. A
     threshold is only meaningful inside one embedding space, so naming the wrong backend
     does not skew the results slightly — it suppresses every hit or admits every one.
+
+    `rerank` adds the second stage. It is the one argument here that breaks the module's
+    pure-function posture, because a cross-encoder reads the query text and the candidate
+    text together and no precomputed vector can stand in for that. The model runs in this
+    process; the hit records which one, so the score stays explicable later.
     """
     try:
         ceiling = BACKENDS[backend].vector_ceiling
@@ -126,6 +140,7 @@ def classify_with_embedding(
                 revision=revision,
                 limit=limit,
                 vector_ceiling=ceiling,
+                reranker=build_reranker() if rerank else None,
             )
         return {
             "ok": True,
@@ -138,6 +153,7 @@ def classify_with_embedding(
                 "confirmation_lexical_floor": CONFIRMATION_LEXICAL_FLOOR,
                 "backend": backend,
             },
+            "reranked": rerank,
         }
     except Exception as exc:
         return _fail(exc)
