@@ -263,6 +263,57 @@ class TestTheWorkflowsCanActuallyBeImported:
         assert before == after
 
 
+class TestThePipelineCanFail:
+    """The release fix, and the oldest defect in the repository when it was made.
+
+    Every HTTP node carried `neverError: true` from week 9 to the freeze, so a 500 from
+    the API arrived as an ordinary item whose body was an error document. The next node
+    read a key that was not there, `JSON.stringify` dropped it rather than raising, and
+    the run went on to report success over a claim built on nothing. The workflow's own
+    success signal was the thing being falsified, so no amount of watching it could have
+    caught this — which is why it survived four roadmaps.
+
+    Asserted on the generated artefacts rather than on the generator, because the
+    artefacts are what n8n imports, and week 12 already proved those two can disagree.
+    """
+
+    @pytest.fixture
+    def workflows(self) -> list[dict]:
+        return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(WORKFLOWS.glob("*.json"))]
+
+    def test_no_http_node_swallows_a_failed_response(self, workflows: list[dict]) -> None:
+        for workflow in workflows:
+            for node in workflow["nodes"]:
+                if node["type"] != "n8n-nodes-base.httpRequest":
+                    continue
+                response = node["parameters"]["options"]["response"]["response"]
+                assert response["neverError"] is False, f"{workflow['name']}/{node['name']}"
+
+    def test_the_flag_is_stated_rather_than_left_to_the_default(
+        self, workflows: list[dict]
+    ) -> None:
+        """`false` is n8n's default, and the default is what was in force before someone
+        typed `true`. Writing it down means the next person has to type over an argued
+        decision rather than fill in a blank."""
+        http_nodes = [
+            node
+            for workflow in workflows
+            for node in workflow["nodes"]
+            if node["type"] == "n8n-nodes-base.httpRequest"
+        ]
+        assert len(http_nodes) == 15
+        assert all("neverError" in json.dumps(node) for node in http_nodes)
+
+    def test_no_node_continues_past_its_own_failure(self, workflows: list[dict]) -> None:
+        """`neverError` decides whether a non-2xx is a value; `onError` decides what
+        happens once it is a failure. Fixing one and leaving the other set to continue
+        would restore the defect through the other half of the same setting."""
+        for workflow in workflows:
+            for node in workflow["nodes"]:
+                assert node.get("onError", "stopWorkflow") == "stopWorkflow", node["name"]
+                assert node.get("continueOnFail", False) is False, node["name"]
+
+
 def by_name_body(workflows: list[dict], name: str) -> dict:
     return next(w for w in workflows if w["name"] == name)
 

@@ -39,7 +39,7 @@
         "options": {
           "response": {
             "response": {
-              "neverError": true
+              "neverError": false
             }
           }
         },

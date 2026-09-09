@@ -80,11 +80,40 @@ _AUTH_HEADER = {
 #: produce.
 
 
+#: `neverError` decides whether a non-2xx response is a value or a failure, and it was
+#: `True` on every one of these calls from week 9 until the release freeze.
+#:
+#: What that meant in practice: a 500 from `/matching/run` came back as an ordinary item
+#: whose body was an error document, the next node read `$json` and found no `savings`
+#: key, and the pipeline carried on. `JSON.stringify` drops an undefined key rather than
+#: raising, so the request to the step after that went out *missing a field* instead of
+#: carrying a wrong one — the same failure mode as the item-pairing defect above, arriving
+#: through a different door. The run reached `/claims/package` and reported success. The
+#: claim it packaged was built on nothing.
+#:
+#: Nothing detected this, and nothing could have: the workflow's own success signal was
+#: the thing being falsified. `errorWorkflow` was wired, tested and correct, and it never
+#: fired, because no node ever raised. Four weeks of roadmaps recorded it as the oldest
+#: outstanding defect in the repository.
+#:
+#: `False` is n8n's default and the flag is set explicitly anyway, because the default is
+#: what was in force before someone typed `True` and the point of writing it down is that
+#: the next person has to type over an argued decision rather than fill in a blank. With
+#: it off, a non-2xx raises, `onError` is left at its own default of `stopWorkflow`, the
+#: run halts at the failing node, and `drawbridgeError1` records the failure as a blocking
+#: exception against the claim — which is the state an analyst can act on and a packaged
+#: claim built on an error document is not.
+#:
+#: This is the fail-closed half of the design the rest of the pipeline already assumed.
+#: A run that cannot fail cannot be trusted when it succeeds.
+_FAIL_CLOSED = {"response": {"response": {"neverError": False}}}
+
+
 def http(name: str, x: int, y: int, method: str, url: str, body: str | None = None) -> dict:
     params: dict = {
         "method": method,
         "url": url,
-        "options": {"response": {"response": {"neverError": True}}},
+        "options": dict(_FAIL_CLOSED),
     }
     if body is not None:
         params |= {"sendBody": True, "specifyBody": "json", "jsonBody": body}

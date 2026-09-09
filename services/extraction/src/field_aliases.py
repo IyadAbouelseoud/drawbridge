@@ -6,7 +6,7 @@ scale past the third broker; resolution goes through this alias table instead.
 
 Labels are matched after `arabic.normalise`, so entries here are stored normalised too —
 alef variants folded, tashkeel stripped. Add aliases as real layouts are encountered;
-week 2 seeds the common ones only (see docs/ROADMAP.md week 3 checklist).
+week 2 seeds the common ones only (see docs/ROADMAP_ARCHIVE.md week 3 checklist).
 """
 
 from __future__ import annotations

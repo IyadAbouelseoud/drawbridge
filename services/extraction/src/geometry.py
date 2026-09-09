@@ -1,6 +1,6 @@
 """Glyph-geometry reconstruction of RTL table cells.
 
-**Status: implemented in week 10. Deferred since week 2 — see docs/ROADMAP.md.**
+**Status: implemented in week 10. Deferred since week 2 — see docs/ROADMAP_ARCHIVE.md.**
 
 Week 2's `arabic.looks_visually_ordered` decides visual-vs-logical order from a heuristic:
 a field label never begins with its separator. That works for `label: value` lines and

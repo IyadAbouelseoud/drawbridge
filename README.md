@@ -1,6 +1,23 @@
 # Drawbridge
 
-Autonomous customs duty recovery and trade remediation, across two jurisdictions.
+**v1.0.0** — feature freeze. Autonomous customs duty recovery and trade remediation
+across two jurisdictions: US CBP drawback under 19 U.S.C. §1313, and GCC/ZATCA refunds
+under Art. 16 of the Common Customs Law.
+
+Where it stands, in four numbers and one property:
+
+| | |
+|---|---|
+| Classification recall | **88%** — the correct subheading is in the top ten on 44 of 50 labelled queries |
+| Classification rank-1 | **52%** — 26 of 50, and the reason it is not higher is [below](#what-this-does-not-do-yet) |
+| Retrieval | hybrid: pgvector over 28,899 lines narrows to 50 in ~20 ms, a multilingual cross-encoder re-scores those 50, blended 70/30 |
+| Both lanes | reproduce **to the cent** against known-answer claims in `tests/golden/` |
+| Human review | **fail-closed** — nothing reaches a filing packet unreviewed, and a failed API call halts the run instead of packaging around it |
+
+Two things that number does not say, and this line does: **rank-1 is 52%, not 88%**, and
+the difference between those figures is the difference between "the analyst is looking at
+the right line" and "the machine picked it". Drawbridge claims the first. The section at
+the end of this file says what it does not do, and it is not a short section.
 
 Importers overpay customs duty and mostly do not get it back, because the reconciliation
 that proves a refund is owed is brutal: matching import entries to exports line by line,
@@ -111,6 +128,17 @@ one stage was 34/50 in the top 10 and 17/50 at rank 1
 
 The second stage is worth +10 in the top ten and +9 at rank one — measured on fifty
 queries, against +3 and +2 on the ten it had in week 16.
+
+**A run that fails, fails.** Every HTTP node in all three workflows sets
+`neverError: false`, so a non-2xx from the API raises at the node that made the call, the
+run halts there, and `drawbridge-pipeline-error` records it as a blocking review row
+against the claim. Until the release freeze the flag was `true` on all fifteen calls: a
+500 from `/claims/persist` arrived as an ordinary item whose body was an error document,
+the next node read a key that was not in it, `JSON.stringify` dropped the key rather than
+raising, and the run continued through packaging and returned HTTP 200. It recorded
+`success` over a claim built on nothing, and no amount of watching the pipeline could have
+caught that, because the success signal was the thing being falsified. It was the oldest
+defect in the repository and it is the last one this release closes.
 
 The workflows are imported and run:
 
@@ -239,7 +267,7 @@ make pilot-run                    # both corpora end to end against the deployed
 | `n8n/workflows` | Orchestration, version-controlled as JSON |
 | `scripts/` | Ingest, embedding, token minting, offboarding, the pilot |
 | `tests/golden` | Known-answer claims that must reproduce to the cent |
-| `docs/` | `ARCHITECTURE.md`, `ROADMAP.md` — persistent project context |
+| `docs/` | `ARCHITECTURE.md` — design and every defect found along the way; `ROADMAP_ARCHIVE.md` — the seventeen weeks, closed |
 
 ## Invariants
 
@@ -247,15 +275,24 @@ make pilot-run                    # both corpora end to end against the deployed
   judgment calls; it never originates a number.
 - Money is `Decimal`, never `float`.
 - n8n holds no business state. Claim state is a Postgres state machine.
+- A pipeline run fails closed. No HTTP node swallows a non-2xx, no node continues past its
+  own failure, and a crashed run leaves a blocking review row rather than a packaged claim
+  or a claim stranded mid-transition.
+- No classification is auto-confirmed. `needs_analyst_confirmation` is true for every
+  classification the system currently produces against the full schedule.
 - Document objects are immutable; a correction writes a new object.
 - A corpus is loaded from a downloaded snapshot, never from a live endpoint — a
   classification that reached a filing must be reproducible after the publisher moves the
   URL.
 
-## What this does not do yet
+## What this does not do
 
-Stated here rather than discovered later. The full list, with the reasoning, is in
-`docs/ROADMAP.md`.
+Stated here rather than discovered later. The week-by-week reasoning is archived in
+`docs/ROADMAP_ARCHIVE.md`; the architecture and every defect found along the way are in
+`docs/ARCHITECTURE.md`.
+
+None of the following are open work items. Development is frozen at v1.0.0 and these are
+the boundaries of what was built.
 
 - **Classify to a single line.** On the fifty labelled queries week 17 expanded the
   benchmark to, the correct subheading is in the top ten **44 times** and first **26**.
@@ -268,17 +305,21 @@ Stated here rather than discovered later. The full list, with the reasoning, is 
 - **Auto-confirm anything.** All fifty calibration queries come back vector-only against
   the full schedule, so `needs_analyst_confirmation` is true for every classification the
   system currently produces. The confirmation rule has three weeks of design, its own
-  benchmark and its own tests, and has never fired at volume. Week 18 finds out why.
+  benchmark and its own tests, and has never fired at volume. The safe direction to be
+  wrong in, and the reason "fail-closed" above is a measured property rather than an
+  aspiration: in the shipped configuration every classification goes to a human.
 - **Carry the ruling corpus.** CBP publishes no bulk export; `scripts/ingest_cross.py`
   draws a term-sampled ~120 rulings. A sample is not CROSS.
-- **Fail a pipeline run.** Every n8n HTTP node sets `neverError: true`, so a 500 from
-  `/claims/persist` becomes `{data: "Internal Server Error"}`, the run continues through
-  packaging, returns HTTP 200 and records `success`. Understood, reproduced, and not yet
-  fixed — it is a structural change to a 22-node graph and it has been the first item on
-  the entry checklist for three weeks running, which is the argument for doing it next
-  rather than a reason it keeps being deferred.
 - **Classify a whole entry interactively.** Reranking costs ~2.8 s a line, so a 200-line
-  entry is a nine-minute request. It is opt-in for exactly that reason; batching it is
-  still outstanding.
+  entry is a nine-minute request. It is opt-in for exactly that reason. Batching the
+  forward passes would fix it and was not done.
 - **File anything.** Both pilot corpora are fiction, every figure carries a
-  `pilot-fixture` provenance box, and `assert_not_evidence` refuses to act on one.
+  `pilot-fixture` provenance box, and `assert_not_evidence` refuses to act on one. This is
+  a design constraint and not a gap: Drawbridge produces the packet and the audit trail,
+  and a licensed broker files it.
+- **Draft against a live model.** The agent worker's write path is proven end to end — the
+  queue select, `build_facts`, the grounding check, the per-row commit — with a stub
+  standing in for the model, because no `anthropic_api_key` is configured in any
+  deployment. The model call itself has never run.
+- **Run on premises.** The on-prem compose file is pinned by digest and has only ever been
+  `docker compose config`-ed. It has not been deployed.

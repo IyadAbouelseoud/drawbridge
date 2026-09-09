@@ -11,8 +11,12 @@ messages, PR bodies, or tags.
 
 ## Persistent context
 
-Architecture and roadmap live in `docs/ARCHITECTURE.md` and `docs/ROADMAP.md`.
-Read both at the start of any session before making structural decisions.
+Architecture lives in `docs/ARCHITECTURE.md`. The week-by-week roadmap is closed and
+archived at `docs/ROADMAP_ARCHIVE.md` — a record, not a plan. Read both at the start of
+any session before making structural decisions.
+
+**The repository is feature-frozen at v1.0.0.** Do not open new work against the archive's
+closed items without being asked to.
 
 ## Conventions
 

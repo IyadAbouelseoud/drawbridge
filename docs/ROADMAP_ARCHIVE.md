@@ -1,16 +1,42 @@
-# DRAWBRIDGE — 14-Week Roadmap
+# DRAWBRIDGE — Roadmap Archive
 
-> Persistent context. Read with `ARCHITECTURE.md` and `COMPLIANCE-GCC.md` at the start
-> of any session.
+> **Closed at v1.0.0. This is a record, not a plan.**
+>
+> Development ran seventeen weeks against this document and stopped. Nothing below is an
+> open work item. It is kept because the *reasoning* in it — why an ordering was chosen,
+> what a week found that it was not looking for, which assumptions did not survive being
+> measured — is the part that would be lost, and it is not recoverable from the diff.
+>
+> Architecture is in `ARCHITECTURE.md`; the GCC statutory basis is in `COMPLIANCE-GCC.md`.
+> Both remain live.
 
-## Status
+## Status at the freeze
 
 | | |
 |---|---|
-| Current week | 17 |
+| Release | **v1.0.0**, 17 weeks, feature-frozen |
 | Scope | **Dual-jurisdiction: US (CBP) + GCC/KSA (ZATCA)** as of week 2 |
-| Current milestone | **A set big enough to argue with** — fifty labelled queries, and an ingest repair measured rather than assumed |
+| Milestones | **17 of 17 delivered.** Two exit criteria were met on a different measure than the one written down, and both say so in their row |
+| Externally blocked | Three, none of which more engineering resolves: a licensed filing, a bulk CROSS export CBP does not publish, and a model key no deployment holds |
+| Last defect closed | The pipeline could not fail. Four checklists old. `ARCHITECTURE.md` §23 |
 | Week 1 exit gate | **PASSED** — 10/10 containers healthy, MCP handshakes verified |
+
+### How to read the milestone table below
+
+Every row is delivered. Two are worth reading twice rather than counting:
+
+- **Week 12–13, "refund in motion".** Not met and never meetable by this system: filing
+  requires a licensed broker, which is the constraint the whole design is built around
+  (`ARCHITECTURE.md` §5). What was delivered is a packet and an audit trail a broker
+  files. The criterion was written before that constraint was fully understood.
+- **Week 16, "9/10 at hs6 in the top ten".** Met on ten queries. Week 17 replaced them
+  with fifty, and the same pipeline scores 44/50 — 88%, which is the honest version of the
+  same claim, and 26/50 at rank one, which is a claim week 16 did not make. A criterion
+  measured on ten labels is a criterion the label set can pass on its own.
+
+Week 17's own target — rank-1 above 85% — was **missed at 52%**, and `ARCHITECTURE.md`
+§22.6 says why it is not reachable by ranking. It is recorded as missed. Substituting the
+top-ten figure that did clear 85% would be choosing the metric after seeing it.
 
 ---
 
@@ -33,6 +59,7 @@
 | 15 | Debug, review, harden | Backups under object lock; every committed artefact executed at least once |
 | 16 | Retrieve-then-rerank; restore drill | 9/10 at hs6 in the top ten; a backup restored and its ledger re-verified |
 | 17 | Ingest hierarchy; fifty-query benchmark | 44/50 at hs6 in the top ten, 26/50 at rank one; the ancestor-chain theory refuted |
+| — | **v1.0.0 freeze** | A pipeline that fails closed; the last of four checklists' worth of the same item |
 
 ---
 
@@ -1357,24 +1384,42 @@ correct engineering response is to leave the gap visible.
    and vector paths stopped overlapping at all. No query in the fixture now produces a
    `both` hit. The test constructs the hit now and asserts the rule.
 
-## Week 18 entry checklist
+## What was open at the freeze
 
-1. **A pipeline that can fail.** Fourth week on this list. Remove `neverError` or gate on
-   status after every HTTP node; today a run that 500s reports success and packages a
-   claim built on nothing. Nothing else on this list is as old or as cheap.
-2. **Find out why the lexical path never fires at volume.** Item 1 above is either a
-   tuning problem, a query-preprocessing problem, or evidence that trigram similarity over
-   28,899 lines cannot reach the top ten — and it decides whether the confirmation rule is
-   a working safety property or a decoration.
-3. **Sibling disambiguation, if anything is to be done about rank-1.** The failure is
-   numeric and negation-shaped, not semantic. A rule that extracts stated quantities from
-   the query and filters candidates whose text contradicts them would address fourteen of
-   the eighteen near misses; a bigger model would address none of them.
-4. **Latency.** 2.8 s median and 7.5 s worst case, unchanged. Batch the forward passes,
-   cache per (query, code), or declare reranking interactive-only in the API.
-5. **An Anthropic key in a deployment**, so the agent worker's drafting runs live.
-6. **Start the on-prem file.** Still only ever `docker compose config`-ed.
-7. **More of CROSS**, and **signed images**.
+This was the week 18 entry checklist. It is closed here with what actually became of each
+item, because a checklist archived without dispositions reads as work in progress.
+
+1. **A pipeline that can fail.** **Done — the release fix.** `neverError: false` on all
+   fifteen HTTP nodes, `onError` left at `stopWorkflow`, both asserted against the
+   generated artefacts rather than the generator. A run that 500s now halts at the failing
+   node and leaves a blocking review row instead of packaging a claim built on nothing.
+   Four checklists old at the point it was fixed, and the oldest defect in the repository.
+   `ARCHITECTURE.md` §23.
+2. **Find out why the lexical path never fires at volume.** **Not done, and stated in the
+   README as a limitation.** All fifty calibration queries return vector-only against the
+   28,899-line schedule, so `needs_analyst_confirmation` is true for every classification
+   the system produces. That is the safe direction to be wrong in — it is the reason the
+   product's review posture is fail-closed in fact and not merely by policy — but it means
+   the confirmation rule was never exercised at volume. Whether it is a working safety
+   property or a decoration is genuinely not known.
+3. **Sibling disambiguation.** **Not done, and deliberately not.** The failure is numeric
+   and negation-shaped: fourteen of eighteen near misses are outranked by a sibling
+   differing on a stated quantity. A quantity-extraction filter would address them and a
+   bigger model would address none. It was scoped, understood, and left out of v1.0.0
+   rather than half-built into it. §22.6 carries the table.
+4. **Latency.** **Not done.** 2.8 s median, 7.5 s worst case. Reranking is opt-in for that
+   reason and a 200-line entry is a nine-minute request.
+5. **An Anthropic key in a deployment.** **Externally blocked.** The agent worker's write
+   path is proven end to end against a stub — queue select, `build_facts`, grounding check,
+   per-row commit. The model call has never run because no deployment holds a key.
+6. **The on-prem file.** **Not deployed.** Pinned by digest, `docker compose config`-ed,
+   never run on a host.
+7. **More of CROSS**, **signed images**. **CROSS is externally blocked** — CBP publishes no
+   bulk export, so `scripts/ingest_cross.py` draws a term-sampled ~120 rulings and a sample
+   is not CROSS. Image signing was not done.
+
+Three of the seven are external constraints, three are scoped-out engineering, and one is
+the defect this release exists to close.
 
 ## Sequencing rationale
 
