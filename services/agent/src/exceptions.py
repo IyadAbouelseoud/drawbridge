@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from services.agent.src import grounding
+from services.agent.src import grounding, injection, output_guard
 from services.agent.src.client import generate, redact
 from services.agent.src.schemas import ExceptionMemo
 from services.rules.src.triage import ReviewReason
@@ -45,6 +45,18 @@ REDACTED_KEYS: tuple[str, ...] = (
     "raw_document",
     "document_bytes",
     "tenant_contact",
+    # v1.1.0. Filing identity has no bearing on why an exception fired, and a bank
+    # account or a tax identifier sent to a third-party model is disclosure for nothing.
+    "iban",
+    "refund_account_iban",
+    "ein",
+    "cr_number",
+    "vat_number",
+    "email",
+    "phone",
+    "token",
+    "access_token",
+    "client_secret",
 )
 
 SYSTEM = """You are a senior customs analyst triaging an exception in a duty-recovery \
@@ -117,7 +129,26 @@ GUIDANCE: dict[ReviewReason, str] = {
         "still outstanding. Deadlines here do not extend, so sequencing advice is the "
         "most valuable thing in the memo."
     ),
+    ReviewReason.HIGH_VALUE_APPROVAL: (
+        "The refund is above the auto-approve ceiling, so an approver who did not resolve "
+        "the claim's other exceptions must sign it off. Summarise what the record shows "
+        "about the size of the refund and what an approver should verify before "
+        "releasing it; do not recommend approval on the size of the figure alone."
+    ),
+    # Never sent: `draft` refuses these rows before any call. Present so the table stays
+    # total over the enum — and so the reason is written down next to the others.
+    ReviewReason.SUSPECTED_PROMPT_INJECTION: (
+        "Not drafted. A source document contains text addressed to an automated reader, "
+        "and the row is for a person."
+    ),
+    ReviewReason.PIPELINE_FAILURE: (
+        "Not drafted. A pipeline run failed; the row says at which node and why, and the "
+        "remedy is operational rather than a judgment about the claim."
+    ),
 }
+
+#: Reasons the drafter declines outright, before any model call.
+NEVER_DRAFTED = frozenset({ReviewReason.SUSPECTED_PROMPT_INJECTION, ReviewReason.PIPELINE_FAILURE})
 
 INSTRUCTION_HEAD = "Draft the pre-analysis memo for the exception below."
 
@@ -153,13 +184,20 @@ def draft(facts: dict[str, Any], **kwargs: Any) -> ExceptionMemo:
     reason = ReviewReason(facts["reason"])
     instruction = f"{INSTRUCTION_HEAD}\n\n{GUIDANCE[reason]}"
 
+    if reason in NEVER_DRAFTED:
+        # The row exists because a person must look at the source. Sending it to the model
+        # would send the suspected payload to the reader it was written for.
+        msg = f"{reason.value} rows are never drafted; they are for a person to read"
+        raise ValueError(msg)
+    facts = injection.prepare(facts)
     memo = generate(
         output_model=ExceptionMemo,
-        system=SYSTEM,
+        system=SYSTEM + injection.FRAMING,
         facts=facts,
         instruction=instruction,
         **kwargs,
     )
     grounding.check_model(memo, grounding.allowed_figures(facts))
     grounding.check_citations(memo.citations, facts)
+    output_guard.validate(memo)
     return memo

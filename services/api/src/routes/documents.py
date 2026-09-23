@@ -30,17 +30,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 
+from drawbridge_schemas.agents import Scope
 from drawbridge_schemas.provenance import Confidence, DocumentKind, DocumentRef, Language
 from mcp_servers.mcp_docs.store import (
     DocumentNotFoundError,
     DocumentStore,
     StoreConfig,
     document_id_for,
+    tenant_owns,
 )
-from services.api.src.auth import authorise_tenant
+from services.api.src.auth import actor_name, authorise_tenant, require
 from services.api.src.config import get_settings
 from services.api.src.ledger import record
 from services.api.src.models import Document
@@ -90,7 +93,9 @@ class BatchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tenant_id: UUID
-    documents: list[DocumentIn] = Field(min_length=1)
+    # Bounded: one claim's evidence is a handful of documents, and the body cap in
+    # `guard.EdgeMiddleware` bounds the bytes but not the number of objects written.
+    documents: list[DocumentIn] = Field(min_length=1, max_length=50)
 
 
 def _table_cells(path: Path, pages: int) -> list[dict[str, Any]]:
@@ -124,15 +129,28 @@ def _suffix(filename: str) -> str:
     return Path(filename).suffix or ".pdf"
 
 
-def _register(session: Session, tenant_id: UUID, ref: DocumentRef) -> None:
-    """Record the document if it is not already recorded.
+def _register(session: Session, tenant_id: UUID, ref: DocumentRef) -> tuple[DocumentRef, bool]:
+    """Record the document if this tenant has not already recorded it.
 
-    Identity is the content hash, so re-ingesting the same file is a no-op rather than a
-    duplicate row. A broker who re-sends a corrected packet containing three unchanged
-    attachments should not fork three documents.
+    Identity is the content hash within the tenant, so re-ingesting the same file is a
+    no-op rather than a duplicate row. A broker who re-sends a corrected packet containing
+    three unchanged attachments should not fork three documents.
+
+    Deduped on (tenant, sha256) rather than on the id, and the existing row's id is the
+    one returned: rows written before v1.1.0 carry the content-only id, and a re-ingest
+    must resolve to them rather than register the same object a second time.
+
+    Returns the canonical reference and whether it was newly registered.
     """
-    if session.get(Document, ref.document_id) is not None:
-        return
+    existing = (
+        session.execute(
+            select(Document).where(Document.tenant_id == tenant_id, Document.sha256 == ref.sha256)
+        )
+        .scalars()
+        .first()
+    )
+    if existing is not None:
+        return ref.model_copy(update={"document_id": existing.document_id}), False
     session.add(
         Document(
             document_id=ref.document_id,
@@ -144,9 +162,14 @@ def _register(session: Session, tenant_id: UUID, ref: DocumentRef) -> None:
             language=ref.language.value,
         )
     )
+    return ref, True
 
 
-@router.post("/documents/batch", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/documents/batch",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require(Scope.DOCUMENTS_WRITE))],
+)
 async def store_batch(body: BatchRequest) -> dict[str, Any]:
     """Put each document in MinIO and register it against the tenant.
 
@@ -183,9 +206,16 @@ async def store_batch(body: BatchRequest) -> dict[str, Any]:
                 )
             )
         elif item.object_key and item.sha256:
+            # The key is the caller's word for where the bytes are. It must be under this
+            # tenant's prefix, or registering it would hand this tenant another's document.
+            if not tenant_owns(tenant_id, item.object_key):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={"error": "wrong_tenant", "message": "object key is not yours"},
+                )
             refs.append(
                 DocumentRef(
-                    document_id=document_id_for(item.sha256),
+                    document_id=document_id_for(item.sha256, tenant_id),
                     kind=item.kind,
                     sha256=item.sha256,
                     object_key=item.object_key,
@@ -202,11 +232,13 @@ async def store_batch(body: BatchRequest) -> dict[str, Any]:
                 },
             )
 
+    canonical: list[DocumentRef] = []
+
     def _work(session: Session) -> None:
-        for ref in refs:
-            before = session.get(Document, ref.document_id) is not None
-            _register(session, tenant_id, ref)
-            if before:
+        for proposed in refs:
+            ref, created = _register(session, tenant_id, proposed)
+            canonical.append(ref)
+            if not created:
                 # Re-ingesting identical bytes is a no-op, and a ledger row saying a
                 # document arrived twice would misdescribe it as two documents.
                 continue
@@ -214,7 +246,7 @@ async def store_batch(body: BatchRequest) -> dict[str, Any]:
                 session,
                 tenant_id=tenant_id,
                 event_type="document_ingested",
-                actor="pipeline",
+                actor=actor_name("pipeline"),
                 subject=ref.kind.value,
                 document_sha256=ref.sha256,
                 payload={
@@ -237,7 +269,7 @@ async def store_batch(body: BatchRequest) -> dict[str, Any]:
                 "object_key": ref.object_key,
                 "language": ref.language.value,
             }
-            for ref in refs
+            for ref in canonical
         ],
     }
 
@@ -246,11 +278,13 @@ class ExtractionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tenant_id: UUID
-    documents: list[UUID] = Field(min_length=1, description="document_ids from /documents/batch")
+    documents: list[UUID] = Field(
+        min_length=1, max_length=50, description="document_ids from /documents/batch"
+    )
     floor: Annotated[float, Field(gt=0, le=1)] = EXTRACTION_CONFIDENCE_FLOOR
 
 
-@router.post("/extraction/run")
+@router.post("/extraction/run", dependencies=[Depends(require(Scope.EXTRACTION_RUN))])
 async def run_extraction(body: ExtractionRequest) -> dict[str, Any]:
     """Read each stored document and report how confidently it was read.
 

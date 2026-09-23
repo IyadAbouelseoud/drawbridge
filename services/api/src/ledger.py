@@ -39,6 +39,13 @@ EVENT_TYPES = (
     "review_resolved",
     "valuation_override",
     "packet_built",
+    # v1.1.0 — the gaps the security pass found in the trail. A reopened exception was
+    # recorded only in a free-text column; a drafted memo, a withheld one and a suspected
+    # injection were recorded nowhere.
+    "review_reopened",
+    "agent_memo_drafted",
+    "agent_memo_withheld",
+    "prompt_injection_suspected",
 )
 
 

@@ -4,6 +4,16 @@ Single source of truth. Every service and MCP server imports its types from here
 nothing redefines a claim, an entry line, or a provenance span locally.
 """
 
+from drawbridge_schemas.agents import (
+    AGENTS,
+    HUMAN_ONLY_SCOPES,
+    ROLE_SCOPES,
+    AgentIdentity,
+    AgentKind,
+    OwnerRole,
+    Role,
+    Scope,
+)
 from drawbridge_schemas.bom import (
     BillOfMaterials,
     BomComponent,
@@ -48,9 +58,14 @@ from drawbridge_schemas.trade import (
 )
 
 __all__ = [
+    "AGENTS",
     "GCC_MIN_REEXPORT_VALUE_USD",
+    "HUMAN_ONLY_SCOPES",
     "KSA_PROFILE",
+    "ROLE_SCOPES",
     "US_PROFILE",
+    "AgentIdentity",
+    "AgentKind",
     "BillOfMaterials",
     "BomComponent",
     "Claim",
@@ -73,9 +88,12 @@ __all__ = [
     "ManufacturingBasis",
     "MatchTheory",
     "Money",
+    "OwnerRole",
     "Provenance",
     "RecoveryLane",
     "RefundLine",
+    "Role",
+    "Scope",
     "Span",
     "TenantProfile",
     "ValuationBasis",

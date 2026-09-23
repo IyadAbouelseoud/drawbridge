@@ -10,7 +10,8 @@ pages plus Big-4 and law-firm advisories; they are directionally reliable but th
 numbers of ZATCA Resolution 28624 were not obtainable in English. Treat section 4 numbers
 as needing confirmation against the Arabic Umm Al-Qura text before a live filing; the
 packager enforces this automatically by emitting every 28624 citation as an
-`ANALYST_REVIEW` placeholder (§8.4.1).
+`ANALYST_REVIEW` placeholder (§8.4.1). Section 10 (v1.1.0) maps the operational controls onto
+these obligations and asserts no new rule; its **[counsel]** items are open.
 
 ---
 
@@ -438,3 +439,63 @@ by the partial series.
 in a fixed shape, and §8.2 is updated from that file rather than from recollection. Until
 it exists, `PartialConsignmentBehaviour.UNDETERMINED` is what the engine assumes, and
 partial-shipment claims continue to route to `ANALYST_REVIEW`.
+
+---
+
+## 10. Operational controls against the KSA lane's obligations (v1.1.0)
+
+**Verification status.** This section asserts no new rule of law. It maps the controls the
+v1.1.0 security pass added (`ARCHITECTURE.md` §24) onto obligations already cited in
+§§1–9, so an auditor asking "what stops the system doing X" gets a pointer rather than an
+argument. Items marked **[counsel]** are questions this file cannot settle and a live KSA
+deployment must.
+
+### 10.1 Who may change what a ZATCA refund request says
+
+| Obligation | Where cited | Control |
+|---|---|---|
+| The refund is paid to the establishment of record | §6 (payload: importer identity, IBAN) | The IBAN and the claimant come from `tenant_profiles`, IBAN mod-97 checked. Until v1.1.0 `/packaging/build` accepted either as a request field, and n8n forwarded the claimant from the ingest webhook's body. Overriding them is now a human **approver**'s decision; the pipeline cannot; the `packet_built` ledger row records whether identity came from the profile or the request, and who supplied it |
+| The claimant is the importer of record, or proves purchase | §2, Art. 16 §1 (gate 8 in `ARCHITECTURE.md` §3.7) | As above: a machine identity cannot substitute a claimant |
+| Clearance and refund lodgement are licensed activities | `ARCHITECTURE.md` §5.6 | A machine may take a claim as far as `packaged`. `handed_off`, `filed` and `paid` are attested by a human approver; the pipeline's token is refused at the gate whatever its scopes say |
+| A valuation corrected to clear the USD 5,000 minimum must be defensible | §8.1, GCC Customs Valuation Art. 28 | `override_declared_valuation` is human-only, needs recorded reasoning, and writes both figures to the ledger; an approver releasing a high-value claim may not be the analyst who overrode its valuation |
+| Unverified 28624 article numbers must not reach a filing | §8.4.1 | Unchanged. The drafter still may not cite an authority it was not given, and the output guard now also refuses a memo carrying a URL or instructions to the analyst's software |
+
+### 10.2 Retention and reconstruction — Art. 175 / ZATCA five-year originals
+
+Everything that changes a claim is an `audit_ledger` event with the verified actor, its kind
+(human, machine, local) and — for a machine — its registered identity and accountable owner
+role. v1.1.0 closed the gaps: the raising of an exception (`review_opened`), its reopening,
+an analyst's approval, every memo the model drafted or was refused, every suspected
+injection. Operational events — the kill switch, each credential issued, a circuit-breaker
+trip — are in the append-only `control_events` table. What was *read* is in the structured
+access log, joined to the ledger by trace id.
+
+Document identity is now per tenant (`document_id_for(sha256, tenant_id)`), so two
+establishments holding byte-identical originals — a forwarder's standard form sent to both —
+each retain their own record rather than colliding on one.
+
+### 10.3 The kill switch and the statutory clocks
+
+Halting the system does not halt Art. 16 §3(b)'s six months or Art. 174's three years. A
+`global` or `tenant` halt stops every mutation, which includes the pipeline persisting new
+claims; reads stay available, so `GET /claims/{id}` and the queue still show each claim's
+`filing_deadline` and `absolute_bar_date` during an incident. **An operator throwing a halt
+of more than a day should read the deadline column first**: `deadline_imminent` rows are
+raised by triage, and triage does not run while the pipeline is halted.
+
+### 10.4 Data that leaves the deployment for a model **[counsel]**
+
+With an Anthropic key configured, the exception drafter sends a review row's facts to
+Anthropic's API. Before sending, it removes filing identifiers — IBAN, EIN, CR number, VAT
+number — and contact details, email and phone (`exceptions.REDACTED_KEYS`). What remains
+is what the exception is about: goods descriptions, figures, dates, declaration numbers and
+the citations in play.
+
+Most of that identifies establishments rather than individuals. Some of it can relate to
+individuals — a sole proprietor's declaration, an analyst's name in a resolution note — and
+the Saudi Personal Data Protection Law (Royal Decree M/19, as amended) regulates personal
+data and its transfer outside the Kingdom. Whether a model call over these facts is such a
+transfer, and which of the law's transfer conditions would apply, has not been reviewed by
+counsel and is not asserted here. The default posture answers it by construction: no
+deployment of this repository has held a key (`ARCHITECTURE.md` §20.8), and the drafter
+does nothing without one. **Resolve this before enabling the drafter for a KSA tenant.**

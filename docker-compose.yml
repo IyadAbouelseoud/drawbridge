@@ -1,5 +1,12 @@
 # Drawbridge — development stack.
 #
+# **Every published port binds 127.0.0.1 (v1.1.0).** `"5432:5432"` publishes on every
+# interface of the host, so a laptop on a shared network was serving Postgres — with the
+# owner password `drawbridge` — MinIO, Vault in dev mode, and five MCP servers that until
+# the same release had no authentication at all. Loopback is what development needs; a
+# deployment that must be reached from elsewhere is `docker-compose.onprem.yml`, behind
+# Caddy and TLS.
+#
 # Week 1 exit gate: `docker compose up` brings every service green.
 # Production overlay: docker-compose.prod.yml. On-prem: docker-compose.onprem.yml.
 
@@ -69,6 +76,13 @@ x-python-base: &python-base
     DRAWBRIDGE_JWT_ISSUER: ${DRAWBRIDGE_JWT_ISSUER:-drawbridge}
     DRAWBRIDGE_JWT_AUDIENCE: ${DRAWBRIDGE_JWT_AUDIENCE:-drawbridge-api}
     DRAWBRIDGE_OIDC_JWKS_URL: ${DRAWBRIDGE_OIDC_JWKS_URL:-}
+    # Agent governance (v1.1.0). Who answers for the registered agents, the approval
+    # ceiling, and the deployment-level kill switch. See services/api/src/config.py.
+    DRAWBRIDGE_OWNER_PLATFORM: ${DRAWBRIDGE_OWNER_PLATFORM:-}
+    DRAWBRIDGE_OWNER_COMPLIANCE: ${DRAWBRIDGE_OWNER_COMPLIANCE:-}
+    DRAWBRIDGE_OWNER_SECURITY: ${DRAWBRIDGE_OWNER_SECURITY:-}
+    DRAWBRIDGE_AUTO_APPROVE_CEILING_USD: ${DRAWBRIDGE_AUTO_APPROVE_CEILING_USD:-100000}
+    DRAWBRIDGE_KILL_SWITCH: ${DRAWBRIDGE_KILL_SWITCH:-}
   volumes:
     - ./services:/app/services:ro
     - ./mcp_servers:/app/mcp_servers:ro
@@ -104,7 +118,7 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:5432:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U drawbridge -d drawbridge"]
       interval: 10s
@@ -117,7 +131,7 @@ services:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
     volumes: [redis-data:/data]
-    ports: ["6379:6379"]
+    ports: ["127.0.0.1:6379:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -134,7 +148,7 @@ services:
       MINIO_ROOT_USER: ${DRAWBRIDGE_S3_ACCESS_KEY:-drawbridge}
       MINIO_ROOT_PASSWORD: ${DRAWBRIDGE_S3_SECRET_KEY:-drawbridge}
     volumes: [minio-data:/data]
-    ports: ["9000:9000", "9001:9001"]
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s
@@ -188,16 +202,17 @@ services:
       # that reached the API. Scoped rather than opened wide — the allowlist below
       # is the only variable a workflow may read.
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
-      N8N_VARS_ALLOWLIST: DRAWBRIDGE_SERVICE_TOKEN
-      # Every HTTP Request node sends this as a bearer token. It is a *service* token:
-      # cross-tenant by design, because one workflow runs whichever tenant its trigger
-      # names. Mint it with `make token-service` and treat it as the most valuable secret
-      # in the deployment — see services/api/src/auth.py.
-      DRAWBRIDGE_SERVICE_TOKEN: ${DRAWBRIDGE_SERVICE_TOKEN:-}
+      N8N_VARS_ALLOWLIST: DRAWBRIDGE_PIPELINE_CLIENT_SECRET,DRAWBRIDGE_TOKEN_URL
+      # v1.1.0: the workflow no longer carries a day-long service token. It holds the
+      # pipeline's client secret — useless against any data route — and exchanges it at
+      # the start of every run for a fifteen-minute access token. `make up` bridges the
+      # secret from .secrets.json; see n8n/generate_workflows.py::token_exchange.
+      DRAWBRIDGE_PIPELINE_CLIENT_SECRET: ${DRAWBRIDGE_PIPELINE_CLIENT_SECRET:-}
+      DRAWBRIDGE_TOKEN_URL: http://api:8000/auth/token
     volumes:
       - n8n-data:/home/node/.n8n
       - ./n8n/workflows:/workflows:ro
-    ports: ["5678:5678"]
+    ports: ["127.0.0.1:5678:5678"]
     depends_on:
       postgres: { condition: service_healthy }
     restart: unless-stopped
@@ -212,8 +227,8 @@ services:
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
-      - "16686:16686"  # UI
-      - "4318:4318"    # OTLP/HTTP
+      - "127.0.0.1:16686:16686"  # UI
+      - "127.0.0.1:4318:4318"    # OTLP/HTTP
     restart: unless-stopped
     networks: [drawbridge]
 
@@ -238,7 +253,7 @@ services:
     environment:
       VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_ROOT_TOKEN_ID:-drawbridge-dev-root}
       VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
-    ports: ["8200:8200"]
+    ports: ["127.0.0.1:8200:8200"]
     healthcheck:
       # 200 means initialised, unsealed and active. A sealed Vault answers 503 here, which
       # is why this is not a bare connectivity check.
@@ -280,7 +295,7 @@ services:
       AUTHENTIK_HOST: ${AUTHENTIK_HOST:-http://localhost:9443}
     volumes:
       - authentik-media:/media
-    ports: ["9443:9000"]
+    ports: ["127.0.0.1:9443:9000"]
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -308,7 +323,7 @@ services:
       dockerfile: services/api/Dockerfile
     command:
       ["uvicorn", "services.api.src.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
-    ports: ["8000:8000"]
+    ports: ["127.0.0.1:8000:8000"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 15s
@@ -323,7 +338,7 @@ services:
       context: .
       dockerfile: mcp_servers/mcp_ace/Dockerfile
     command: ["python", "-m", "mcp_servers.mcp_ace.server"]
-    ports: ["8101:8101"]
+    ports: ["127.0.0.1:8101:8101"]
     healthcheck:
       test: ["CMD", "curl", "-sS", "-o", "/dev/null", "--fail-early", "--connect-timeout", "3", "http://localhost:8101/mcp"]
       <<: *mcp-health
@@ -334,7 +349,7 @@ services:
       context: .
       dockerfile: mcp_servers/mcp_hts/Dockerfile
     command: ["python", "-m", "mcp_servers.mcp_hts.server"]
-    ports: ["8102:8102"]
+    ports: ["127.0.0.1:8102:8102"]
     healthcheck:
       test: ["CMD", "curl", "-sS", "-o", "/dev/null", "--fail-early", "--connect-timeout", "3", "http://localhost:8102/mcp"]
       <<: *mcp-health
@@ -345,7 +360,7 @@ services:
       context: .
       dockerfile: mcp_servers/mcp_docs/Dockerfile
     command: ["python", "-m", "mcp_servers.mcp_docs.server"]
-    ports: ["8103:8103"]
+    ports: ["127.0.0.1:8103:8103"]
     healthcheck:
       test: ["CMD", "curl", "-sS", "-o", "/dev/null", "--fail-early", "--connect-timeout", "3", "http://localhost:8103/mcp"]
       <<: *mcp-health
@@ -356,7 +371,7 @@ services:
       context: .
       dockerfile: mcp_servers/mcp_claims/Dockerfile
     command: ["python", "-m", "mcp_servers.mcp_claims.server"]
-    ports: ["8104:8104"]
+    ports: ["127.0.0.1:8104:8104"]
     healthcheck:
       test: ["CMD", "curl", "-sS", "-o", "/dev/null", "--fail-early", "--connect-timeout", "3", "http://localhost:8104/mcp"]
       <<: *mcp-health
@@ -367,7 +382,7 @@ services:
       context: .
       dockerfile: mcp_servers/mcp_ledger/Dockerfile
     command: ["python", "-m", "mcp_servers.mcp_ledger.server"]
-    ports: ["8105:8105"]
+    ports: ["127.0.0.1:8105:8105"]
     healthcheck:
       test: ["CMD", "curl", "-sS", "-o", "/dev/null", "--fail-early", "--connect-timeout", "3", "http://localhost:8105/mcp"]
       <<: *mcp-health

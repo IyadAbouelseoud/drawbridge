@@ -116,7 +116,7 @@ template {
 }
 
 template {
-  source      = "/vault/templates/service_token.ctmpl"
-  destination = "/vault/render/n8n/service_token"
+  source      = "/vault/templates/pipeline_client_secret.ctmpl"
+  destination = "/vault/render/n8n/pipeline_client_secret"
   perms       = "0644"
 }

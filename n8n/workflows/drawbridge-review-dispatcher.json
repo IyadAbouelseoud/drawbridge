@@ -30,8 +30,47 @@
     },
     {
       "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DRAWBRIDGE_TOKEN_URL || 'http://api:8000/auth/token' }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "client_credentials"
+            },
+            {
+              "name": "client_id",
+              "value": "agent:n8n-pipeline"
+            },
+            {
+              "name": "client_secret",
+              "value": "={{ $env.DRAWBRIDGE_PIPELINE_CLIENT_SECRET }}"
+            }
+          ]
+        }
+      },
+      "id": "get-access-token",
+      "name": "Get Access Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -510,
+        300
+      ]
+    },
+    {
+      "parameters": {
         "method": "GET",
-        "url": "http://api:8000/review/queue?tenant_id={{ $json.tenant_id }}&state=open&limit=200",
+        "url": "http://api:8000/review/overview?limit=200",
         "options": {
           "response": {
             "response": {
@@ -44,7 +83,7 @@
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Get Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -61,7 +100,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://api:8000/review/draft?tenant_id={{ $json.tenant_id }}",
+        "url": "http://api:8000/review/draft?limit=50",
         "options": {
           "response": {
             "response": {
@@ -74,7 +113,7 @@
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Get Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -90,7 +129,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Blocking first, then by how little time is left on the filing window. Age alone is\n// the wrong sort: a three-week-old item with six months of runway is less urgent than\n// yesterday's item with nine days.\n//\n// Reads the queue from the fetch node rather than from its own input, because the\n// drafting sweep sits between them and returns a count, not the rows.\nconst items = $('Fetch Open Queue').all().map(i => i.json);\nconst RANK = { blocking: 0, high: 1, normal: 2, low: 3 };\nitems.sort(function (a, b) {\n  const s = (RANK[a.severity] === undefined ? 9 : RANK[a.severity])\n          - (RANK[b.severity] === undefined ? 9 : RANK[b.severity]);\n  if (s !== 0) return s;\n  const da = (a.payload && a.payload.days !== undefined) ? a.payload.days : 9999;\n  const db = (b.payload && b.payload.days !== undefined) ? b.payload.days : 9999;\n  return da - db;\n});\nreturn items.map(function (json) { return { json: json }; });"
+        "jsCode": "// Blocking first, then by how little time is left on the filing window. Age alone is\n// the wrong sort: a three-week-old item with six months of runway is less urgent than\n// yesterday's item with nine days.\n//\n// Reads the queue from the fetch node rather than from its own input, because the\n// drafting sweep sits between them and returns a count, not the rows.\nconst items = ($('Fetch Open Queue').first().json.items || []);\nconst RANK = { blocking: 0, high: 1, normal: 2, low: 3 };\nitems.sort(function (a, b) {\n  const s = (RANK[a.severity] === undefined ? 9 : RANK[a.severity])\n          - (RANK[b.severity] === undefined ? 9 : RANK[b.severity]);\n  if (s !== 0) return s;\n  const da = (a.payload && a.payload.days !== undefined) ? a.payload.days : 9999;\n  const db = (b.payload && b.payload.days !== undefined) ? b.payload.days : 9999;\n  return da - db;\n});\nreturn items.map(function (json) { return { json: json }; });"
       },
       "id": "rank-by-urgency",
       "name": "Rank By Urgency",
@@ -161,6 +200,17 @@
   ],
   "connections": {
     "Every 15 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Get Access Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Access Token": {
       "main": [
         [
           {

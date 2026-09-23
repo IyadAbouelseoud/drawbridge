@@ -29,7 +29,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Fail fast on a malformed batch. A claim reaching the matcher without its jurisdiction\n// would be matched under whichever statute happens to be the default, which is exactly\n// the failure that looks plausible all the way to a filing.\n//\n// `claimant` is required here rather than at the packaging step because that step runs\n// twenty minutes and one analyst decision later, and discovering then that the filing\n// identity was never supplied means the run is lost, not delayed.\n// The Webhook node hands on the whole HTTP request — { headers, params, query, body } —\n// not the body. Every node after this one reads the claim fields at the top level, so the\n// unwrap happens here, once, and this node returns the payload itself.\n//\n// Found by running it. The first live execution failed at this line with \"ingest payload\n// missing required field: tenant_id\" against a payload that had one: the field was at\n// `$json.body.tenant_id` and had been for as long as the workflow existed. The fallback to\n// `$json` is for `n8n execute` and the editor's \"test step\", which pass a bare object.\nconst b = $input.first().json.body || $input.first().json;\nconst REQUIRED = ['tenant_id', 'jurisdiction', 'documents', 'imports', 'exports', 'claimant'];\nfor (const f of REQUIRED) {\n  if (!b[f]) throw new Error('ingest payload missing required field: ' + f);\n}\nif (!['us', 'ksa'].includes(b.jurisdiction)) {\n  throw new Error('unknown jurisdiction: ' + b.jurisdiction);\n}\nif (!b.imports.length || !b.exports.length) {\n  throw new Error('a claim needs at least one import line and one export line');\n}\nreturn [{ json: Object.assign({}, b, {\n  as_of: b.as_of || new Date().toISOString().slice(0, 10),\n}) }];"
+        "jsCode": "// Fail fast on a malformed batch. A claim reaching the matcher without its jurisdiction\n// would be matched under whichever statute happens to be the default, which is exactly\n// the failure that looks plausible all the way to a filing.\n//\n// `claimant` is no longer accepted from the webhook (v1.1.0). The packet is printed with\n// the tenant's filing profile — who claims and where the money lands are rows, not request\n// fields (§18.1) — and the Build Packet node used to forward this payload's `claimant`\n// straight into a document addressed to a customs authority.\n// The Webhook node hands on the whole HTTP request — { headers, params, query, body } —\n// not the body. Every node after this one reads the claim fields at the top level, so the\n// unwrap happens here, once, and this node returns the payload itself.\n//\n// Found by running it. The first live execution failed at this line with \"ingest payload\n// missing required field: tenant_id\" against a payload that had one: the field was at\n// `$json.body.tenant_id` and had been for as long as the workflow existed. The fallback to\n// `$json` is for `n8n execute` and the editor's \"test step\", which pass a bare object.\nconst b = $input.first().json.body || $input.first().json;\nconst REQUIRED = ['tenant_id', 'jurisdiction', 'documents', 'imports', 'exports'];\nfor (const f of REQUIRED) {\n  if (!b[f]) throw new Error('ingest payload missing required field: ' + f);\n}\nif (!['us', 'ksa'].includes(b.jurisdiction)) {\n  throw new Error('unknown jurisdiction: ' + b.jurisdiction);\n}\nif (!b.imports.length || !b.exports.length) {\n  throw new Error('a claim needs at least one import line and one export line');\n}\nreturn [{ json: Object.assign({}, b, {\n  as_of: b.as_of || new Date().toISOString().slice(0, 10),\n}) }];"
       },
       "id": "validate-payload",
       "name": "Validate Payload",
@@ -38,6 +38,78 @@
       "position": [
         -940,
         300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/pipeline/admit",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').first().json.tenant_id, run_id: String($execution.id) }) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $('Ingest Webhook').first().json.headers.authorization || '' }}"
+            }
+          ]
+        }
+      },
+      "id": "admit-run",
+      "name": "Admit Run",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -940,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DRAWBRIDGE_TOKEN_URL || 'http://api:8000/auth/token' }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "client_credentials"
+            },
+            {
+              "name": "client_id",
+              "value": "agent:n8n-pipeline"
+            },
+            {
+              "name": "client_secret",
+              "value": "={{ $env.DRAWBRIDGE_PIPELINE_CLIENT_SECRET }}"
+            }
+          ]
+        }
+      },
+      "id": "get-access-token",
+      "name": "Get Access Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -850,
+        480
       ]
     },
     {
@@ -53,13 +125,13 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ tenant_id: $json.tenant_id, documents: $json.documents }) }}",
+        "jsonBody": "={{ JSON.stringify({ tenant_id: $('Validate Payload').first().json.tenant_id, documents: $('Validate Payload').first().json.documents }) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Get Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -92,7 +164,7 @@
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Get Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -138,7 +210,7 @@
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Get Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -184,7 +256,7 @@
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Get Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -217,7 +289,7 @@
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Get Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -250,7 +322,7 @@
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Get Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -314,7 +386,7 @@
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Get Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -344,7 +416,7 @@
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Get Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -375,7 +447,115 @@
     },
     {
       "parameters": {
-        "jsCode": "// An analyst may approve, correct, reject or defer. Only the first two continue; a\n// rejected claim stops here with its reason recorded rather than proceeding quietly.\n// A deferred one also stops — it is still open, and the dispatcher will bring it back.\nconst r = $input.first().json;\nconst proceed = ['approved', 'corrected'].indexOf(r.resolution) !== -1;\nreturn [{ json: Object.assign({}, r, {\n  halt: !proceed,\n  next_state: proceed ? 'approved' : 'rejected',\n}) }];"
+        "method": "POST",
+        "url": "={{ $env.DRAWBRIDGE_TOKEN_URL || 'http://api:8000/auth/token' }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "client_credentials"
+            },
+            {
+              "name": "client_id",
+              "value": "agent:n8n-pipeline"
+            },
+            {
+              "name": "client_secret",
+              "value": "={{ $env.DRAWBRIDGE_PIPELINE_CLIENT_SECRET }}"
+            }
+          ]
+        }
+      },
+      "id": "resume-access-token",
+      "name": "Resume Access Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1330,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DRAWBRIDGE_TOKEN_URL || 'http://api:8000/auth/token' }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "client_credentials"
+            },
+            {
+              "name": "client_id",
+              "value": "agent:n8n-pipeline"
+            },
+            {
+              "name": "client_secret",
+              "value": "={{ $env.DRAWBRIDGE_PIPELINE_CLIENT_SECRET }}"
+            }
+          ]
+        }
+      },
+      "id": "refresh-access-token",
+      "name": "Refresh Access Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://api:8000/review/pending/{{ $('Await Resolution').first().json.body.resume_token }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $('Resume Access Token').first().json.access_token }}"
+            }
+          ]
+        }
+      },
+      "id": "verify-resolution",
+      "name": "Verify Resolution",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1330,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// An analyst may approve, correct, reject or defer, and the answer is read from the API —\n// `Verify Resolution` — not from the resume webhook's body. Until v1.1.0 this node read\n// `resolution` off the Wait node's output, which is the whole webhook request\n// ({ headers, body, ... }); the field was never at the top level, so every resumed run\n// took the halt branch. And a body is whatever whoever reached the webhook sent.\n//\n// Three outcomes, not two. `deferred` used to join `rejected` on the halt branch and move\n// the claim to `rejected` — a terminal state — for a decision that means \"look again\n// later\". A deferral now ends the run and leaves the claim where it is.\nconst v = $input.first().json;\nlet decision = 'defer';\nif (v.may_continue === true) decision = 'continue';\nelse if (v.resolution === 'rejected') decision = 'reject';\nreturn [{ json: Object.assign({}, v, { decision: decision }) }];"
       },
       "id": "apply-resolution",
       "name": "Apply Resolution",
@@ -397,11 +577,11 @@
             {
               "id": "c1",
               "operator": {
-                "type": "boolean",
-                "operation": "false",
-                "singleValue": true
+                "type": "string",
+                "operation": "equals"
               },
-              "leftValue": "={{ $json.halt }}"
+              "leftValue": "={{ $json.decision }}",
+              "rightValue": "continue"
             }
           ],
           "combinator": "and"
@@ -415,6 +595,37 @@
       "position": [
         1600,
         140
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "leftValue": "={{ $json.decision }}",
+              "rightValue": "reject"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "analyst-rejected",
+      "name": "Analyst Rejected",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1700,
+        40
       ]
     },
     {
@@ -436,7 +647,7 @@
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Refresh Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -463,13 +674,13 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').first().json.claim_id, to_state: 'rejected', actor: 'analyst', reason: $('Apply Resolution').first().json.resolution_note || 'analyst did not approve' }) }}",
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').first().json.claim_id, to_state: 'rejected', actor: 'pipeline', reason: 'an analyst rejected an exception on this claim; run ' + $execution.id }) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Resume Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -496,13 +707,13 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').first().json.claim_id, claimant: $('Validate Payload').first().json.claimant, include_artifacts: false }) }}",
+        "jsonBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').first().json.claim_id, include_artifacts: false }) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Refresh Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -535,7 +746,7 @@
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Refresh Access Token').first().json.access_token }}"
             }
           ]
         }
@@ -567,6 +778,21 @@
     {
       "parameters": {
         "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').first().json.claim_id, state: 'analyst_review', resolution: $('Apply Resolution').first().json.resolution }) }}",
+        "options": {}
+      },
+      "id": "respond-deferred",
+      "name": "Respond Deferred",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1880,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
         "responseBody": "={{ JSON.stringify({ claim_id: $('Persist Claim').first().json.claim_id, state: 'rejected', resolution: $('Apply Resolution').first().json.resolution }) }}",
         "options": {}
       },
@@ -593,6 +819,28 @@
       ]
     },
     "Validate Payload": {
+      "main": [
+        [
+          {
+            "node": "Admit Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Admit Run": {
+      "main": [
+        [
+          {
+            "node": "Get Access Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Access Token": {
       "main": [
         [
           {
@@ -702,7 +950,7 @@
         ],
         [
           {
-            "node": "Approve Claim",
+            "node": "Refresh Access Token",
             "type": "main",
             "index": 0
           }
@@ -735,6 +983,28 @@
       "main": [
         [
           {
+            "node": "Resume Access Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resume Access Token": {
+      "main": [
+        [
+          {
+            "node": "Verify Resolution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Resolution": {
+      "main": [
+        [
+          {
             "node": "Apply Resolution",
             "type": "main",
             "index": 0
@@ -757,14 +1027,32 @@
       "main": [
         [
           {
-            "node": "Approve Claim",
+            "node": "Refresh Access Token",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
+            "node": "Analyst Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyst Rejected": {
+      "main": [
+        [
+          {
             "node": "Halt Claim",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Deferred",
             "type": "main",
             "index": 0
           }
@@ -776,6 +1064,17 @@
         [
           {
             "node": "Respond Halted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Refresh Access Token": {
+      "main": [
+        [
+          {
+            "node": "Approve Claim",
             "type": "main",
             "index": 0
           }

@@ -21,7 +21,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// A crashed run must leave the claim in a state an analyst can act on, not stranded\n// mid-transition with no record of why it stopped.\nconst e = $input.first().json;\nconst ex = e.execution || {};\nreturn [{ json: {\n  tenant_id: e.tenant_id,\n  reason: 'solver_infeasible',\n  severity: 'blocking',\n  summary: 'pipeline run ' + ex.id + ' failed at node ' + ex.lastNodeExecuted\n         + ': ' + ((ex.error && ex.error.message) || 'unknown error'),\n  payload: { node: ex.lastNodeExecuted, workflow: (e.workflow || {}).name },\n} }];"
+        "jsCode": "// A crashed run must leave the claim in a state an analyst can act on, not stranded\n// mid-transition with no record of why it stopped.\n//\n// Until v1.1.0 this posted `tenant_id: e.tenant_id`. The Error Trigger's payload carries\n// the execution and the workflow and no tenant, so the key was undefined, JSON.stringify\n// dropped it, and the API refused the request: no crash ever reached the queue. It also\n// filed every crash as `solver_infeasible`. The API now attributes the run itself, from\n// the record `/pipeline/admit` wrote when the run started.\nconst e = $input.first().json;\nconst ex = e.execution || {};\nreturn [{ json: {\n  workflow_run_id: String(ex.id),\n  node: ex.lastNodeExecuted || '',\n  message: ((ex.error && ex.error.message) || 'unknown error').slice(0, 1500),\n  workflow: (e.workflow || {}).name || '',\n} }];"
       },
       "id": "build-exception",
       "name": "Build Exception",
@@ -35,7 +35,46 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "http://api:8000/review/suspend",
+        "url": "={{ $env.DRAWBRIDGE_TOKEN_URL || 'http://api:8000/auth/token' }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "grant_type",
+              "value": "client_credentials"
+            },
+            {
+              "name": "client_id",
+              "value": "agent:n8n-pipeline"
+            },
+            {
+              "name": "client_secret",
+              "value": "={{ $env.DRAWBRIDGE_PIPELINE_CLIENT_SECRET }}"
+            }
+          ]
+        }
+      },
+      "id": "get-access-token",
+      "name": "Get Access Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -90,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/pipeline/failure",
         "options": {
           "response": {
             "response": {
@@ -45,19 +84,19 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ tenant_id: $json.tenant_id, workflow_run_id: $json.payload.workflow, items: [$json] }) }}",
+        "jsonBody": "={{ JSON.stringify($('Build Exception').first().json) }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
             {
               "name": "Authorization",
-              "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"
+              "value": "=Bearer {{ $('Get Access Token').first().json.access_token }}"
             }
           ]
         }
       },
-      "id": "queue-exception",
-      "name": "Queue Exception",
+      "id": "report-failure",
+      "name": "Report Failure",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
@@ -82,7 +121,18 @@
       "main": [
         [
           {
-            "node": "Queue Exception",
+            "node": "Get Access Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Access Token": {
+      "main": [
+        [
+          {
+            "node": "Report Failure",
             "type": "main",
             "index": 0
           }

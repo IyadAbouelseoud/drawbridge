@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "drawbridge-claims": {
+      "type": "http",
+      "url": "http://localhost:8104/mcp",
+      "headers": { "Authorization": "Bearer ${DRAWBRIDGE_ANALYST_TOKEN}" }
+    },
+    "drawbridge-ledger": {
+      "type": "http",
+      "url": "http://localhost:8105/mcp",
+      "headers": { "Authorization": "Bearer ${DRAWBRIDGE_ANALYST_TOKEN}" }
+    },
+    "drawbridge-docs": {
+      "type": "http",
+      "url": "http://localhost:8103/mcp",
+      "headers": { "Authorization": "Bearer ${DRAWBRIDGE_ANALYST_TOKEN}" }
+    },
+    "drawbridge-hts": {
+      "type": "http",
+      "url": "http://localhost:8102/mcp",
+      "headers": { "Authorization": "Bearer ${DRAWBRIDGE_ANALYST_TOKEN}" }
+    }
+  }
+}

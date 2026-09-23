@@ -37,6 +37,7 @@ import argparse
 import base64
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
@@ -98,29 +99,40 @@ class Report:
         return "\n".join(lines)
 
 
+#: Re-mint the harness token after ten minutes of its fifteen.
+TOKEN_REFRESH_SECONDS = 600.0
+
+
 class Api:
     """Thin client over the deployed API. Never raises on a status; the caller judges."""
 
     def __init__(self, base: str) -> None:
-        token = os.environ.get("DRAWBRIDGE_SERVICE_TOKEN", "").strip()
-        if not token:
-            # The same shape n8n carries: one run, driving whichever tenant the trigger
-            # names. Against a real Authentik there is no secret here to sign with and the
-            # token has to arrive in the environment instead.
-            token = mint(
+        # The registered e2e identity (`agent:e2e-harness`), because this script plays the
+        # part n8n plays: one run, driving a named tenant through the pipeline. Minted
+        # locally against DRAWBRIDGE_JWT_SECRET for fifteen minutes — the ceiling the
+        # verifier enforces for it — and re-minted before it lapses, so a long run does not
+        # fail half way through on a credential. Against a real Authentik there is no secret
+        # here and the token has to be supplied in DRAWBRIDGE_SERVICE_TOKEN instead.
+        self._supplied = os.environ.get("DRAWBRIDGE_SERVICE_TOKEN", "").strip()
+        self._token = ""
+        self._minted_at = 0.0
+        self._client = httpx.Client(base_url=base.rstrip("/"), timeout=TIMEOUT)
+
+    def _headers(self) -> dict[str, str]:
+        if self._supplied:
+            return {"Authorization": f"Bearer {self._supplied}"}
+        if not self._token or time.monotonic() - self._minted_at > TOKEN_REFRESH_SECONDS:
+            self._token = mint(
                 get_settings(),
-                subject="pilot-run",
+                subject="agent:e2e-harness",
                 scopes=(SERVICE_SCOPE,),
-                ttl_seconds=1800,
+                ttl_seconds=900,
             )
-        self._client = httpx.Client(
-            base_url=base.rstrip("/"),
-            timeout=TIMEOUT,
-            headers={"Authorization": f"Bearer {token}"},
-        )
+            self._minted_at = time.monotonic()
+        return {"Authorization": f"Bearer {self._token}"}
 
     def post(self, path: str, body: Any) -> tuple[int, Any]:
-        response = self._client.post(path, json=body)
+        response = self._client.post(path, json=body, headers=self._headers())
         try:
             return response.status_code, response.json()
         except ValueError:

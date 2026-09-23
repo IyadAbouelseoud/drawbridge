@@ -515,7 +515,8 @@ class AuditLedger(Base):
         CheckConstraint(
             "event_type IN ('document_ingested','extraction_run','figure_traced',"
             "'claim_persisted','claim_transition','review_opened','review_resolved',"
-            "'valuation_override','packet_built')",
+            "'valuation_override','packet_built','review_reopened',"
+            "'agent_memo_drafted','agent_memo_withheld','prompt_injection_suspected')",
             name="ck_ledger_event_type",
         ),
         CheckConstraint("char_length(entry_hash) = 64", name="ck_ledger_entry_hash_length"),
@@ -641,7 +642,8 @@ class ReviewQueue(Base):
         CheckConstraint(
             "reason IN ('solver_not_optimal','solver_infeasible','low_extraction_confidence',"
             "'threshold_near_miss','rate_unavailable','unknown_field_label',"
-            "'jurisdiction_ambiguous','deadline_imminent')",
+            "'jurisdiction_ambiguous','deadline_imminent',"
+            "'high_value_approval','suspected_prompt_injection','pipeline_failure')",
             name="ck_review_reason",
         ),
         CheckConstraint("state IN ('open','claimed','resolved')", name="ck_review_state"),
@@ -661,4 +663,108 @@ class ReviewQueue(Base):
         ),
         Index("ix_review_queue_open", "tenant_id", "state", "created_at"),
         Index("ix_review_queue_claim", "claim_id"),
+        # The drafter's poll. Created by migration b93e2d7a5c14 in week 8 and absent from
+        # this model until v1.1.0, so every database `create_all` built — the integration
+        # suite's — lacked an index production had. Same definition as the migration.
+        Index(
+            "ix_review_queue_undrafted",
+            "tenant_id",
+            "created_at",
+            postgresql_where=text("agent_memo IS NULL AND state = 'open'"),
+        ),
     )
+
+
+class ControlEvent(Base):
+    """The operational record: the kill switch, and every short-lived credential issued.
+
+    Not tenant data, so not in `audit_ledger` — that chain is per tenant by design (§15.3)
+    and a global halt belongs to no tenant. Append-only by the same construction: triggers
+    refuse UPDATE, DELETE and TRUNCATE, so the switch's history cannot be rewritten to say
+    it was never thrown.
+
+    **The switch's state is a query over its history**, not a mutable flag. The latest
+    engage-or-release row per scope decides, which means there is no row to UPDATE, no
+    moment at which the state and its record can disagree, and "who stopped the system,
+    when, and why" is the same read as "is it stopped".
+    """
+
+    __tablename__ = "control_events"
+
+    event_id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(48))
+    scope_kind: Mapped[str] = mapped_column(String(16), default="global")
+    scope_value: Mapped[str] = mapped_column(String(128), default="")
+    actor: Mapped[str] = mapped_column(String(128))
+    actor_kind: Mapped[str] = mapped_column(String(16))
+    reason: Mapped[str] = mapped_column(Text)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    trace_id: Mapped[str | None] = mapped_column(String(32))
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('kill_switch_engaged','kill_switch_released','token_issued',"
+            "'circuit_breaker_tripped')",
+            name="ck_control_event_type",
+        ),
+        CheckConstraint(
+            "scope_kind IN ('global','tenant','principal')", name="ck_control_scope_kind"
+        ),
+        CheckConstraint("actor_kind IN ('human','machine','local')", name="ck_control_actor_kind"),
+        # A halt or a release with no stated reason is the one record an incident review
+        # most needs and least often gets.
+        CheckConstraint("char_length(reason) >= 20", name="ck_control_reason_stated"),
+        # The switch's state query reads engage/release rows only. Partial, because the
+        # table also takes a `token_issued` row on every credential exchange — several per
+        # pipeline run — and the first measurement (scripts/perf_audit.py) found the state
+        # query sequentially scanning all of them: a cold read that would have grown with
+        # every run the deployment ever made.
+        Index(
+            "ix_control_events_switch",
+            "scope_kind",
+            "scope_value",
+            "event_id",
+            postgresql_where=text("event_type IN ('kill_switch_engaged', 'kill_switch_released')"),
+        ),
+    )
+
+
+CONTROL_GUARD_FUNCTION = """
+CREATE OR REPLACE FUNCTION control_events_is_append_only()
+RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'control_events is append-only: % refused', TG_OP
+        USING ERRCODE = 'restrict_violation';
+END;
+$$ LANGUAGE plpgsql;
+"""
+
+CONTROL_GUARD_TRIGGERS = (
+    "DROP TRIGGER IF EXISTS control_events_no_update ON control_events",
+    "CREATE TRIGGER control_events_no_update BEFORE UPDATE ON control_events "
+    "FOR EACH ROW EXECUTE FUNCTION control_events_is_append_only()",
+    "DROP TRIGGER IF EXISTS control_events_no_delete ON control_events",
+    "CREATE TRIGGER control_events_no_delete BEFORE DELETE ON control_events "
+    "FOR EACH ROW EXECUTE FUNCTION control_events_is_append_only()",
+    "DROP TRIGGER IF EXISTS control_events_no_truncate ON control_events",
+    "CREATE TRIGGER control_events_no_truncate BEFORE TRUNCATE ON control_events "
+    "FOR EACH STATEMENT EXECUTE FUNCTION control_events_is_append_only()",
+)
+
+
+def install_control_guards(connection: Connection) -> None:
+    connection.execute(text(CONTROL_GUARD_FUNCTION))
+    for statement in CONTROL_GUARD_TRIGGERS:
+        connection.execute(text(statement))
+
+
+@event.listens_for(ControlEvent.__table__, "after_create")
+def _install_control_guards_on_create(
+    target: object,  # noqa: ARG001 - fixed SQLAlchemy event signature
+    connection: Connection,
+    **kwargs: Any,  # noqa: ARG001 - fixed SQLAlchemy event signature
+) -> None:
+    install_control_guards(connection)

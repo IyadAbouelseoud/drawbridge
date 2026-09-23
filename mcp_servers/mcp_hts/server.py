@@ -20,7 +20,9 @@ from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 from sqlalchemy import text
 
+from drawbridge_schemas.agents import Scope
 from mcp_servers.mcp_claims.db import session_scope
+from mcp_servers.security import READ_ONLY, guarded, run, server_kwargs
 from services.api.src.config import get_settings
 from services.api.src.telemetry import configure_tracing
 from services.classifier.src.embeddings import BACKENDS, DEFAULT_BACKEND, build_reranker
@@ -31,20 +33,25 @@ from services.classifier.src.search import (
     search_tariff,
 )
 
-server = MCPServer("mcp-hts")
+server = MCPServer(
+    "mcp-hts",
+    **server_kwargs("agent:mcp-hts", get_settings().mcp_hts_url),
+)
 
 
 def _fail(exc: Exception) -> dict[str, Any]:
     return {"ok": False, "error": type(exc).__name__, "detail": str(exc)}
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(None)
 def ping() -> str:
     """Liveness probe."""
     return "mcp-hts ok"
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(Scope.CORPUS_READ)
 def classify(
     description: Annotated[str, Field(description="Goods description to classify")],
     jurisdiction: Annotated[str, Field(description="us | ksa")] = "us",
@@ -86,7 +93,8 @@ def classify(
         return _fail(exc)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(Scope.CORPUS_READ)
 def classify_with_embedding(
     description: Annotated[str, Field(description="Goods description to classify")],
     embedding: Annotated[
@@ -159,7 +167,8 @@ def classify_with_embedding(
         return _fail(exc)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(Scope.CORPUS_READ)
 def lookup_code(
     code: Annotated[str, Field(description="Tariff code, digits only")],
     jurisdiction: Annotated[str, Field(description="us | ksa")] = "us",
@@ -214,7 +223,8 @@ def lookup_code(
         return _fail(exc)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(Scope.CORPUS_READ)
 def compare_across_jurisdictions(
     hs6: Annotated[str, Field(description="6-digit harmonised subheading")],
 ) -> dict[str, Any]:
@@ -258,7 +268,8 @@ def compare_across_jurisdictions(
         return _fail(exc)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(Scope.CORPUS_READ)
 def find_rulings(
     query: Annotated[str, Field(description="Article description or issue")],
     jurisdiction: Annotated[str, Field(description="us | ksa")] = "us",
@@ -285,7 +296,8 @@ def find_rulings(
         return _fail(exc)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(Scope.CORPUS_READ)
 def corpus_status() -> dict[str, Any]:
     """What has been ingested, and how much of it is embedded.
 
@@ -343,8 +355,7 @@ def main() -> None:
     # the same trace. Without an exporter configured the spans are created and dropped —
     # see services/api/src/telemetry.py; the server starts either way.
     configure_tracing("drawbridge-mcp-hts", endpoint=get_settings().otel_exporter_endpoint)
-    # MCP SDK 2.x takes the bind address on run(), not on the constructor.
-    server.run(transport="streamable-http", host="0.0.0.0", port=8102)
+    run(server, name="mcp-hts", host_alias="mcp-hts", port=8102)
 
 
 if __name__ == "__main__":

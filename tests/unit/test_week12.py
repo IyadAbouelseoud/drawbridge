@@ -67,7 +67,10 @@ class TestWhatDecodeAccepts:
         assert principal.is_service is False
 
     def test_a_service_token_carries_no_tenant(self, settings: Settings) -> None:
-        principal = decode(mint(settings, subject="n8n", scopes=(SERVICE_SCOPE,)), settings)
+        # v1.1.0: a machine token names a registered identity; "n8n" is no longer one.
+        principal = decode(
+            mint(settings, subject="agent:n8n-pipeline", scopes=(SERVICE_SCOPE,)), settings
+        )
         assert principal.tenant_id is None
         assert principal.is_service is True
 
@@ -80,9 +83,10 @@ class TestWhatDecodeAccepts:
         """
         now = int(time.time())
         base = {
-            "sub": "n8n",
+            "sub": "agent:n8n-pipeline",
             "iss": settings.jwt_issuer,
             "aud": settings.jwt_audience,
+            "iat": now,
             "exp": now + 60,
         }
         as_list = jwt.encode({**base, "scopes": [SERVICE_SCOPE]}, SECRET, algorithm="HS256")
@@ -121,8 +125,11 @@ class TestWhatDecodeRefuses:
             decode(other, settings)
 
     def test_an_expired_token(self, settings: Settings) -> None:
+        """Expired by more than the 30-second clock-skew leeway `decode` allows (v1.1.0);
+        a token one second past `exp` is inside it, as it would be at any verifier that
+        tolerates NTP drift between issuer and host."""
         with pytest.raises(AuthError, match="expired"):
-            decode(mint(settings, subject="alice", tenant_id=uuid4(), ttl_seconds=-1), settings)
+            decode(mint(settings, subject="alice", tenant_id=uuid4(), ttl_seconds=-120), settings)
 
     def test_an_unsigned_token(self, settings: Settings) -> None:
         """`alg: none`, the oldest JWT bug there is.
@@ -157,6 +164,7 @@ class TestWhatDecodeRefuses:
                 "sub": "alice",
                 "iss": settings.jwt_issuer,
                 "aud": settings.jwt_audience,
+                "iat": now,
                 "exp": now + 60,
                 "tenant_id": "'; DROP TABLE claims; --",
             },
@@ -169,7 +177,13 @@ class TestWhatDecodeRefuses:
     def test_a_token_that_is_both_a_user_and_a_service(self, settings: Settings) -> None:
         with pytest.raises(AuthError, match="must not carry a tenant"):
             decode(
-                mint(settings, subject="x", tenant_id=uuid4(), scopes=(SERVICE_SCOPE,)), settings
+                mint(
+                    settings,
+                    subject="agent:n8n-pipeline",
+                    tenant_id=uuid4(),
+                    scopes=(SERVICE_SCOPE,),
+                ),
+                settings,
             )
 
 

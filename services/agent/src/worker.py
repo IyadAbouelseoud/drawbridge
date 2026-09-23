@@ -18,11 +18,16 @@ minutes because an analyst arrives minutes to hours after the suspension.
 and commits per row, so two workers against one queue is a supported configuration, an
 interrupted pass loses at most the row in flight, and a restart resumes by construction.
 
-**It runs unscoped, deliberately.** `tenant_id=None` drafts across every tenant, which is
-the same posture as the service token n8n carries and for the same reason: one worker
-serves whichever tenants have queued work. It therefore connects as the owner role, and
-`docker-compose.onprem.yml` gives it its own credential so that the blast radius of the
-one cross-tenant process in the deployment is a credential somebody can revoke.
+**It serves every tenant, and reads each one under its own scope.** `tenant_id=None`
+drafts across every tenant with work waiting — one worker for all of them — but since
+v1.1.0 it gets there by asking `app_tenants_with_undrafted_reviews()` which tenants those
+are (ids only) and then scoping to each in turn. Before that it ran unscoped, which under
+the app role the on-prem stack gives it reads nothing at all: the deployed worker would
+have polled an empty queue forever and, logging only passes that did something, said so
+never. It holds no owner DSN and needs none.
+
+**It stops when told.** Every row checks the kill switch for `agent:memo-drafter`, and a
+pass that finds it engaged ends and logs `halted` rather than spinning.
 """
 
 from __future__ import annotations
@@ -82,12 +87,14 @@ def run(*, interval: float, batch: int, once: bool) -> int:
             report = draft_pending(session, limit=batch)
         passes += 1
         drafted_total += report.drafted
-        if report.drafted or report.skipped or report.unavailable:
+        if report.attempted or report.halted:
             logger.info(
-                "worker.pass drafted=%d skipped=%d unavailable=%d",
+                "worker.pass drafted=%d skipped=%d withheld=%d unavailable=%d halted=%s",
                 report.drafted,
                 report.skipped,
+                report.withheld,
                 report.unavailable,
+                report.halted,
             )
         if once:
             break

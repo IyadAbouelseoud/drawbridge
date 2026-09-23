@@ -139,6 +139,15 @@ x-python-onprem: &python-onprem
     DRAWBRIDGE_PREPARER_FILER_CODE: ${DRAWBRIDGE_PREPARER_FILER_CODE:-}
     DRAWBRIDGE_PREPARER_CONTACT: ${DRAWBRIDGE_PREPARER_CONTACT:-}
 
+    # Agent governance (v1.1.0). Required: the API refuses to start outside development
+    # while any registered agent's owner role is unbound (auth.check_identity_posture).
+    DRAWBRIDGE_OWNER_PLATFORM: ${DRAWBRIDGE_OWNER_PLATFORM:?name the platform owner}
+    DRAWBRIDGE_OWNER_COMPLIANCE: ${DRAWBRIDGE_OWNER_COMPLIANCE:?name the compliance owner}
+    DRAWBRIDGE_OWNER_SECURITY: ${DRAWBRIDGE_OWNER_SECURITY:?name the security owner}
+    DRAWBRIDGE_AUTO_APPROVE_CEILING_USD: ${DRAWBRIDGE_AUTO_APPROVE_CEILING_USD:-100000}
+    # `engaged` halts every mutation without consulting the database.
+    DRAWBRIDGE_KILL_SWITCH: ${DRAWBRIDGE_KILL_SWITCH:-}
+
     DRAWBRIDGE_MCP_ACE_URL: http://mcp-ace:8101/mcp
     DRAWBRIDGE_MCP_HTS_URL: http://mcp-hts:8102/mcp
     DRAWBRIDGE_MCP_DOCS_URL: http://mcp-docs:8103/mcp
@@ -368,7 +377,7 @@ services:
                    /vault/render/minio/minio_root_password \
                    /vault/render/n8n/postgres_password \
                    /vault/render/n8n/n8n_encryption_key \
-                   /vault/render/n8n/service_token; do
+                   /vault/render/n8n/pipeline_client_secret; do
             [ -s "$$f" ] || exit 1
             grep -q '<no value>' "$$f" && exit 1
           done
@@ -467,12 +476,25 @@ services:
       # that reached the API. Scoped rather than opened wide — the allowlist below
       # is the only variable a workflow may read.
       N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
-      N8N_VARS_ALLOWLIST: DRAWBRIDGE_SERVICE_TOKEN
+      N8N_VARS_ALLOWLIST: DRAWBRIDGE_PIPELINE_CLIENT_SECRET,DRAWBRIDGE_TOKEN_URL
       N8N_HIRING_BANNER_ENABLED: "false"
       GENERIC_TIMEZONE: ${DRAWBRIDGE_TIMEZONE:-UTC}
-      # Cross-tenant by design: one workflow runs whichever tenant its trigger names.
-      # This is the most valuable secret in the deployment; see services/api/src/auth.py.
-      DRAWBRIDGE_SERVICE_TOKEN_FILE: /vault/render/n8n/service_token
+      # v1.1.0. The pipeline exchanges its client secret for a fifteen-minute token at
+      # Authentik's token endpoint on every run; it holds no bearer token at rest.
+      #
+      # This replaced `DRAWBRIDGE_SERVICE_TOKEN_FILE`, which never worked: n8n expands the
+      # `_FILE` suffix for its own configuration variables only, so `$env.DRAWBRIDGE_
+      # SERVICE_TOKEN` was empty in every on-prem run and every API call would have gone
+      # out as `Bearer ` — found by reading, since this stack has never been deployed. The
+      # entrypoint below exports the rendered file instead.
+      DRAWBRIDGE_TOKEN_URL: ${DRAWBRIDGE_TOKEN_URL:?set DRAWBRIDGE_TOKEN_URL to Authentik's token endpoint}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        export DRAWBRIDGE_PIPELINE_CLIENT_SECRET="$$(cat /vault/render/n8n/pipeline_client_secret)"
+        && exec tini -- /docker-entrypoint.sh "$$@"
+      - --
     volumes:
       - render-n8n:/vault/render/n8n:ro
       - n8n-data:/home/node/.n8n

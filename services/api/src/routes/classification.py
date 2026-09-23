@@ -23,9 +23,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Annotated, Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
 
+from drawbridge_schemas.agents import Scope
+from services.api.src.auth import require
 from services.api.src.sync_db import in_thread
 from services.classifier.src.embeddings import (
     BACKENDS,
@@ -90,7 +92,7 @@ def _agreement(declared: str, candidates: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
-@router.post("/run")
+@router.post("/run", dependencies=[Depends(require(Scope.CLASSIFICATION_RUN))])
 async def run_classification(body: ClassifyRequest) -> dict[str, Any]:
     """Check every line's declared code against the schedule.
 

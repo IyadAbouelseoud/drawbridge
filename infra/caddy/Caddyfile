@@ -27,7 +27,15 @@
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
 		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Cross-Origin-Opener-Policy "same-origin"
 		-Server
+	}
+
+	# The API caps bodies at 64 MB itself (guard.EdgeMiddleware); refusing larger ones
+	# here means they never cross the network to it.
+	request_body {
+		max_size 64MB
 	}
 
 	# Authentik owns /application/* and the login flows. Routed first, because the API is
@@ -46,11 +54,33 @@
 		reverse_proxy authentik-server:9000
 	}
 
-	# n8n's editor. Behind the same TLS endpoint rather than on its own port, so there is
-	# one place where access is granted and one access log to read.
-	handle /n8n/* {
+	# n8n, in three parts (v1.1.0). Until now all of /n8n/* was proxied to anyone.
+	#
+	# The ingest webhook is public: it is how a tenant starts a run, and the run's first
+	# node verifies the caller's own bearer token against the API (/pipeline/admit).
+	handle /n8n/webhook/drawbridge/ingest {
 		uri strip_prefix /n8n
 		reverse_proxy n8n:5678
+	}
+	# Resume webhooks are never public. They are addressed by n8n execution id — a
+	# sequential integer — and the only legitimate caller is mcp-claims, inside the
+	# network. The workflow re-reads the decision from the API anyway; this keeps the
+	# guessable URL off the internet.
+	handle /n8n/webhook-waiting/* {
+		respond "Not Found" 404
+	}
+	# The editor holds every workflow and n8n's credential store. Private networks only;
+	# a deployment that needs remote access puts it behind Authentik forward-auth.
+	@n8n_editor_private {
+		path /n8n/*
+		remote_ip private_ranges
+	}
+	handle @n8n_editor_private {
+		uri strip_prefix /n8n
+		reverse_proxy n8n:5678
+	}
+	handle /n8n/* {
+		respond "Forbidden" 403
 	}
 
 	handle {

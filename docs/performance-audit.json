@@ -1,0 +1,94 @@
+{
+  "machine": {
+    "python": "3.14.0",
+    "platform": "Windows-11-10.0.26200-SP0"
+  },
+  "request_path": {
+    "no_middleware": {
+      "median_us": 229.4,
+      "p95_us": 401.9,
+      "n": 2000
+    },
+    "v1.0.0_auth": {
+      "median_us": 598.6,
+      "p95_us": 1028.1,
+      "n": 2000
+    },
+    "v1.1.0_stack": {
+      "median_us": 576.3,
+      "p95_us": 969.6,
+      "n": 2000
+    }
+  },
+  "primitives": {
+    "jwt_decode_hs256": {
+      "median_us": 49.9,
+      "p95_us": 71.3,
+      "n": 2000
+    },
+    "injection_scan_facts": {
+      "median_us": 351.2,
+      "p95_us": 470.1,
+      "n": 500
+    },
+    "output_guard_memo": {
+      "median_us": 639.0,
+      "p95_us": 917.4,
+      "n": 500
+    },
+    "anthropic_client_construction": {
+      "median_us": 1001.2,
+      "p95_us": 1415.9,
+      "n": 50
+    },
+    "killswitch_read_cold": {
+      "median_us": 1109.2,
+      "p95_us": 2527.0,
+      "n": 200
+    },
+    "killswitch_read_cached": {
+      "median_us": 1.4,
+      "p95_us": 1.9,
+      "n": 2000
+    }
+  },
+  "query_plans": {
+    "drafter_poll": {
+      "execution_ms": 0.046,
+      "nodes": [
+        "Limit",
+        "Index Scan (ix_review_queue_undrafted)"
+      ]
+    },
+    "drafter_tenant_lookup": {
+      "execution_ms": 2.416,
+      "nodes": [
+        "ProjectSet",
+        "Result"
+      ]
+    },
+    "killswitch_state": {
+      "execution_ms": 0.031,
+      "nodes": [
+        "Subquery Scan",
+        "Unique",
+        "Incremental Sort",
+        "Index Scan (ix_control_events_switch)"
+      ]
+    },
+    "queue_ordered": {
+      "execution_ms": 0.121,
+      "nodes": [
+        "Limit",
+        "Sort",
+        "Bitmap Heap Scan",
+        "Bitmap Index Scan (ix_review_queue_open)"
+      ]
+    },
+    "_seeded": {
+      "tenants": 50,
+      "review_rows": 20000,
+      "control_events": 5000
+    }
+  }
+}

@@ -38,29 +38,40 @@ def node(
     return result
 
 
-#: Every call this workflow makes to the API carries the service token, and it is applied
-#: here rather than per node.
+#: Every call this workflow makes to the API carries a bearer token, and it is applied in
+#: one place (`http`) rather than per node.
 #:
-#: Week 12 made the token decide the tenant and added this header to the three generated
-#: JSON files by hand, without touching this generator. It went unnoticed for three commits
-#: because nobody ran the generator: regenerating would have silently stripped the bearer
-#: token from all eight API calls, and the pipeline would have started failing on 401 with
-#: a diff that looked like formatting. A header applied in one place cannot be forgotten
-#: from one node, which is the actual fix — the original defect was not the missing lines,
-#: it was that they were per-node lines at all.
+#: Week 12 added the header to the three generated JSON files by hand, without touching
+#: this generator. It went unnoticed for three commits because nobody ran the generator:
+#: regenerating would have silently stripped the bearer token from all eight API calls.
+#: A header applied in one place cannot be forgotten from one node.
 #:
-#: `$env` rather than an n8n credential: the token is mounted into the container by the
-#: deployment (`DRAWBRIDGE_SERVICE_TOKEN_FILE` on-prem), so it rotates with a restart and
-#: never enters n8n's own encrypted credential store, where it would be a second copy with
-#: its own lifecycle and its own encryption key to lose.
-_AUTH_HEADER = {
-    "sendHeaders": True,
-    "headerParameters": {
-        "parameters": [
-            {"name": "Authorization", "value": "=Bearer {{ $env.DRAWBRIDGE_SERVICE_TOKEN }}"}
-        ]
-    },
-}
+#: **v1.1.0: the token is fifteen minutes old at most.** Until now the header read
+#: `$env.DRAWBRIDGE_SERVICE_TOKEN` — one cross-tenant JWT minted for a day, the most
+#: valuable secret in the deployment, sitting in n8n's environment. The workflow now holds
+#: only the pipeline's *client secret* (`$env.DRAWBRIDGE_PIPELINE_CLIENT_SECRET`), which
+#: is useless against any data route, and exchanges it at `/auth/token` at the start of
+#: every run for a token that expires in fifteen minutes. A run parked on an analyst for
+#: hours exchanges again when it resumes (`Refresh Access Token`), because the token it
+#: started with is long dead by then — which is the point.
+TOKEN_NODE = "Get Access Token"
+RESUME_NODE = "Resume Access Token"
+REFRESH_NODE = "Refresh Access Token"
+CLIENT_ID = "agent:n8n-pipeline"
+
+
+def _bearer(token_node: str) -> dict:
+    return {
+        "sendHeaders": True,
+        "headerParameters": {
+            "parameters": [
+                {
+                    "name": "Authorization",
+                    "value": "=Bearer {{ $('" + token_node + "').first().json.access_token }}",
+                }
+            ]
+        },
+    }
 
 
 #: Cross-node references use `$('Node').first().json`, never `$('Node').item.json`.
@@ -109,7 +120,20 @@ _AUTH_HEADER = {
 _FAIL_CLOSED = {"response": {"response": {"neverError": False}}}
 
 
-def http(name: str, x: int, y: int, method: str, url: str, body: str | None = None) -> dict:
+def http(
+    name: str,
+    x: int,
+    y: int,
+    method: str,
+    url: str,
+    body: str | None = None,
+    *,
+    token: str = TOKEN_NODE,
+    authorization: str | None = None,
+) -> dict:
+    """One API call. `token` names the node whose access token it presents;
+    `authorization` overrides that with a literal header expression (the admit call,
+    which presents the *caller's* credential rather than the pipeline's)."""
     params: dict = {
         "method": method,
         "url": url,
@@ -117,7 +141,38 @@ def http(name: str, x: int, y: int, method: str, url: str, body: str | None = No
     }
     if body is not None:
         params |= {"sendBody": True, "specifyBody": "json", "jsonBody": body}
-    params |= _AUTH_HEADER
+    if authorization is not None:
+        params |= {
+            "sendHeaders": True,
+            "headerParameters": {"parameters": [{"name": "Authorization", "value": authorization}]},
+        }
+    else:
+        params |= _bearer(token)
+    return node(name, "n8n-nodes-base.httpRequest", x, y, params, tv=4.2)
+
+
+def token_exchange(name: str, x: int, y: int) -> dict:
+    """The client-credentials exchange. The one API call with no bearer token.
+
+    Form-encoded with the secret in the body (RFC 6749 §2.3.1 `client_secret_post`), and
+    the endpoint read from `$env.DRAWBRIDGE_TOKEN_URL`: the API's own `/auth/token` in
+    development, Authentik's token endpoint on-prem — where the API holds no signing key
+    and refuses to issue. The same node talks to either issuer.
+    """
+    params: dict = {
+        "method": "POST",
+        "url": "={{ $env.DRAWBRIDGE_TOKEN_URL || '" + API + "/auth/token' }}",
+        "options": dict(_FAIL_CLOSED),
+        "sendBody": True,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+            "parameters": [
+                {"name": "grant_type", "value": "client_credentials"},
+                {"name": "client_id", "value": CLIENT_ID},
+                {"name": "client_secret", "value": "={{ $env.DRAWBRIDGE_PIPELINE_CLIENT_SECRET }}"},
+            ]
+        },
+    }
     return node(name, "n8n-nodes-base.httpRequest", x, y, params, tv=4.2)
 
 
@@ -189,9 +244,10 @@ VALIDATE_JS = """
 // would be matched under whichever statute happens to be the default, which is exactly
 // the failure that looks plausible all the way to a filing.
 //
-// `claimant` is required here rather than at the packaging step because that step runs
-// twenty minutes and one analyst decision later, and discovering then that the filing
-// identity was never supplied means the run is lost, not delayed.
+// `claimant` is no longer accepted from the webhook (v1.1.0). The packet is printed with
+// the tenant's filing profile — who claims and where the money lands are rows, not request
+// fields (§18.1) — and the Build Packet node used to forward this payload's `claimant`
+// straight into a document addressed to a customs authority.
 // The Webhook node hands on the whole HTTP request — { headers, params, query, body } —
 // not the body. Every node after this one reads the claim fields at the top level, so the
 // unwrap happens here, once, and this node returns the payload itself.
@@ -201,7 +257,7 @@ VALIDATE_JS = """
 // `$json.body.tenant_id` and had been for as long as the workflow existed. The fallback to
 // `$json` is for `n8n execute` and the editor's "test step", which pass a bare object.
 const b = $input.first().json.body || $input.first().json;
-const REQUIRED = ['tenant_id', 'jurisdiction', 'documents', 'imports', 'exports', 'claimant'];
+const REQUIRED = ['tenant_id', 'jurisdiction', 'documents', 'imports', 'exports'];
 for (const f of REQUIRED) {
   if (!b[f]) throw new Error('ingest payload missing required field: ' + f);
 }
@@ -246,15 +302,20 @@ return [{ json: Object.assign({}, c, {
 """
 
 RESOLUTION_JS = """
-// An analyst may approve, correct, reject or defer. Only the first two continue; a
-// rejected claim stops here with its reason recorded rather than proceeding quietly.
-// A deferred one also stops — it is still open, and the dispatcher will bring it back.
-const r = $input.first().json;
-const proceed = ['approved', 'corrected'].indexOf(r.resolution) !== -1;
-return [{ json: Object.assign({}, r, {
-  halt: !proceed,
-  next_state: proceed ? 'approved' : 'rejected',
-}) }];
+// An analyst may approve, correct, reject or defer, and the answer is read from the API —
+// `Verify Resolution` — not from the resume webhook's body. Until v1.1.0 this node read
+// `resolution` off the Wait node's output, which is the whole webhook request
+// ({ headers, body, ... }); the field was never at the top level, so every resumed run
+// took the halt branch. And a body is whatever whoever reached the webhook sent.
+//
+// Three outcomes, not two. `deferred` used to join `rejected` on the halt branch and move
+// the claim to `rejected` — a terminal state — for a decision that means "look again
+// later". A deferral now ends the run and leaves the claim where it is.
+const v = $input.first().json;
+let decision = 'defer';
+if (v.may_continue === true) decision = 'continue';
+else if (v.resolution === 'rejected') decision = 'reject';
+return [{ json: Object.assign({}, v, { decision: decision }) }];
 """
 
 RANK_JS = """
@@ -264,7 +325,7 @@ RANK_JS = """
 //
 // Reads the queue from the fetch node rather than from its own input, because the
 // drafting sweep sits between them and returns a count, not the rows.
-const items = $('Fetch Open Queue').all().map(i => i.json);
+const items = ($('Fetch Open Queue').first().json.items || []);
 const RANK = { blocking: 0, high: 1, normal: 2, low: 3 };
 items.sort(function (a, b) {
   const s = (RANK[a.severity] === undefined ? 9 : RANK[a.severity])
@@ -302,15 +363,19 @@ return [{ json: {
 ERROR_JS = """
 // A crashed run must leave the claim in a state an analyst can act on, not stranded
 // mid-transition with no record of why it stopped.
+//
+// Until v1.1.0 this posted `tenant_id: e.tenant_id`. The Error Trigger's payload carries
+// the execution and the workflow and no tenant, so the key was undefined, JSON.stringify
+// dropped it, and the API refused the request: no crash ever reached the queue. It also
+// filed every crash as `solver_infeasible`. The API now attributes the run itself, from
+// the record `/pipeline/admit` wrote when the run started.
 const e = $input.first().json;
 const ex = e.execution || {};
 return [{ json: {
-  tenant_id: e.tenant_id,
-  reason: 'solver_infeasible',
-  severity: 'blocking',
-  summary: 'pipeline run ' + ex.id + ' failed at node ' + ex.lastNodeExecuted
-         + ': ' + ((ex.error && ex.error.message) || 'unknown error'),
-  payload: { node: ex.lastNodeExecuted, workflow: (e.workflow || {}).name },
+  workflow_run_id: String(ex.id),
+  node: ex.lastNodeExecuted || '',
+  message: ((ex.error && ex.error.message) || 'unknown error').slice(0, 1500),
+  workflow: (e.workflow || {}).name || '',
 } }];
 """
 
@@ -395,13 +460,30 @@ def pipeline() -> dict:
                 extra={"webhookId": "drawbridge-ingest"},
             ),
             code("Validate Payload", -940, 300, VALIDATE_JS),
+            # The caller's own credential, forwarded. See services/api/src/routes/pipeline.py:
+            # an ingest webhook that anyone could reach used to drive the pipeline's
+            # cross-tenant token against whatever tenant the payload named.
+            http(
+                "Admit Run",
+                -940,
+                480,
+                "POST",
+                API + "/pipeline/admit",
+                "={{ JSON.stringify({ "
+                "tenant_id: $('Validate Payload').first().json.tenant_id, "
+                "run_id: String($execution.id) }) }}",
+                authorization="={{ $('Ingest Webhook').first().json.headers.authorization || '' }}",
+            ),
+            token_exchange(TOKEN_NODE, -850, 480),
             http(
                 "Store Documents",
                 -760,
                 300,
                 "POST",
                 API + "/documents/batch",
-                "={{ JSON.stringify({ tenant_id: $json.tenant_id, documents: $json.documents }) }}",
+                "={{ JSON.stringify({ "
+                "tenant_id: $('Validate Payload').first().json.tenant_id, "
+                "documents: $('Validate Payload').first().json.documents }) }}",
             ),
             http(
                 "Extract",
@@ -505,8 +587,21 @@ def pipeline() -> dict:
                 tv=1.1,
                 extra={"webhookId": "drawbridge-review-resume"},
             ),
+            token_exchange(RESUME_NODE, 1330, 40),
+            token_exchange(REFRESH_NODE, 1760, 300),
+            http(
+                "Verify Resolution",
+                1330,
+                140,
+                "GET",
+                API + "/review/pending/{{ $('Await Resolution').first().json.body.resume_token }}",
+                token=RESUME_NODE,
+            ),
             code("Apply Resolution", 1420, 140, RESOLUTION_JS),
-            boolean_if("Analyst Continued", 1600, 140, "={{ $json.halt }}", "false"),
+            boolean_if(
+                "Analyst Continued", 1600, 140, "={{ $json.decision }}", "equals", "continue"
+            ),
+            boolean_if("Analyst Rejected", 1700, 40, "={{ $json.decision }}", "equals", "reject"),
             http(
                 "Approve Claim",
                 1820,
@@ -517,6 +612,7 @@ def pipeline() -> dict:
                 "claim_id: $('Persist Claim').first().json.claim_id, "
                 "to_state: 'approved', actor: 'pipeline', "
                 "reason: 'pipeline run ' + $execution.id }) }}",
+                token=REFRESH_NODE,
             ),
             http(
                 "Halt Claim",
@@ -526,9 +622,10 @@ def pipeline() -> dict:
                 API + "/claims/transition",
                 "={{ JSON.stringify({ "
                 "claim_id: $('Persist Claim').first().json.claim_id, "
-                "to_state: 'rejected', actor: 'analyst', "
-                "reason: $('Apply Resolution').first().json.resolution_note "
-                "|| 'analyst did not approve' }) }}",
+                "to_state: 'rejected', actor: 'pipeline', "
+                "reason: 'an analyst rejected an exception on this claim; run ' "
+                "+ $execution.id }) }}",
+                token=RESUME_NODE,
             ),
             http(
                 "Build Packet",
@@ -538,8 +635,8 @@ def pipeline() -> dict:
                 API + "/packaging/build",
                 "={{ JSON.stringify({ "
                 "claim_id: $('Persist Claim').first().json.claim_id, "
-                "claimant: $('Validate Payload').first().json.claimant, "
                 "include_artifacts: false }) }}",
+                token=REFRESH_NODE,
             ),
             http(
                 "Mark Packaged",
@@ -551,6 +648,7 @@ def pipeline() -> dict:
                 "claim_id: $('Persist Claim').first().json.claim_id, "
                 "to_state: 'packaged', actor: 'pipeline', "
                 "reason: 'packet rendered by run ' + $execution.id }) }}",
+                token=REFRESH_NODE,
             ),
             node(
                 "Respond",
@@ -566,6 +664,23 @@ def pipeline() -> dict:
                         "refund: $('Persist Claim').first().json.total_refund, "
                         "transmittable: $('Build Packet').first().json.transmittable, "
                         "artifacts: $('Build Packet').first().json.manifest.artifacts }) }}"
+                    ),
+                    "options": {},
+                },
+                tv=1.1,
+            ),
+            node(
+                "Respond Deferred",
+                "n8n-nodes-base.respondToWebhook",
+                1880,
+                -120,
+                {
+                    "respondWith": "json",
+                    "responseBody": (
+                        "={{ JSON.stringify({ "
+                        "claim_id: $('Persist Claim').first().json.claim_id, "
+                        "state: 'analyst_review', "
+                        "resolution: $('Apply Resolution').first().json.resolution }) }}"
                     ),
                     "options": {},
                 },
@@ -593,6 +708,8 @@ def pipeline() -> dict:
             **chain(
                 "Ingest Webhook",
                 "Validate Payload",
+                "Admit Run",
+                TOKEN_NODE,
                 "Store Documents",
                 "Extract",
                 "Confidence Gate",
@@ -603,17 +720,20 @@ def pipeline() -> dict:
                 "Persist Claim",
                 "Needs Review",
             ),
-            **branch("Needs Review", "Suspend For Analyst", "Approve Claim"),
+            **branch("Needs Review", "Suspend For Analyst", REFRESH_NODE),
             **chain(
                 "Suspend For Analyst",
                 "Draft Analyst Memos",
                 "Await Resolution",
+                RESUME_NODE,
+                "Verify Resolution",
                 "Apply Resolution",
                 "Analyst Continued",
             ),
-            **branch("Analyst Continued", "Approve Claim", "Halt Claim"),
+            **branch("Analyst Continued", REFRESH_NODE, "Analyst Rejected"),
+            **branch("Analyst Rejected", "Halt Claim", "Respond Deferred"),
             **chain("Halt Claim", "Respond Halted"),
-            **chain("Approve Claim", "Build Packet", "Mark Packaged", "Respond"),
+            **chain(REFRESH_NODE, "Approve Claim", "Build Packet", "Mark Packaged", "Respond"),
         },
         "pinData": {},
     }
@@ -643,20 +763,12 @@ def review_dispatcher() -> dict:
                 {"rule": {"interval": [{"field": "minutes", "minutesInterval": 15}]}},
                 tv=1.2,
             ),
-            http(
-                "Fetch Open Queue",
-                -400,
-                300,
-                "GET",
-                API + "/review/queue?tenant_id={{ $json.tenant_id }}&state=open&limit=200",
-            ),
-            http(
-                "Draft Missing Memos",
-                -220,
-                300,
-                "POST",
-                API + "/review/draft?tenant_id={{ $json.tenant_id }}",
-            ),
+            token_exchange(TOKEN_NODE, -510, 300),
+            # Across every tenant with open work. It used to ask `/review/queue` for
+            # `$json.tenant_id` — read from a Schedule Trigger, which has none — and was
+            # refused on every sweep since week 9.
+            http("Fetch Open Queue", -400, 300, "GET", API + "/review/overview?limit=200"),
+            http("Draft Missing Memos", -220, 300, "POST", API + "/review/draft?limit=50"),
             code("Rank By Urgency", -40, 300, RANK_JS),
             boolean_if("Is Blocking", 160, 300, "={{ $json.severity }}", "equals", "blocking"),
             code("Escalate", 380, 160, ESCALATE_JS),
@@ -665,6 +777,7 @@ def review_dispatcher() -> dict:
         "connections": {
             **chain(
                 "Every 15 Minutes",
+                TOKEN_NODE,
                 "Fetch Open Queue",
                 "Draft Missing Memos",
                 "Rank By Urgency",
@@ -690,17 +803,17 @@ def error_workflow() -> dict:
         "nodes": [
             node("Error Trigger", "n8n-nodes-base.errorTrigger", -420, 300, {}, tv=1),
             code("Build Exception", -200, 300, ERROR_JS),
+            token_exchange(TOKEN_NODE, -90, 300),
             http(
-                "Queue Exception",
+                "Report Failure",
                 20,
                 300,
                 "POST",
-                API + "/review/suspend",
-                "={{ JSON.stringify({ tenant_id: $json.tenant_id, "
-                "workflow_run_id: $json.payload.workflow, items: [$json] }) }}",
+                API + "/pipeline/failure",
+                "={{ JSON.stringify($('Build Exception').first().json) }}",
             ),
         ],
-        "connections": chain("Error Trigger", "Build Exception", "Queue Exception"),
+        "connections": chain("Error Trigger", "Build Exception", TOKEN_NODE, "Report Failure"),
         "pinData": {},
     }
 

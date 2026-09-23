@@ -24,8 +24,8 @@ now authoritative and a body that disagrees with it is refused.
 claim. A *service* principal carries `drawbridge:service` in `scopes` and no tenant, and
 may act for any of them: n8n runs one pipeline against whichever tenant its trigger names,
 and minting it a token per tenant would put tenant credentials in a workflow file. A
-service token is therefore a cross-tenant credential and the most valuable secret in the
-deployment. It is minted separately (`scripts/mint_token.py --service`), and
+service token is therefore a cross-tenant credential. Since v1.1.0 it names a registered
+agent, lives fifteen minutes, and is obtained per run from `/auth/token` rather than held;
 `tests/integration/test_tenant_isolation.py` proves the *user* path, which is the one that
 faces a human.
 
@@ -33,6 +33,15 @@ faces a human.
 shared secret for local work, where standing up an identity provider to run the test suite
 would be its own kind of dishonesty. Both paths check `iss`, `aud` and `exp`; the
 difference is where the key comes from.
+
+**v1.1.0: who, not just which tenant.** A machine token must name a registered identity in
+`sub` (`drawbridge_schemas.agents`), and what it may do is that identity's scopes — the
+token can narrow them and never widen them. A human token carries `roles`, and a token
+without them gets the environment's default role, which outside development is read-only.
+Every token must carry `iat`, and `exp - iat` may not exceed the ceiling for its kind of
+principal: fifteen minutes for the pipeline, an hour for a person. That is enforced here
+rather than requested of the issuer, because a lifetime limit that depends on every issuer
+remembering it is a limit on the issuers that remembered.
 """
 
 from __future__ import annotations
@@ -41,19 +50,27 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import jwt
 import structlog
 from fastapi import HTTPException, status
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
+
+from drawbridge_schemas.agents import (
+    AgentKind,
+    Role,
+    Scope,
+    agent,
+    is_agent_subject,
+    scopes_for_roles,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from starlette.requests import Request
-    from starlette.responses import Response
+    from starlette.types import ASGIApp, Receive, Send
+    from starlette.types import Scope as ASGIScope
 
     from services.api.src.config import Settings
 
@@ -64,7 +81,25 @@ SERVICE_SCOPE = "drawbridge:service"
 # Reachable without a token. Health and readiness are polled by Docker before anything
 # could hold a credential; the schema endpoints describe the API rather than any tenant's
 # data.
-PUBLIC_PATHS = frozenset({"/health", "/ready", "/docs", "/redoc", "/openapi.json"})
+#
+# `/auth/token` is here because it authenticates by client secret rather than by bearer
+# token — it is the place a bearer token comes from. The documentation paths are listed
+# but only mounted in development (`Settings.docs_enabled`), so outside it they 404.
+PUBLIC_PATHS = frozenset({"/health", "/ready", "/docs", "/redoc", "/openapi.json", "/auth/token"})
+
+#: The longest bearer token the verifier will parse. See `AuthMiddleware`.
+MAX_TOKEN_CHARS = 8192
+
+#: Clock skew tolerated on `exp`, `iat` and the lifetime ceiling. Thirty seconds covers
+#: NTP drift between an issuer and this host without meaningfully extending a token.
+LEEWAY_SECONDS = 30
+
+#: The claim a human token's roles arrive in. Authentik's scope mapping emits it from the
+#: user's `drawbridge_roles` attribute (infra/authentik_bootstrap.py).
+ROLES_CLAIM = "roles"
+
+_SCOPE_VALUES = frozenset(scope.value for scope in Scope)
+_ROLE_VALUES = frozenset(role.value for role in Role)
 
 
 class AuthError(Exception):
@@ -92,10 +127,40 @@ class Principal:
     tenant_id: UUID | None
     scopes: frozenset[str] = field(default_factory=frozenset)
     email: str | None = None
+    roles: frozenset[str] = field(default_factory=frozenset)
+    #: The registered identity, for a machine principal. Equal to `subject` when set.
+    agent_id: str | None = None
+    #: The token's `jti`, where the issuer supplied one — what an access log line and a
+    #: ledger row can quote to name the exact credential that acted.
+    token_id: str | None = None
+    #: What this principal may do, as `Scope` values. Computed once by `decode`; a
+    #: principal constructed directly (tests, in-process callers) derives it on read.
+    permissions: frozenset[str] | None = None
 
     @property
     def is_service(self) -> bool:
         return SERVICE_SCOPE in self.scopes
+
+    @property
+    def is_machine(self) -> bool:
+        return self.agent_id is not None or self.is_service
+
+    @property
+    def is_human(self) -> bool:
+        return not self.is_machine
+
+    @property
+    def effective_permissions(self) -> frozenset[str]:
+        if self.permissions is not None:
+            return self.permissions
+        if self.is_machine:
+            identity = agent(self.agent_id or self.subject)
+            return frozenset(s.value for s in identity.scopes) if identity else frozenset()
+        known = {Role(r) for r in self.roles if r in _ROLE_VALUES}
+        return frozenset(s.value for s in scopes_for_roles(known))
+
+    def can(self, scope: Scope) -> bool:
+        return scope.value in self.effective_permissions
 
 
 _principal: ContextVar[Principal | None] = ContextVar("drawbridge_principal", default=None)
@@ -164,6 +229,44 @@ def _scopes(claims: dict[str, Any]) -> frozenset[str]:
     return frozenset(str(item) for item in raw)
 
 
+def _roles(claims: dict[str, Any]) -> frozenset[str]:
+    """Roles from a list or a space-delimited string, keeping only the ones that exist.
+
+    Unknown roles are dropped rather than refused. An identity provider shared with other
+    applications will emit roles meaning nothing here, and refusing the token over them
+    would make this API's availability depend on someone else's naming.
+    """
+    raw = claims.get(ROLES_CLAIM) or []
+    values = raw.split() if isinstance(raw, str) else [str(item) for item in raw]
+    return frozenset(value for value in values if value in _ROLE_VALUES)
+
+
+def _check_lifetime(claims: dict[str, Any], ceiling: int) -> None:
+    """Refuse a token that was issued to live longer than its principal may hold one.
+
+    `exp` alone says when a token stops working. It does not say how long it was meant to
+    work, and a token minted for a year and presented on day one passes every check that
+    looks only at `exp`. The ceiling is the difference between "not expired" and
+    "short-lived", and it is checked against what the issuer itself wrote.
+    """
+    issued = int(claims["iat"])
+    expires = int(claims["exp"])
+    if issued > int(time.time()) + LEEWAY_SECONDS:
+        raise AuthError("token issued in the future")
+    if expires - issued > ceiling + LEEWAY_SECONDS:
+        log.warning("auth.lifetime_exceeded", lifetime=expires - issued, ceiling=ceiling)
+        raise AuthError("token lifetime exceeds the permitted maximum")
+
+
+def _default_roles(settings: Settings) -> frozenset[str]:
+    role = (
+        settings.default_user_role_development
+        if settings.is_development
+        else settings.default_user_role
+    )
+    return frozenset({role}) if role in _ROLE_VALUES else frozenset()
+
+
 def decode(token: str, settings: Settings) -> Principal:
     """Verify a token and read the caller out of it."""
     key, algorithms = _signing_key(token, settings)
@@ -174,7 +277,8 @@ def decode(token: str, settings: Settings) -> Principal:
             algorithms=algorithms,
             audience=settings.jwt_audience,
             issuer=settings.jwt_issuer,
-            options={"require": ["exp", "iss", "aud", "sub"]},
+            leeway=LEEWAY_SECONDS,
+            options={"require": ["exp", "iat", "iss", "aud", "sub"]},
         )
     except jwt.ExpiredSignatureError as exc:
         raise AuthError("token expired") from exc
@@ -185,14 +289,15 @@ def decode(token: str, settings: Settings) -> Principal:
         log.info("auth.rejected", reason=str(exc))
         raise AuthError("invalid token") from exc
 
+    subject = str(claims["sub"])
     scopes = _scopes(claims)
     raw_tenant = claims.get(settings.jwt_tenant_claim)
+    token_id = str(claims["jti"]) if claims.get("jti") else None
 
-    if SERVICE_SCOPE in scopes:
-        if raw_tenant:
-            raise AuthError("a service token must not carry a tenant")
-        return Principal(subject=str(claims["sub"]), tenant_id=None, scopes=scopes)
+    if SERVICE_SCOPE in scopes or is_agent_subject(subject):
+        return _machine(subject, scopes, raw_tenant, token_id, claims, settings)
 
+    _check_lifetime(claims, settings.max_user_token_ttl_seconds)
     if not raw_tenant:
         raise AuthError(f"token carries no {settings.jwt_tenant_claim} claim")
     try:
@@ -200,11 +305,78 @@ def decode(token: str, settings: Settings) -> Principal:
     except ValueError as exc:
         raise AuthError("tenant claim is not a uuid") from exc
 
+    roles = _roles(claims) or _default_roles(settings)
+    permissions = frozenset(s.value for s in scopes_for_roles({Role(r) for r in roles}))
+    # A human token may narrow what its roles allow — a delegated token minted for one
+    # task — and never widen it. Scopes this API does not define (`openid`, `profile`)
+    # say nothing about it and are ignored.
+    requested = scopes & _SCOPE_VALUES
+    if requested:
+        permissions &= requested
+
     return Principal(
-        subject=str(claims["sub"]),
+        subject=subject,
         tenant_id=tenant_id,
         scopes=scopes,
         email=claims.get("email"),
+        roles=roles,
+        token_id=token_id,
+        permissions=permissions,
+    )
+
+
+def _machine(
+    subject: str,
+    scopes: frozenset[str],
+    raw_tenant: Any,
+    token_id: str | None,
+    claims: dict[str, Any],
+    settings: Settings,
+) -> Principal:
+    """A machine principal: a registered identity, its ceiling, and nothing it did not
+    register for."""
+    identity = agent(subject)
+    if identity is None:
+        # Logged with the subject, returned without it: the caller knows what it sent.
+        log.warning("auth.unregistered_agent", subject=subject)
+        raise AuthError("a machine token must name a registered agent")
+    if identity.kind is not AgentKind.API_CLIENT:
+        # A tool server, a database worker and a privileged job never present a bearer
+        # token. One arriving under their name is somebody else using it.
+        log.warning("auth.agent_kind_refused", subject=subject, kind=identity.kind.value)
+        raise AuthError("this identity does not authenticate with a bearer token")
+    if settings.environment not in identity.environments:
+        log.warning("auth.agent_environment_refused", subject=subject)
+        raise AuthError("this identity may not authenticate in this environment")
+
+    _check_lifetime(claims, identity.max_token_ttl_seconds)
+
+    tenant_id: UUID | None
+    if identity.cross_tenant:
+        if SERVICE_SCOPE not in scopes:
+            raise AuthError("a cross-tenant agent token must carry the service scope")
+        if raw_tenant:
+            raise AuthError("a service token must not carry a tenant")
+        tenant_id = None
+    else:
+        if SERVICE_SCOPE in scopes:
+            raise AuthError("a tenant-bound agent may not carry the service scope")
+        try:
+            tenant_id = UUID(str(raw_tenant))
+        except ValueError as exc:
+            raise AuthError("tenant claim is not a uuid") from exc
+
+    registered = frozenset(s.value for s in identity.scopes)
+    requested = scopes & _SCOPE_VALUES
+    permissions = registered & requested if requested else registered
+
+    return Principal(
+        subject=subject,
+        tenant_id=tenant_id,
+        scopes=scopes,
+        agent_id=identity.agent_id,
+        token_id=token_id,
+        permissions=permissions,
     )
 
 
@@ -216,20 +388,34 @@ def _unauthorized(reason: str) -> JSONResponse:
     )
 
 
-class AuthMiddleware(BaseHTTPMiddleware):
-    """Verify the bearer token, or refuse the request."""
+class AuthMiddleware:
+    """Verify the bearer token, or refuse the request.
 
-    def __init__(self, app: Any, settings: Settings) -> None:
-        super().__init__(app)
+    Pure ASGI rather than `BaseHTTPMiddleware` since v1.1.0. The base class runs every
+    request through a task group and a pair of memory streams, which costs a measurable
+    slice of every call and is known to interact badly with context variables — the
+    mechanism this middleware exists to set. The behaviour is unchanged; the principal is
+    also left on `scope["state"]` so the access log, which sits outside this layer, can
+    name who a request was without re-verifying the token.
+    """
+
+    def __init__(self, app: ASGIApp, settings: Settings) -> None:
+        self.app = app
         self._settings = settings
 
-    async def dispatch(
-        self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
-    ) -> Response:
-        if request.url.path in PUBLIC_PATHS or request.method == "OPTIONS":
-            return await call_next(request)
+    async def __call__(self, scope: ASGIScope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        if scope["path"] in PUBLIC_PATHS or scope["method"] == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
 
-        header = request.headers.get("authorization", "")
+        header = ""
+        for name, value in scope.get("headers", ()):
+            if name == b"authorization":
+                header = value.decode("latin-1")
+                break
         scheme, _, token = header.partition(" ")
 
         if not token or scheme.lower() != "bearer":
@@ -237,17 +423,27 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 # The escape hatch, and it is loud at startup. See
                 # `check_auth_configuration`.
                 set_principal(None)
-                return await call_next(request)
-            return _unauthorized("missing bearer token")
+                await self.app(scope, receive, send)
+                return
+            await _unauthorized("missing bearer token")(scope, receive, send)
+            return
+
+        # A bearer token is a few hundred bytes; one of 64 KB is not a token but an
+        # attempt to make the verifier parse something large before it refuses.
+        if len(token) > MAX_TOKEN_CHARS:
+            await _unauthorized("invalid token")(scope, receive, send)
+            return
 
         try:
             principal = decode(token, self._settings)
         except AuthError as exc:
-            return _unauthorized(exc.reason)
+            await _unauthorized(exc.reason)(scope, receive, send)
+            return
 
+        scope.setdefault("state", {})["principal"] = principal
         reset = _principal.set(principal)
         try:
-            return await call_next(request)
+            await self.app(scope, receive, send)
         finally:
             _principal.reset(reset)
 
@@ -315,6 +511,80 @@ def expected_tenant() -> UUID | None:
     return principal.tenant_id
 
 
+def require(scope: Scope) -> Callable[[], Awaitable[None]]:
+    """A route dependency: the caller must hold `scope`.
+
+    403 rather than 401, and the scope is named in the body. A caller refused here has
+    authenticated correctly and asked for something its role does not include; telling
+    it which permission was missing costs nothing an attacker could not read in the
+    OpenAPI schema, and saves an operator an afternoon.
+
+    No principal means authentication is switched off (development) — the middleware
+    has already refused every request that needed one.
+    """
+
+    async def _dependency() -> None:
+        principal = current_principal()
+        if principal is None or principal.can(scope):
+            return
+        log.warning(
+            "auth.forbidden",
+            subject=principal.subject,
+            agent_id=principal.agent_id,
+            scope=scope.value,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "forbidden", "message": f"requires scope {scope.value}"},
+        )
+
+    return _dependency
+
+
+def actor_name(declared: str | None = None) -> str:
+    """Who to record as having acted.
+
+    The verified subject whenever there is one. A body field saying `actor: "analyst"`
+    was, until v1.1.0, what `claim_transitions` recorded — n8n's "Halt Claim" node wrote
+    `analyst` on every rejection it forwarded, and the trail said a person had done what
+    the pipeline did. `declared` survives only for in-process callers with no principal:
+    CLI scripts and tests, which hold a database session and could write anything anyway.
+    """
+    principal = current_principal()
+    if principal is not None:
+        return principal.subject
+    return declared or "unauthenticated"
+
+
+def check_identity_posture(settings: Settings) -> None:
+    """Refuse to start outside development while an agent has nobody answering for it.
+
+    The registry names an owner *role* for every agent; the deployment binds the role to
+    a person. An unbound role is a registry entry that reads as governance and routes an
+    incident to no one — the present-and-inert shape again.
+    """
+    unbound = [
+        name
+        for name, value in (
+            ("owner_platform", settings.owner_platform),
+            ("owner_compliance", settings.owner_compliance),
+            ("owner_security", settings.owner_security),
+        )
+        if not value.strip()
+    ]
+    if not unbound:
+        return
+    if settings.is_development:
+        log.warning("identity.owners_unbound", fields=unbound)
+        return
+    msg = (
+        f"refusing to start in environment={settings.environment!r}: agent owner roles "
+        f"are unbound ({', '.join('DRAWBRIDGE_' + f.upper() for f in unbound)}). Every "
+        "registered agent must have a named person accountable for it."
+    )
+    raise RuntimeError(msg)
+
+
 def check_auth_configuration(settings: Settings) -> None:
     """Refuse to start in a state where the control is installed and does nothing.
 
@@ -345,7 +615,9 @@ def mint(
     subject: str,
     tenant_id: UUID | None = None,
     scopes: tuple[str, ...] = (),
-    ttl_seconds: int = 3600,
+    ttl_seconds: int = 900,
+    roles: tuple[str, ...] = (),
+    token_id: str | None = None,
 ) -> str:
     """Issue an HS256 token against the local secret.
 
@@ -365,7 +637,10 @@ def mint(
         "aud": settings.jwt_audience,
         "iat": now,
         "exp": now + ttl_seconds,
+        "jti": token_id or str(uuid4()),
     }
+    if roles:
+        claims[ROLES_CLAIM] = list(roles)
     if scopes:
         claims["scope"] = " ".join(scopes)
     if tenant_id is not None:

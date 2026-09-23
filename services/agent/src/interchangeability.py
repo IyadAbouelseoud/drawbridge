@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from services.agent.src import grounding
+from services.agent.src import grounding, injection, output_guard
 from services.agent.src.client import generate
 from services.agent.src.schemas import InterchangeabilityMemo
 
@@ -121,9 +121,10 @@ def draft(facts: dict[str, Any], **kwargs: Any) -> InterchangeabilityMemo:
     surfaced rather than swallowed: a memo that fails either check must not reach a
     filing, and a caller silently substituting an empty memo would hide a real defect.
     """
+    facts = injection.prepare(facts)
     memo = generate(
         output_model=InterchangeabilityMemo,
-        system=SYSTEM,
+        system=SYSTEM + injection.FRAMING,
         facts=facts,
         instruction=INSTRUCTION,
         **kwargs,
@@ -131,4 +132,5 @@ def draft(facts: dict[str, Any], **kwargs: Any) -> InterchangeabilityMemo:
     allowed = grounding.allowed_figures(facts)
     grounding.check_model(memo, allowed)
     grounding.check_citations(memo.citations, facts)
+    output_guard.validate(memo)
     return memo

@@ -27,6 +27,7 @@ from sqlalchemy import select
 
 from drawbridge_schemas.claim import RecoveryLane
 from drawbridge_schemas.jurisdiction import Currency, Jurisdiction
+from services.api.src.auth import actor_name
 from services.api.src.config import Settings, get_settings
 from services.api.src.ledger import record
 from services.api.src.models import Claim, EntryLine, ExportLine, RefundLine
@@ -180,6 +181,10 @@ def build(
 ) -> FilingPacket:
     """Assemble and render. The one call the API route makes."""
     options.setdefault("preparer", preparer_from_settings(get_settings()))
+    identity_source: dict[str, Any] = options.pop("identity_source", None) or {
+        "claimant": "profile",
+        "refund_account": "profile",
+    }
     request = build_request(
         session,
         claim_id=claim_id,
@@ -199,13 +204,16 @@ def build(
             tenant_id=claim.tenant_id,
             claim_id=claim_id,
             event_type="packet_built",
-            actor="pipeline",
+            actor=actor_name("pipeline"),
             subject=claim.lane,
             payload={
                 "artifacts": [a.filename for a in packet.artifacts],
                 "transmittable": not packet.requires_analyst_review,
                 "open_citations": [f"{c.authority} {c.article}" for c in packet.open_citations],
                 "total_refund": str(claim.total_refund),
+                # Whether the identity printed on the packet — who claims, and where the
+                # money lands — came from the tenant's profile or from the request.
+                "identity_source": identity_source,
             },
         )
     return packet

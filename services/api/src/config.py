@@ -98,14 +98,62 @@ class Settings(BaseSettings):
     # Resolved from the secrets file, not from `.env`. See services/api/src/secrets.py.
     jwt_secret: str | None = None
 
-    # What n8n presents. A service token acts for any tenant it names, which makes this
-    # the one credential whose leak is a cross-tenant breach; it is carried here so the
-    # posture check can see it, and read by the workflow layer from the same source.
+    # Retired in v1.1.0 and read by nothing: n8n now exchanges `pipeline_client_secret` for
+    # a fifteen-minute token per run. Kept as a field so a secrets file written before the
+    # release still loads, and so `check_secret_posture` still refuses a placeholder in it.
     service_token: str | None = None
 
     # The unprivileged role's password, kept out of the DSN. `database_url` may be
     # configured without one and this is injected below.
     app_db_password: str | None = None
+
+    # ------------------------------------------------------ agent governance (v1.1.0)
+    # How long a bearer token may live, enforced by the verifier rather than requested of
+    # the issuer. Machine identities carry their own, shorter ceiling in
+    # `drawbridge_schemas.agents`; this is the ceiling for a human's token.
+    max_user_token_ttl_seconds: int = 3600
+
+    # What a human token without a `roles` claim is. Development keeps the week-12 path
+    # working with `analyst`; everywhere else the default is read-only, because a token
+    # whose issuer never said what its holder may do has not been granted anything.
+    default_user_role_development: str = "analyst"
+    default_user_role: str = "auditor"
+
+    # The client-credentials exchange (`POST /auth/token`). Each value is the secret a
+    # registered API-client agent presents to obtain a short-lived access token; it is
+    # useless against any data route on its own. Local issuer only — under Authentik the
+    # agents authenticate to Authentik and this endpoint refuses.
+    pipeline_client_secret: str | None = None
+    e2e_client_secret: str | None = None
+
+    # The accountable people. Each registered agent names an owner *role*; these bind the
+    # roles to someone. Refused outside development while any is empty.
+    owner_platform: str = ""
+    owner_compliance: str = ""
+    owner_security: str = ""
+
+    # The approval gate. A claim whose refund exceeds this — in USD, SAR converted at the
+    # SAMA peg — cannot be approved by the pipeline or by an analyst alone: it needs an
+    # `approver` who did not resolve its exceptions. See services/api/src/gates.py.
+    auto_approve_ceiling_usd: str = "100000"
+
+    # The kill switch's deployment-level override. `engaged` halts every mutation without
+    # consulting the database, which is the one form of the switch that still works when
+    # the database is the thing that went wrong.
+    kill_switch: str = ""
+
+    # Abuse limits. Requests per minute per principal (or per client address before one
+    # is known); the token endpoint and the model-calling endpoint get their own, tighter
+    # buckets because each request there costs a credential guess or a model call.
+    rate_limit_per_minute: int = 600
+    token_rate_limit_per_minute: int = 20
+    draft_rate_limit_per_minute: int = 10
+    max_request_bytes: int = 64 * 1024 * 1024
+
+    # The OpenAPI schema and its two UIs. They describe the API rather than any tenant's
+    # data, which is why they were public; they are also a map of every route for someone
+    # who has not yet found one, which is why they are off outside development.
+    expose_api_docs: bool | None = None
 
     # Secrets belonging to adjacent services, resolved here so one file covers the stack
     # and `check_secret_posture` can refuse on all of them at once.
@@ -179,6 +227,14 @@ class Settings(BaseSettings):
             dotenv_settings,
             file_secret_settings,
         )
+
+    @property
+    def is_development(self) -> bool:
+        return self.environment == "development"
+
+    @property
+    def docs_enabled(self) -> bool:
+        return self.is_development if self.expose_api_docs is None else self.expose_api_docs
 
     @property
     def sync_database_url(self) -> str:

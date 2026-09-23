@@ -125,7 +125,7 @@ def _init(path: Path, *, force: bool) -> int:
     if outstanding:
         print(f"  still unset, and not mintable here: {', '.join(outstanding)}")
         if "service_token" in outstanding:
-            print("    service_token  <- make token-service  (signs with the jwt_secret above)")
+            print("    service_token  <- retired in v1.1.0; the pipeline exchanges a client secret")
         if "anthropic_api_key" in outstanding:
             print("    anthropic_api_key  <- issued by Anthropic; paste it in")
     if force:
@@ -264,7 +264,9 @@ _ENV_BRIDGE: tuple[tuple[str, str], ...] = (
     ("AUTHENTIK_BOOTSTRAP_TOKEN", "authentik_bootstrap_token"),
     ("DRAWBRIDGE_S3_SECRET_KEY", "s3_secret_key"),
     ("DRAWBRIDGE_APP_DB_PASSWORD", "app_db_password"),
-    ("DRAWBRIDGE_SERVICE_TOKEN", "service_token"),
+    # v1.1.0: the pipeline's client secret, exchanged per run for a short-lived token.
+    # Replaces the day-long service token this list used to bridge.
+    ("DRAWBRIDGE_PIPELINE_CLIENT_SECRET", "pipeline_client_secret"),
 )
 
 

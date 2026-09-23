@@ -17,13 +17,14 @@ from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from drawbridge_schemas.agents import Scope
 from drawbridge_schemas.jurisdiction import Jurisdiction
 from drawbridge_schemas.trade import EntryLine, ExportLine, LineMatch
 from services.api.src.analyst import AnalystError, claim_history, claim_summary, transition_claim
-from services.api.src.auth import authorise_tenant
+from services.api.src.auth import actor_name, authorise_tenant, require
 from services.api.src.persistence import PersistenceError, persist_claim
 from services.api.src.sync_db import in_thread, in_thread_for_claim
 from services.api.src.tenancy import TenantScopeError
@@ -48,6 +49,7 @@ class PersistRequest(BaseModel):
     matches: list[LineMatch] = Field(min_length=1)
     total_refund: Decimal
     requires_review: bool = False
+    # Recorded only when no principal is present. See `auth.actor_name`.
     actor: str = "pipeline"
 
 
@@ -56,8 +58,10 @@ class TransitionRequest(BaseModel):
 
     claim_id: UUID
     to_state: str
+    # Recorded only when no principal is present. n8n sent "analyst" on every rejection
+    # it forwarded; the trail now says who actually made the call.
     actor: str = "n8n"
-    reason: str | None = None
+    reason: Annotated[str, Field(max_length=4000)] | None = None
 
 
 class ClaimOut(BaseModel):
@@ -75,7 +79,11 @@ class ClaimOut(BaseModel):
     open_exceptions: int
 
 
-@router.post("/persist", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/persist",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require(Scope.CLAIMS_PERSIST))],
+)
 async def persist(body: PersistRequest) -> dict[str, Any]:
     """Write the matched claim, its lines and its refund components.
 
@@ -97,7 +105,7 @@ async def persist(body: PersistRequest) -> dict[str, Any]:
                 matches=body.matches,
                 total_refund=body.total_refund,
                 requires_review=body.requires_review,
-                actor=body.actor,
+                actor=actor_name(body.actor),
             ),
             tenant_id,
         )
@@ -108,7 +116,7 @@ async def persist(body: PersistRequest) -> dict[str, Any]:
         ) from exc
 
 
-@router.post("/transition")
+@router.post("/transition", dependencies=[Depends(require(Scope.CLAIMS_TRANSITION))])
 async def transition(body: TransitionRequest) -> dict[str, Any]:
     """Advance a claim, recording who moved it and why.
 
@@ -141,7 +149,9 @@ async def transition(body: TransitionRequest) -> dict[str, Any]:
         ) from exc
 
 
-@router.get("/{claim_id}", response_model=ClaimOut)
+@router.get(
+    "/{claim_id}", response_model=ClaimOut, dependencies=[Depends(require(Scope.CLAIMS_READ))]
+)
 async def get_claim(claim_id: UUID) -> Any:
     try:
         return await in_thread_for_claim(claim_id, lambda session: claim_summary(session, claim_id))
@@ -152,7 +162,7 @@ async def get_claim(claim_id: UUID) -> Any:
         ) from exc
 
 
-@router.get("/{claim_id}/history")
+@router.get("/{claim_id}/history", dependencies=[Depends(require(Scope.CLAIMS_READ))])
 async def get_history(
     claim_id: UUID, limit: Annotated[int, Field(ge=1, le=500)] = 100
 ) -> dict[str, Any]:

@@ -73,17 +73,24 @@ INFRA_PATH = "drawbridge-infra"
 INFRA_POLICY_NAME = "drawbridge-infra"
 INFRA_ROLE_NAME = "drawbridge-infra"
 
-#: What vault-agent renders. Five are generated here; `service_token` is a JWT the
-#: identity provider signs and cannot be minted from random bytes, so it is supplied.
+#: What vault-agent renders, all six generated here. Until v1.1.0 the sixth was
+#: `service_token`, a day-long JWT that had to be minted elsewhere and supplied; it is now
+#: `pipeline_client_secret`, random bytes the pipeline exchanges for a fifteen-minute token,
+#: so nothing on this path has to be supplied by hand.
 INFRA_GENERATED: tuple[str, ...] = (
     "postgres_password",
     "minio_root_user",
     "minio_root_password",
     "authentik_secret_key",
     "n8n_encryption_key",
+    "pipeline_client_secret",
 )
-INFRA_SUPPLIED: tuple[str, ...] = ("service_token",)
+INFRA_SUPPLIED: tuple[str, ...] = ()
 INFRA_FIELDS: tuple[str, ...] = INFRA_GENERATED + INFRA_SUPPLIED
+
+#: Written by releases before v1.1.0 and pruned on the next run: a long-lived credential
+#: left in Vault after nothing reads it is a credential waiting to be found.
+INFRA_RETIRED: tuple[str, ...] = ("service_token",)
 
 #: The AppRole token's lifetime. Twenty minutes is longer than a container start and
 #: shorter than a shift: the token this process ends up holding is useless to anyone who
@@ -276,7 +283,7 @@ def verify(address: str, mount: str, path: str, role_id: str, secret_id: str) ->
     return 0
 
 
-def ensure_infra_secrets(vault: Vault, mount: str, path: str, *, service_token: str) -> str:
+def ensure_infra_secrets(vault: Vault, mount: str, path: str) -> str:
     """Put the six credentials vault-agent renders into Vault, generating what it can.
 
     **Read-modify-write, and every existing value wins.** Regenerating a credential that
@@ -288,14 +295,12 @@ def ensure_infra_secrets(vault: Vault, mount: str, path: str, *, service_token: 
     new value, then restart the consumer — and `secrets/README.md` says which of these
     survive it.
 
-    `service_token` is the exception in the other direction: it is a JWT the identity
-    provider signs, so it cannot be generated from random bytes and has to be supplied.
-    Passing nothing leaves whatever is already there, which is what a re-run wants.
+    A retired field (`service_token`, before v1.1.0) is removed rather than carried.
     """
     current = vault.call("GET", f"/v1/{mount}/data/{path}", allow=(404,))
     existing = current.get("data", {}).get("data") or {}
 
-    values = dict(existing)
+    values = {k: v for k, v in existing.items() if k not in INFRA_RETIRED}
     minted: list[str] = []
     for field in INFRA_GENERATED:
         if not values.get(field):
@@ -304,8 +309,6 @@ def ensure_infra_secrets(vault: Vault, mount: str, path: str, *, service_token: 
             # diagnosed as a wrong password.
             values[field] = _stdlib_secrets.token_urlsafe(32)
             minted.append(field)
-    if service_token:
-        values["service_token"] = service_token
 
     unknown = sorted(set(values) - set(INFRA_FIELDS))
     if unknown:
@@ -325,16 +328,14 @@ def ensure_infra_secrets(vault: Vault, mount: str, path: str, *, service_token: 
     return f"{note} at {mount}/{path}, version {version}{tail}"
 
 
-def bootstrap_infra(vault: Vault, mount: str, *, rotate: bool, service_token: str) -> str:
+def bootstrap_infra(vault: Vault, mount: str, *, rotate: bool) -> str:
     """Configure the infra path, its policy, its role, and return the secret_id.
 
     Prints nothing. The caller owns the one place a credential reaches stdout.
     """
     ensure_kv_v2(vault, mount)
     ensure_policy(vault, mount, INFRA_PATH, name=INFRA_POLICY_NAME)
-    print(
-        f"  infra     {ensure_infra_secrets(vault, mount, INFRA_PATH, service_token=service_token)}"
-    )
+    print(f"  infra     {ensure_infra_secrets(vault, mount, INFRA_PATH)}")
     # Longer than the API's twenty minutes because this process is long-lived and renews
     # on its own schedule; a token that expired between renewals would leave the rendered
     # files stale with nothing saying so.
@@ -375,12 +376,6 @@ def main(argv: list[str] | None = None) -> int:
         "able to read the database owner's password.",
     )
     parser.add_argument(
-        "--service-token",
-        default=os.environ.get("DRAWBRIDGE_SERVICE_TOKEN", ""),
-        help="--infra only: the JWT n8n carries. Cannot be generated; mint it with "
-        "scripts/mint_token.py --service. Omitting it leaves whatever Vault already has.",
-    )
-    parser.add_argument(
         "--verify-only",
         action="store_true",
         help="skip configuration; read back with DRAWBRIDGE_VAULT_ROLE_ID / _SECRET_ID",
@@ -402,9 +397,7 @@ def main(argv: list[str] | None = None) -> int:
         vault = Vault(args.addr, args.token)
         try:
             print(f"vault {args.addr}")
-            role_id, secret_id = bootstrap_infra(
-                vault, args.mount, rotate=args.rotate, service_token=args.service_token
-            ).split("\n")
+            role_id, secret_id = bootstrap_infra(vault, args.mount, rotate=args.rotate).split("\n")
         except BootstrapError as exc:
             print(f"refused: {exc}", file=sys.stderr)
             return 1

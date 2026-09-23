@@ -347,6 +347,10 @@ claims the agent cannot close alone actually get closed.
 reuse plus the fact that every MCP call is a natural audit-log boundary. Single-surface,
 this would be pure overhead.
 
+*Weakness found in v1.1.0: a tool boundary nobody authenticated.* Until then every server
+answered any caller that could reach it, for any tenant. Each now requires a bearer token
+verified by the API's own verifier, and each tool checks its scope and tenant — §24.4.
+
 ### Docker — isolation, reproducibility, deployability
 
 Customs data is commercially sensitive and often ITAR-adjacent. Brokers and 3PLs will not
@@ -406,6 +410,7 @@ Matching       MatchStrategy interface: OR-Tools CP-SAT (US substitution) | link
 Infra          Docker Compose (dev/on-prem) -> Kubernetes (multi-tenant SaaS) · Traefik · Authentik
 Quality        pytest + hypothesis · ruff · mypy --strict · pre-commit
 Observability  OpenTelemetry -> Grafana/Tempo · immutable append-only claim ledger
+Governance     agent registry · short-lived tokens · approval gates · kill switch (v1.1.0, §24)
 ```
 
 ## 7. Repository layout
@@ -435,6 +440,7 @@ drawbridge/
 │                                 # manage_secrets.py · calibrate_thresholds.py (wk 13)
 │                                 # ingest_cross.py — fetch a CROSS sample, then load it (wk 14)
 ├── tests/                        # unit · golden-claim fixtures · property-based rules
+│   ├── security/                 # adversarial evaluation suite + regression pins (§24.9)
 │   └── fixtures/                 # tariff_benchmark.json · bayan.py (synthetic RTL table)
 ├── secrets/                       # gitignored; the six files Postgres, MinIO and n8n read
 └── infra/
@@ -475,6 +481,9 @@ not own these transitions.
 | mcp-docs | 8103 | streamable-HTTP |
 | mcp-claims | 8104 | streamable-HTTP |
 | mcp-ledger | 8105 | streamable-HTTP |
+
+Every published port binds `127.0.0.1` since v1.1.0, and every MCP server requires a bearer
+token (§24.4). Before that, all of them listened on every interface of the host.
 
 
 ---
@@ -725,7 +734,9 @@ Hardcoded in `client.py`, not parameterised, because each is a property of the p
 - `max_tokens = 1024`. A memo needing more is padding, and the cap bounds a runaway loop.
 - `temperature = 0`. Two analysts opening the same claim must see the same memo, and a
   filing built on a sampled narrative cannot be explained when an auditor asks four years
-  later why it says what it says.
+  later why it says what it says. *v1.1.0: Claude Opus 5 rejects sampling parameters, so this
+  would have failed the first live call; reproducibility now rests on the stored memo and
+  its `agent_model` tag — §24.1 #19.*
 - **Forced tool use.** One tool, the memo schema, required by `tool_choice`. The model has
   no prose path, so there is no JSON parsing step anywhere in the service and nothing that
   can fail on a preamble.
@@ -1277,6 +1288,9 @@ trigger names, and is addressed by claim id four times in a single run. It is a 
 credential and the most valuable secret in a deployment. Stated rather than mitigated — the
 same posture as §16.4 takes toward the owner DSN.
 
+*Mitigated in v1.1.0: it now names a registered agent, lives fifteen minutes, is obtained per
+run from a client-credentials exchange, and may not take a claim past `packaged` — §24.2–24.5.*
+
 ### 17.4 Identifier-addressed routes
 
 §16.5 listed four entry points that hold an identifier and no tenant, gave each a
@@ -1334,8 +1348,10 @@ Not yet propagated across the MCP transport: an analyst tool call is its own tra
   `DRAWBRIDGE_APP_DB_PASSWORD` are environment variables with development defaults.
 - **Authorise anything but the tenant.** There are no roles: every user principal for a
   tenant can do everything to that tenant. An analyst and a read-only auditor are the same
-  caller.
-- **Revoke or rotate.** Tokens expire and nothing refreshes or revokes them.
+  caller. *Closed in v1.1.0 — roles, scopes and approval gates, §24.2 and §24.5.*
+- **Revoke or rotate.** Tokens expire and nothing refreshes or revokes them. *v1.1.0: a
+  lifetime ceiling the verifier enforces, and per-principal revocation through the kill
+  switch — §24.3, §24.7.*
 - **Say who the caller *is* to a customs authority.** The token names a tenant; nothing
   named the claimant. Week 13 supplies it — see §18.1.
 
@@ -1463,7 +1479,9 @@ are still labelled as such in the source.
 Nothing in this repository propagates it, and nothing needs to. The SDK's client
 dispatcher injects W3C context into the JSON-RPC `_meta` (SEP-414) and
 `OpenTelemetryMiddleware` — installed by default and outermost on every server — extracts
-it. Verified live: a tool call under a client span produced `drawbridge-mcp-hts` spans
+it.
+
+*v1.1.0: those servers also require a verified bearer token now — §24.4.* Verified live: a tool call under a client span produced `drawbridge-mcp-hts` spans
 carrying the client's trace id.
 
 `tests/integration/test_trace_propagation.py` pins it, because a property nobody wrote is
@@ -1651,7 +1669,9 @@ minutes and a poll that finds nothing is one indexed query.
 
 It runs unscoped — `tenant_id=None`, drafting across every tenant — which is the same
 posture as the service token n8n carries and for the same reason: one worker serves
-whichever tenants have queued work. It is therefore the second cross-tenant process in the
+whichever tenants have queued work. *v1.1.0 found that under the app role the on-prem stack
+gives it, "unscoped" meant reading nothing at all; it now scopes to each tenant in turn —
+§24.1 #14, §24.4.* It is therefore the second cross-tenant process in the
 deployment, and the on-prem stack gives it its own credential so the blast radius is
 something somebody can revoke.
 
@@ -2431,3 +2451,290 @@ describes the model.
 What is frozen is the feature set, not the honesty of the record. §22.6 states a target
 this system missed and by how much; §20 through §23 are a list of defects found by running
 things that had been committed and passing tests for weeks. Both stay.
+
+---
+
+## 24. Agent governance, and a security pass that read everything (v1.1.0)
+
+v1.0.0 froze the feature set. This release changes no feature. It asks, of every component
+that acts on a claim, three questions the repository had never asked as questions: *who is
+acting*, *what may they do*, and *what happens when they should not have*. It answers them in
+code, and then it reads every artefact the answers depend on — the routes, the MCP servers,
+the n8n JSON, both compose files, the Caddyfile — looking for the place where the answer was
+present and inert.
+
+It found that place twenty times.
+
+### 24.1 What the pass found
+
+Grouped by what an attacker, or an accident, could have done with each. Every one is pinned
+by a named test in `tests/security/test_regressions.py` or the suite beside it.
+
+**Could act for any tenant, or as anyone**
+
+| # | Defect | Effect |
+|---|---|---|
+| 1 | All five MCP servers bound `0.0.0.0` over streamable HTTP with **no authentication** | Any caller able to open a socket could resolve exceptions, override valuations, approve claims and fetch documents, for every tenant |
+| 2 | MCP tools recorded `analyst` from an argument | The audit trail said whoever the caller typed |
+| 3 | `mcp-docs` read, rendered, listed and presigned any object key (presigns for up to a day) | Cross-tenant document read |
+| 4 | `/documents/batch` registered a caller-supplied `object_key` without checking its prefix | Register another tenant's document, read it back through extraction |
+| 5 | The n8n ingest webhook was unauthenticated, and every call after it carried the cross-tenant token | Drive a pipeline run against any tenant a payload named |
+| 6 | `document_id` derived from content alone, and it is the primary key | A second tenant uploading identical bytes hit a 500 — an oracle for "another customer holds this file" |
+| 7 | Dev compose published Postgres, MinIO, Vault and the MCP servers on every host interface | A laptop on a shared network served the owner database with the password `drawbridge` |
+
+**Could skip the human**
+
+| # | Defect | Effect |
+|---|---|---|
+| 8 | `POST /review/{id}/resolve` was a bare UPDATE: no reasoning, no ledger row, callable by the service token | The component a review exists to check could clear its own review |
+| 9 | Any principal could move a claim to `handed_off`, `filed` or `paid`; `actor` came from the request body | The pipeline could attest to a filing; n8n's "Halt Claim" wrote `actor: analyst` on every rejection it forwarded |
+| 10 | A `deferred` resolution counted as decided | The pipeline approved over an analyst's "look again later" |
+| 11 | n8n's "Apply Resolution" read `resolution` from the top level of the Wait node's output, which is the whole webhook request | Every resumed run took the halt branch — and the halt branch moved a *deferred* claim to `rejected`, a terminal state |
+| 12 | `/packaging/build` accepted `claimant` and `refund_account_iban` overrides; n8n forwarded `claimant` from the webhook body | Whoever reached the webhook chose the name on a CBP form and the account a ZATCA refund lands in |
+
+**Could not be stopped, or said nothing**
+
+| # | Defect | Effect |
+|---|---|---|
+| 13 | The service token was a day-long HS256 JWT with no lifetime cap, no `jti`, no revocation | A leaked copy worked for a day and could not be withdrawn short of rotating the signing key |
+| 14 | The on-prem agent worker ran `tenant_id=None` as the app role | Under RLS it read nothing, forever, and logged nothing because it only logs passes that did something |
+| 15 | The error workflow posted `tenant_id` from an Error Trigger payload that has none | No crashed run ever reached the queue; every one was also filed as `solver_infeasible` |
+| 16 | The review dispatcher read `$json.tenant_id` from a Schedule Trigger | Refused on every sweep since week 9; nothing was ever escalated |
+| 17 | `approve_claim`, `reopen_exception`, `review_opened` and every agent memo wrote no ledger event | The most audited decisions were the ones the hash chain did not cover |
+| 18 | On-prem n8n read `DRAWBRIDGE_SERVICE_TOKEN_FILE` | n8n expands `_FILE` for its own variables only; every on-prem API call would have gone out as `Bearer ` |
+| 19 | `client.py` sent `temperature=0` to Claude Opus 5, which rejects sampling parameters | The first live draft would have been a 400; the golden test pinned the defect because its stub accepts any keyword |
+| 20 | `pyproject.toml` has required `opentelemetry-exporter-otlp-proto-http` since week 12; `uv.lock` never contained it | `base.Dockerfile` prefers `uv sync --frozen`, which installs from the lock as written, so an MCP image built that way lacks the exporter and drops its spans quietly. Found when `uv run` re-locked during this pass; not verified against a built image |
+
+Eleven of the twenty are the shape §20 and §23 named: a control that exists, passes its
+tests, and does nothing in use. Five — 14, 15, 16, 18, 20 — are artefacts that have never been
+run in the configuration they describe, which is the week-15 lesson arriving for the fifth
+time. None of them was findable by the suite as it stood, because each suite tested the
+component and not the seam.
+
+### 24.2 Every agent has an identity, an owner and a ceiling
+
+`packages/schemas/src/drawbridge_schemas/agents.py` is the registry. Nine identities:
+
+| agent | kind | owner | may | tenancy |
+|---|---|---|---|---|
+| `agent:n8n-pipeline` | API client | platform | the twelve pipeline scopes | cross-tenant |
+| `agent:memo-drafter` | database worker | compliance | `review:read`, `review:draft` | per tenant, in turn |
+| `agent:mcp-claims` / `-ledger` / `-docs` / `-hts` / `-ace` | tool servers | compliance / platform | what a caller needs to open a session | the caller's |
+| `agent:retention` | privileged job | security | — (holds the owner DSN, and is the only one) | all |
+| `agent:e2e-harness` | API client | platform | pipeline + `pipeline:start` | development only |
+
+A machine token must name one of these in `sub`; an unregistered subject is refused at the
+door, and so is a token under the name of an identity that never holds one (a tool server,
+the worker). What a machine may do is its registered scopes — the token can narrow them and
+never widen them. Five scopes are **human-only** and the registry refuses to register a
+machine holding one: resolving an exception, overriding a valuation, approving, releasing,
+and throwing the kill switch through the API.
+
+People get **roles**: `auditor` (read), `analyst` (work the queue), `approver` (analyst plus
+release and high-value approval), `operator` (the kill switch and nothing else). The
+operator is deliberately not an analyst: the person who can stop the system cannot thereby
+move money through it. A human token without a `roles` claim gets `analyst` in development
+and **`auditor` everywhere else** — a token whose issuer never said what its holder may do
+has not been granted anything.
+
+**Owners are people.** The registry names an owner *role*; the deployment binds each role to
+a named person (`DRAWBRIDGE_OWNER_*`), and outside development the API refuses to start
+while any is unbound.
+
+### 24.3 Credentials that expire before they are worth stealing
+
+The verifier enforces lifetime, not the issuer. `exp - iat` above the ceiling is refused
+however validly the token is signed — fifteen minutes for any agent, an hour for a person —
+and `iat` is required. A limit that depends on every issuer remembering it is a limit on the
+issuers that remembered.
+
+n8n no longer holds a bearer token at all. It holds `pipeline_client_secret` — useless
+against any data route — and exchanges it (`POST /auth/token`, OAuth 2.0 client credentials)
+at the start of every run. A run parked on an analyst for hours exchanges again when it
+resumes, and again before it approves, because the token it started with is dead by then.
+Every issuance is a `token_issued` row in `control_events` with its `jti`, recorded *before*
+the token is returned: an unlogged credential is never issued. Under Authentik the endpoint
+refuses — the API holds no signing key there — and the same n8n node talks to Authentik's
+token endpoint instead (`DRAWBRIDGE_TOKEN_URL`).
+
+### 24.4 Lateral movement: every door checks, every connection is scoped
+
+- **MCP is authenticated** through the SDK's own `token_verifier` and `AuthSettings`,
+  backed by the API's `decode`, so one verifier serves both surfaces. Each server requires
+  its registry scopes to open a session; each tool checks its own scope through
+  `mcp_servers.security.guarded`, which also puts the verified principal on the context
+  variable the gates read. DNS-rebinding protection is on with an explicit host list.
+  Proved over the transport: a real `tools/call` with a token for `carol` and an `analyst`
+  argument of `mallory` records `carol` in the ledger.
+- **MCP tools are tenant-scoped**: `session_scope` checks every claim, review and tenant id
+  against the token's tenant; `mcp-docs` refuses any object key outside the caller's prefix;
+  presigned URLs last five minutes by default and fifteen at most.
+- **Document identity includes the tenant** (`document_id_for(sha256, tenant_id)`), and
+  `/documents/batch` refuses a foreign object key and dedupes on (tenant, sha256), so rows
+  written before the change keep their ids.
+- **The drafter holds no owner DSN.** It asks `app_tenants_with_undrafted_reviews()` —
+  SECURITY DEFINER, ids only — and drafts each tenant inside that tenant's row-level scope.
+- **Nothing in development listens beyond loopback**; on-prem, Caddy refuses n8n resume
+  webhooks from outside and serves the editor to private ranges only.
+
+### 24.5 The approval gates
+
+`services/api/src/gates.py` asks, at every transition and decision, whether *this actor* may
+make *this move* on *this evidence*. It lives in `analyst.py`'s call path, so REST, MCP and
+n8n meet the same rule.
+
+- A machine may take a claim as far as `packaged` and no further. `handed_off`, `filed`
+  and `paid` are facts about the outside world that a person attests.
+- A machine may not approve over an exception a person rejected or deferred.
+- **Above the auto-approve ceiling** (USD 100,000 by default; SAR at the 3.75 peg), triage
+  raises a `high_value_approval` exception, only an `approver` may resolve it, and **not the
+  person who resolved the claim's other exceptions**. The pipeline's approval is refused
+  until it is. Four-eyes compares verified subjects, which is why it could not exist while
+  identity came from the request body.
+- The filing identity on a packet — claimant, and the IBAN a refund lands in — comes from
+  the tenant's profile. Overriding either is an approver's decision and the `packet_built`
+  ledger row says whether the identity came from the profile or the request.
+
+The pipeline's clean lane from week 9 is intact: a small claim triage found nothing wrong
+with still reaches `approved` without a person, because there is nothing for one to decide.
+
+### 24.6 Guardrails on the agent
+
+Four layers on the way in (`services/agent/src/injection.py`), five stages on the way out
+(`services/agent/src/output_guard.py`).
+
+**In.** Every string in the facts is NFKC-folded, stripped of zero-width, bidi-override and
+Unicode-tag characters, and capped. Then it is scanned — instruction overrides, role and
+chat-template markers, persona shifts, prompt probes, text addressed to an AI, decision
+steering, this deployment's tool names, exfiltration shapes, and the Arabic equivalents. A
+fact set that trips the scan **is never sent to the model**: the drafter records
+`prompt_injection_suspected`, marks the row withheld, and raises a `suspected_prompt_injection`
+exception — open, so the claim cannot be approved until a person has read the document. What
+is sent carries a framing paragraph saying the facts are data and instructions inside them
+are to be reported, not followed. IBANs, EINs, CR numbers and contact details are redacted
+from what leaves the deployment.
+
+**Out.** Schema, figures, citations (week 8) — then **policy**: no URL, email, markup,
+function-call syntax, secret-shaped string, tool name, or echoed injection; then
+**coherence**: no `approve` over the memo's own `blocking_unknowns`. A successful injection
+has to *produce* something to be useful — a link, a tool call, an approval over a thin
+record — and each of those is checkable without knowing what the injection said.
+
+**The analyst's own agent.** `inspect_exception` returns document-derived text to an
+analyst's Claude Code session, which holds write tools. The result now carries an
+`untrusted_content_notice` and the detector's findings, and every write tool is annotated
+`destructiveHint`, so the client asks its human before calling one.
+
+### 24.7 The kill switch, and the breaker that should make it unnecessary
+
+`services/api/src/killswitch.py`. Three scopes — `global`, `tenant`, `principal` — and three
+ways to throw it: `POST /control/kill-switch` (operator role, reason required),
+`scripts/killswitch.py` over the owner DSN for when the API is the problem, and
+`DRAWBRIDGE_KILL_SWITCH=engaged` for when the database is. It stops every mutation — API
+writes, MCP write tools, drafting, token issuance — and **leaves reads alone**, because an
+incident is investigated by reading. It is checked where a transaction is scoped to a
+tenant, so there is one enforcement point for every tenant write in the codebase. It fails
+closed: an unreadable switch is an engaged one. Its state is a query over append-only
+history, so "is it stopped" and "who stopped it, when and why" are the same read. Effective
+within one second (`CACHE_SECONDS`), a bound stated rather than rounded to zero.
+
+The **circuit breaker** is the control meant to make the switch unnecessary. Three memos
+refused by the output guards within an hour and the drafter throws the switch on itself,
+records `circuit_breaker_tripped`, and reports `halted` on every pass until a person
+releases it. A machine may engage a switch; only a person may release one.
+
+### 24.8 The record
+
+The ledger now covers what it missed: `review_opened` (written by nothing since week 10),
+`review_reopened`, approval through `approve_claim`, `agent_memo_drafted` (with the digest
+of the facts the model saw), `agent_memo_withheld`, `prompt_injection_suspected`. Every event
+carries the verified actor, its kind and its agent id. Operational events — the switch,
+token issuance, breaker trips — go to `control_events`, append-only by trigger, because they
+belong to no tenant's chain. **Reads** go to a structured access log, one line per request
+and per tool call: principal, agent, roles, tenant, route, status, duration, trace id. The
+ledger records what changed a claim; the access log records what was looked at, which is
+where an exfiltration shows up.
+
+### 24.9 The evaluation suite
+
+`tests/security/` — 226 tests — plus `scripts/run_safety_evals.py`, which produces the
+scorecard in `docs/security-scorecard.json` from the same corpus and fails CI when a number
+regresses:
+
+| | |
+|---|---|
+| Attack corpus | **37/37** detected across thirteen techniques, English, Arabic, zero-width and tag-character smuggling, full-width, ChatML |
+| Benign corpus | **0/147** false positives — the tariff benchmark's real goods language, both languages, plus phrases built to look like attacks ("operating system", "override the declared value") |
+| Steered outputs | **8/8** refused; the known-good memos accepted |
+| Gate matrix | **9/9** as designed |
+| Registry | 9 agents, 9 owned, 0 holding a human-only scope, bearer ceiling 900 s, one holder of the owner DSN |
+
+The first run missed one attack — ChatML's `<|im_start|>`, whose `|` fell outside the tag
+pattern — and the pattern was widened. The full suite is **1,096 passed**; the one failure,
+unchanged from v1.0.0, needs the full tariff corpus loaded and the scratch database had none.
+mypy `--strict` is clean over 143 files. `pip-audit` over the 133 locked packages finds no
+known vulnerabilities.
+
+**What the suite cannot measure** is the live model. No deployment has held an Anthropic key
+(§20.8); `run_safety_evals.py --live` measures false refusals against the real drafter and
+reports `not_run` without one.
+
+### 24.10 What it costs, measured
+
+`scripts/perf_audit.py`, one Windows 11 machine, Python 3.14, Postgres 16 in Docker; medians.
+
+| | |
+|---|---|
+| Authenticated request, no middleware | 229 µs |
+| — behind v1.0.0's `AuthMiddleware` (`BaseHTTPMiddleware`) | 599 µs |
+| — behind v1.1.0's edge + auth + guard (pure ASGI) | **576 µs** (p95 970 vs 1,028) |
+| Kill-switch read, cached / cold | 1.4 µs / 1.1 ms |
+| Kill-switch state query, 5,000 token rows | 0.706 ms → **0.031 ms** |
+| Injection scan per fact set · output guard per memo | 0.35–0.75 ms · 0.64–1.2 ms |
+| Anthropic client construction, formerly once per memo | 1.0–2.0 ms, plus a TLS handshake |
+
+The v1.1.0 stack does more — rate limits, security headers, an access-log line — and is
+still slightly faster than the one `BaseHTTPMiddleware` it replaced, because the base class
+runs every request through a task group and a pair of memory streams.
+
+Two findings came from measuring rather than reading. The kill-switch state query
+sequentially scanned `control_events`, which takes a `token_issued` row on every credential
+exchange — a cold read that would have grown with every pipeline run the deployment ever
+made. A partial index on engage/release rows made it an index scan, 23× faster, and flat.
+And one optimisation did not work: a single combined regex as a pre-filter for the injection
+scan was *slower* (811 µs against 726) — Python's engine still tries every alternative at
+every position — so it was reverted and the measurement recorded in the source.
+
+The hot queries use their indexes: the drafter's poll is an index scan on
+`ix_review_queue_undrafted` at 0.046 ms over 20,000 rows. That index existed in production
+since week 8 and was missing from the model, so every database the suite built with
+`create_all` lacked it; the model now declares it.
+
+### 24.11 CI
+
+The workflow token is read-only. Third-party actions are pinned by commit. `uv lock --check`
+fails a build whose lockfile has drifted from `pyproject.toml` (#20). A Postgres service
+runs the database-backed suites — every isolation, RLS and security test used to skip on
+every push while the badge said green. A security job runs `pip-audit` and a gitleaks scan of
+the full history. The safety scorecard is a gate.
+
+### 24.12 What this does not do
+
+- **Stop a paraphrase written against the pattern list.** The detector is a heuristic. The
+  output guard is the second line, and it checks what an injection must produce rather than
+  how it was worded — but a model persuaded to write a subtly wrong *judgement*, with no link,
+  no tool name and no figure, passes both. That residual is why the memo is advisory and a
+  person resolves every exception.
+- **Authenticate agents against Authentik.** The exchange, the lifetime ceiling and the
+  registry binding are exercised under the local issuer. On-prem, Authentik must be
+  configured to emit `sub = agent:n8n-pipeline` and the service scope for the pipeline's
+  client; that mapping is described and not built, and the on-prem stack has still never
+  been deployed.
+- **Rate-limit across replicas.** The buckets are per process; two API replicas allow twice
+  the rate.
+- **Revoke one token.** Revocation is per principal (the kill switch's `principal` scope)
+  or by expiry; a single `jti` cannot be withdrawn on its own. At fifteen minutes that is the
+  trade this release made.
+- **Run the error workflow and the dispatcher in n8n.** Both were fixed against the
+  generated JSON and the API they call, with tests on both halves. Neither has been imported
+  into a running n8n since the fix.

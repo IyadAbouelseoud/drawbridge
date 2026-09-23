@@ -17,7 +17,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from services.api.src.tenancy import scope_to_claim, scope_to_review, set_tenant
+from services.api.src.auth import expected_tenant
+from services.api.src.tenancy import (
+    TenantScopeError,
+    scope_to_claim,
+    scope_to_review,
+    set_tenant,
+)
+
+__all__ = ["TenantScopeError", "database_url", "engine", "session_scope"]
 
 
 def database_url() -> str:
@@ -31,6 +39,14 @@ def database_url() -> str:
         "DRAWBRIDGE_DATABASE_URL",
         "postgresql+asyncpg://drawbridge:drawbridge@postgres:5432/drawbridge",
     )
+    # The compose files give the app role's DSN without a password, and the API completes
+    # it from the secrets backend (`Settings._apply_db_password`). This read the variable
+    # raw, so an MCP server pointed at `drawbridge_app` had no password to connect with.
+    # An inline password still wins — `inject_password` leaves one alone.
+    from services.api.src.config import get_settings
+    from services.api.src.secrets import inject_password
+
+    url = inject_password(url, get_settings().app_db_password)
     return url.replace("+asyncpg", "").replace("postgresql://", "postgresql+psycopg://")
 
 
@@ -62,15 +78,26 @@ def session_scope(
     scope the rest of the transaction to it — see `services/api/src/tenancy.py`. A tool
     that supplies none of the three runs unscoped and, under the `drawbridge_app` role,
     reads nothing.
+
+    Since v1.1.0 every branch is checked against the caller's tenant (`expected_tenant`,
+    set by `mcp_servers.security.guarded` from the verified token): a tenant user naming
+    another tenant, or another tenant's claim or review, gets the same "not found" the API
+    gives. A tenant user naming nothing is scoped to their own tenant rather than to none.
     """
+    expected = expected_tenant()
     session = _session_factory()()
     try:
         if tenant_id is not None:
+            if expected is not None and tenant_id != expected:
+                msg = f"no tenant {tenant_id}"
+                raise TenantScopeError(msg)
             set_tenant(session, tenant_id)
         elif claim_id is not None:
-            scope_to_claim(session, claim_id)
+            scope_to_claim(session, claim_id, expected)
         elif review_id is not None:
-            scope_to_review(session, review_id)
+            scope_to_review(session, review_id, expected)
+        elif expected is not None:
+            set_tenant(session, expected)
         yield session
         session.commit()
     except Exception:

@@ -5,22 +5,41 @@ the *product* rather than of a call site, and a parameter is an invitation to di
 
 - `MAX_TOKENS = 1024`. A memo that needs more than this is not a better memo; it is the
   model padding. The cap also bounds the cost of a runaway loop over a queue.
-- `TEMPERATURE = 0`. Two analysts opening the same claim must see the same memo, and a
-  filing built on a sampled narrative cannot be reproduced when an auditor asks four
-  years later why it says what it says.
+- `THINKING = {"type": "disabled"}`. The memo is short, the reasoning it needs is in the
+  facts, and forced tool use is the output contract — which a thinking model may not be
+  held to. Claude Opus 5 accepts `disabled` at its default effort.
 - **Forced tool use for output.** The model is given exactly one tool, the memo schema,
   and `tool_choice` requires it. This is not JSON-mode-by-prompting; the model has no
   path to a prose reply, so there is no parse step that can fail on a preamble.
 
-Retries: one, and only for schema violation, with the validation error fed back. A second
-schema failure at temperature 0 will not become a third success — it means the schema and
-the task disagree, which is a bug to fix rather than a call to repeat.
+**What happened to `temperature = 0` (v1.1.0).** It was here from week 8, and Claude Opus 5
+rejects sampling parameters with a 400. Every call this module would have made against the
+configured model would have failed — unnoticed, because no deployment has ever held a key
+(§20.8), and the stub the tests use accepts any keyword. The determinism it stood for was
+never available from the model anyway; it comes from the record: the memo is stored
+verbatim with the model and prompt version that produced it (`queue.model_tag`), so what an
+analyst read in 2026 is what an auditor reads in 2030, without re-running anything.
+
+**The transport is bounded.** One client per process (connection reuse; the previous shape
+built a new one per memo), a 60-second request timeout rather than the SDK's ten minutes,
+and the SDK's own two retries on 429/5xx/connection errors. A worker that can hang for ten
+minutes per row holds a row lock for ten minutes per row.
+
+**A refusal is not a memo.** `stop_reason == "refusal"` raises `AgentRefusedError`, which
+the queue treats like any other contract failure: no memo, the row read unaided. Server-side
+refusal fallbacks to another model are deliberately not enabled — `agent_model` must name
+the model that wrote the memo, and a silent switch would make that record untrue.
+
+Retries on schema violation: one, with the validation error fed back. A second schema
+failure will not become a third success — it means the schema and the task disagree, which
+is a bug to fix rather than a call to repeat.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ValidationError
@@ -37,9 +56,16 @@ MODEL = "claude-opus-5"
 
 # Hardcoded. See the module docstring — these are not call-site decisions.
 MAX_TOKENS = 1024
-TEMPERATURE = 0.0
+THINKING: dict[str, str] = {"type": "disabled"}
+
+#: Seconds per request, and the SDK's own retry count on transient failures.
+REQUEST_TIMEOUT_SECONDS = 60.0
+TRANSPORT_RETRIES = 2
 
 _MAX_ATTEMPTS = 2
+
+_CLIENTS: dict[str, Any] = {}
+_CLIENTS_LOCK = threading.Lock()
 
 
 class AgentUnavailableError(RuntimeError):
@@ -70,19 +96,37 @@ def _schema_for(model: type[BaseModel]) -> dict[str, Any]:
 
 
 def _client(api_key: str | None) -> Any:
+    """One SDK client per key per process — see the module docstring."""
     key = api_key or os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         msg = "ANTHROPIC_API_KEY is not set; the agent layer cannot draft"
         raise AgentUnavailableError(msg)
-    try:
-        from anthropic import Anthropic
-    except ImportError as exc:  # pragma: no cover - anthropic is a hard dependency
-        msg = "the anthropic SDK is not installed"
-        raise AgentUnavailableError(msg) from exc
-    return Anthropic(api_key=key)
+    with _CLIENTS_LOCK:
+        cached = _CLIENTS.get(key)
+        if cached is not None:
+            return cached
+        try:
+            from anthropic import Anthropic
+        except ImportError as exc:  # pragma: no cover - anthropic is a hard dependency
+            msg = "the anthropic SDK is not installed"
+            raise AgentUnavailableError(msg) from exc
+        client = Anthropic(
+            api_key=key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=TRANSPORT_RETRIES
+        )
+        _CLIENTS[key] = client
+        return client
 
 
 def _tool_input(response: Any) -> dict[str, Any]:
+    stop = getattr(response, "stop_reason", None)
+    if stop == "refusal":
+        msg = "the model declined to draft this memo (stop_reason=refusal)"
+        raise AgentRefusedError(msg)
+    if stop == "max_tokens":
+        # A tool input cut off at the cap is a partial record, and the schema might still
+        # accept it — a truncated `blocking_unknowns` list is a valid, shorter list.
+        msg = f"the memo hit the {MAX_TOKENS}-token cap and may be truncated"
+        raise AgentRefusedError(msg)
     for block in response.content:
         if getattr(block, "type", None) == "tool_use" and block.name == "record_memo":
             payload = block.input
@@ -109,7 +153,7 @@ def _call(
         return anthropic.messages.create(
             model=model,
             max_tokens=MAX_TOKENS,
-            temperature=TEMPERATURE,
+            thinking=THINKING,
             system=system,
             tools=[tool],
             tool_choice={"type": "tool", "name": "record_memo"},

@@ -25,7 +25,7 @@ import pytest
 from services.agent.src import exceptions, grounding, interchangeability
 from services.agent.src.client import (
     MAX_TOKENS,
-    TEMPERATURE,
+    THINKING,
     AgentRefusedError,
     AgentUnavailableError,
     generate,
@@ -54,13 +54,14 @@ class _Block:
 @dataclass
 class _Response:
     content: list[_Block]
+    stop_reason: str = "tool_use"
 
 
 class StubClient:
     """Returns canned tool inputs and records exactly what it was called with.
 
     `calls` is what lets the guardrail tests assert on the *request* — that max_tokens and
-    temperature were pinned, that the tool was forced, that the facts arrived as JSON.
+    thinking were pinned, that the tool was forced, that the facts arrived as JSON.
     Those are properties of the call, not of the response, and no amount of inspecting
     output would establish them.
     """
@@ -160,19 +161,40 @@ def _memo_with(**overrides: Any) -> dict[str, Any]:
 
 
 class TestTheCallIsPinned:
-    def test_max_tokens_and_temperature_are_not_call_site_decisions(self) -> None:
-        """Both hardcoded, both asserted on the outgoing request.
-
-        Temperature 0 is not a quality preference. Two analysts opening the same claim
-        must see the same memo, and a filing built on a sampled narrative cannot be
-        explained four years later when an auditor asks why it says what it says.
-        """
+    def test_max_tokens_and_thinking_are_not_call_site_decisions(self) -> None:
+        """Both hardcoded, both asserted on the outgoing request."""
         client = StubClient(GOOD_MEMO)
         interchangeability.draft(FACTS, client=client)
 
         (call,) = client.calls
         assert call["max_tokens"] == MAX_TOKENS == 1024
-        assert call["temperature"] == TEMPERATURE == 0.0
+        assert call["thinking"] == THINKING == {"type": "disabled"}
+
+    def test_no_sampling_parameter_is_sent(self) -> None:
+        """v1.1.0. This test used to assert `temperature == 0.0` on the request.
+
+        Claude Opus 5 refuses sampling parameters with a 400, so the assertion was pinning
+        a request the configured model rejects — passing for eight weeks because the stub
+        accepts any keyword and no deployment has held a key. Reproducibility is the stored
+        memo and its `agent_model` tag, not a sampling setting.
+        """
+        client = StubClient(GOOD_MEMO)
+        interchangeability.draft(FACTS, client=client)
+
+        (call,) = client.calls
+        assert not {"temperature", "top_p", "top_k"} & set(call)
+
+    def test_a_refusal_is_not_a_memo(self) -> None:
+        """`stop_reason == "refusal"` fails closed, like any other contract failure."""
+
+        class Refusing(StubClient):
+            def create(self, **kwargs: Any) -> _Response:
+                response = super().create(**kwargs)
+                response.stop_reason = "refusal"
+                return response
+
+        with pytest.raises(AgentRefusedError):
+            interchangeability.draft(FACTS, client=Refusing(GOOD_MEMO))
 
     def test_output_is_forced_through_the_schema_tool(self) -> None:
         """`tool_choice` leaves the model no prose path.
@@ -214,7 +236,7 @@ class TestTheCallIsPinned:
     def test_a_schema_violation_is_retried_once_then_refused(self) -> None:
         """One retry, with the validation error fed back — and then it stops.
 
-        At temperature 0 a second failure will not become a third success. Repeating the
+        A second failure will not become a third success. Repeating the
         call would burn tokens establishing what the second attempt already established:
         the schema and the task disagree.
         """
@@ -517,6 +539,16 @@ class TestTheExceptionMemo:
         """
         assert set(exceptions.GUIDANCE) == set(ReviewReason)
         for reason in ReviewReason:
+            if reason in exceptions.NEVER_DRAFTED:
+                # v1.1.0: a suspected injection is for a person; the model never sees it.
+                client = StubClient(EXCEPTION_MEMO)
+                facts = exceptions.build_facts(
+                    reason=reason, severity="high", summary="s", payload={}
+                )
+                with pytest.raises(ValueError, match="never drafted"):
+                    exceptions.draft(facts, client=client)
+                assert client.calls == []
+                continue
             client = StubClient(EXCEPTION_MEMO)
             facts = exceptions.build_facts(
                 reason=reason, severity="normal", summary="s", payload={}

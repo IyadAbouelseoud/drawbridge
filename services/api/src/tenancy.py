@@ -106,6 +106,33 @@ CREATE OR REPLACE FUNCTION app_tenant_of_review(p_review uuid) RETURNS uuid AS $
 $$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public;
 """
 
+# The drafting worker's one cross-tenant question: which tenants have work waiting? It used
+# to ask by running unscoped, which under the app role returns nothing — so the on-prem
+# worker, the only one ever deployed as the app role, polled an empty queue forever and
+# logged nothing, because it only logs passes that did something. The answer is a list of
+# tenant ids and no row content; the worker then scopes to each one in turn, so the
+# drafting itself happens inside the same policy every other tenant read does.
+TENANTS_WITH_UNDRAFTED_FUNCTION = """
+CREATE OR REPLACE FUNCTION app_tenants_with_undrafted_reviews() RETURNS SETOF uuid AS $$
+    SELECT DISTINCT r.tenant_id
+      FROM public.review_queue r
+      JOIN public.tenants t ON t.tenant_id = r.tenant_id
+     WHERE r.state = 'open' AND r.agent_memo IS NULL AND r.agent_model IS NULL
+       AND t.offboarded_at IS NULL
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public;
+"""
+
+# The review dispatcher's question, the same shape as the drafter's: which tenants have
+# open exceptions. Ids only.
+TENANTS_WITH_OPEN_REVIEWS_FUNCTION = """
+CREATE OR REPLACE FUNCTION app_tenants_with_open_reviews() RETURNS SETOF uuid AS $$
+    SELECT DISTINCT r.tenant_id
+      FROM public.review_queue r
+      JOIN public.tenants t ON t.tenant_id = r.tenant_id
+     WHERE r.state = 'open' AND t.offboarded_at IS NULL
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public;
+"""
+
 TENANT_OF_TOKEN_FUNCTION = """
 CREATE OR REPLACE FUNCTION app_tenant_of_resume_token(p_token text) RETURNS uuid AS $$
     SELECT r.tenant_id FROM public.review_queue r WHERE r.resume_token = p_token
@@ -143,6 +170,11 @@ TENANT_PREDICATES: dict[str, str] = {
         "WHERE c.claim_id = claim_transitions.claim_id AND c.tenant_id = app_current_tenant())"
     ),
 }
+
+# Operational tables: global, not tenant data, and append-only. The app role writes the
+# kill switch's history through the operator route and reads it on every mutating request;
+# it never needs UPDATE, and the triggers would refuse it anyway.
+OPERATIONAL_TABLES: dict[str, str] = {"control_events": "SELECT, INSERT"}
 
 # Reference data. The tariff schedule and the CROSS rulings are the same for every tenant
 # and carry nothing that identifies one, so no policy applies — but the app role still
@@ -194,6 +226,8 @@ def install_rls(connection: Connection) -> None:
         TENANT_OF_CLAIM_FUNCTION,
         TENANT_OF_REVIEW_FUNCTION,
         TENANT_OF_TOKEN_FUNCTION,
+        TENANTS_WITH_UNDRAFTED_FUNCTION,
+        TENANTS_WITH_OPEN_REVIEWS_FUNCTION,
     ):
         connection.execute(text(function))
 
@@ -259,6 +293,10 @@ def grant_app_role(connection: Connection) -> None:
         privileges = "SELECT, INSERT" if table == "audit_ledger" else "SELECT, INSERT, UPDATE"
         connection.execute(text(f"GRANT {privileges} ON {table} TO {APP_ROLE}"))
 
+    for table, privileges in OPERATIONAL_TABLES.items():
+        if _table_exists(connection, table):
+            connection.execute(text(f"GRANT {privileges} ON {table} TO {APP_ROLE}"))
+
     for table in SHARED_TABLES:
         if not _table_exists(connection, table):
             continue
@@ -286,12 +324,30 @@ _GET = text("SELECT app_current_tenant()")
 
 
 def set_tenant(session: Session, tenant_id: UUID) -> None:
-    """Scope this transaction to one tenant. Undone by commit or rollback."""
+    """Scope this transaction to one tenant. Undone by commit or rollback.
+
+    Inside a mutating unit of work this is also where a kill switch covering the tenant —
+    or the acting principal, or everything — is enforced. See `killswitch.MUTATING`.
+    """
+    from services.api.src import killswitch
+
+    if killswitch.MUTATING.get():
+        killswitch.assert_running(
+            session, principal=killswitch.PRINCIPAL.get(), tenant_id=tenant_id
+        )
     session.execute(_SET, {"name": TENANT_GUC, "value": str(tenant_id)})
 
 
 async def set_tenant_async(session: AsyncSession, tenant_id: UUID) -> None:
     """The async path's equivalent — `review.py` runs on the asyncpg pool."""
+    from services.api.src import killswitch
+
+    if killswitch.MUTATING.get():
+        covering = (await killswitch.state_async(session)).covering(
+            principal=killswitch.PRINCIPAL.get(), tenant_id=tenant_id
+        )
+        if covering is not None:
+            raise killswitch.KillSwitchEngagedError(covering)
     await session.execute(_SET, {"name": TENANT_GUC, "value": str(tenant_id)})
 
 
@@ -321,6 +377,18 @@ def tenant_of_review(session: Session, review_id: UUID) -> UUID | None:
 
 def tenant_of_resume_token(session: Session, token: str) -> UUID | None:
     return _lookup(session, "app_tenant_of_resume_token", token)
+
+
+def tenants_with_open_reviews(session: Session) -> list[UUID]:
+    """Tenant ids with open review rows. Ids only."""
+    rows = session.execute(text("SELECT app_tenants_with_open_reviews()")).scalars()
+    return sorted(UUID(str(row)) for row in rows)
+
+
+def tenants_with_undrafted_reviews(session: Session) -> list[UUID]:
+    """Tenant ids with open, undrafted review rows. Ids only — see the function's DDL."""
+    rows = session.execute(text("SELECT app_tenants_with_undrafted_reviews()")).scalars()
+    return sorted(UUID(str(row)) for row in rows)
 
 
 def _require(owner: UUID | None, expected: UUID | None, missing: str) -> UUID:

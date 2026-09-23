@@ -1514,3 +1514,27 @@ a shared-secret fallback, a plaintext file and an empty ruling table would have 
 hardened deployment of a development configuration. Clearing them first also produced the
 week's most useful finding, because loading CROSS is what showed that ruling search had
 never returned a row. A milestone built on top of unpaid debt tends to certify the debt.
+
+---
+
+## Post-freeze: the v1.1.0 security and governance release
+
+Not a week and not a plan — recorded here because an archive that stops at the freeze would
+imply nothing happened after it. The feature set stayed frozen. The release asked of every
+component that acts on a claim who is acting, what they may do, and what happens when they
+should not have, and it read every artefact those answers depend on.
+
+It found twenty defects, and the ordering lesson of week 15 applies to them without
+modification: eleven were controls present, passing their tests and inert in use; five were
+artefacts never run in the configuration they describe — the on-prem drafter, the n8n error
+workflow, the review dispatcher, the on-prem n8n token file, and a lockfile that had not
+been regenerated since week 12 added a dependency. `ARCHITECTURE.md` §24 has
+the list and what replaced each. What is worth recording *here*, as a sequencing note, is
+that the MCP servers had been the "decisive bet" of week 3 and were unauthenticated from
+then until this release. The tool boundary was designed for reuse by three kinds of caller
+and was never asked which caller it was talking to. Identity arrived in week 12 for the API
+alone; the second door waited fourteen weeks.
+
+The external blockers are unchanged: no Anthropic key, no CBP bulk CROSS export, no field
+deployment. The live-model half of the new evaluation suite reports `not_run` for the first.
+

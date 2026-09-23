@@ -2,7 +2,8 @@
 	restore-drill calibrate calibrate-rerank \
 	token token-service pilot-seed pilot-run secrets-init secrets-show secrets-check \
 	secrets-push vault-up vault-agent-up identity-up cross-ingest onprem-config \
-	pin-images pin-check reembed backup backup-verify n8n-import images
+	pin-images pin-check reembed backup backup-verify n8n-import images \
+	kill-switch-status kill-switch-engage kill-switch-release security-evals
 
 help:
 	@echo "up      - bring the stack up"
@@ -15,7 +16,9 @@ help:
 	@echo "check   - lint + type + test"
 	@echo "rls-bootstrap - create drawbridge_app and grant it; run before up"
 	@echo "token TENANT=<uuid> - mint a local user token"
-	@echo "token-service - mint the cross-tenant token n8n carries"
+	@echo "token-service [AGENT=agent:...] - a 15-minute token for a registered agent"
+	@echo "kill-switch-status / -engage / -release REASON=... - the kill switch, over the owner DSN"
+	@echo "security-evals - adversarial evaluation suite and scorecard"
 	@echo "pilot-seed  - seed both pilot tenants and write their trigger payloads"
 	@echo "pilot-run   - push both pilot corpora through the deployed pipeline"
 	@echo "secrets-init  - generate .secrets.json; additive, add --force to rotate"
@@ -205,16 +208,37 @@ onprem-config:
 	DRAWBRIDGE_OIDC_JWKS_URL=http://check/jwks DRAWBRIDGE_JWT_ISSUER=http://check/ \
 	DRAWBRIDGE_PREPARER_NAME=check DRAWBRIDGE_PUBLIC_HOST=check.example \
 	DRAWBRIDGE_VAULT_AGENT_ROLE_ID=check DRAWBRIDGE_VAULT_AGENT_SECRET_ID=check \
+	DRAWBRIDGE_TOKEN_URL=http://check/token DRAWBRIDGE_OWNER_PLATFORM=check \
+	DRAWBRIDGE_OWNER_COMPLIANCE=check DRAWBRIDGE_OWNER_SECURITY=check \
 		docker compose -f docker-compose.onprem.yml config -q && echo 'onprem stack is valid'
 
 token:
 	@test -n "$(TENANT)" || (echo 'usage: make token TENANT=<uuid>' && exit 2)
 	@uv run python scripts/mint_token.py --tenant $(TENANT)
 
-# Cross-tenant by design: one workflow runs whichever tenant its trigger names.
-# Put the output in DRAWBRIDGE_SERVICE_TOKEN and treat it accordingly.
+# A fifteen-minute token for a registered API-client agent — the e2e harness by default.
+# v1.1.0 retired the day-long service token this target used to save: the verifier now
+# refuses any machine token whose lifetime exceeds its registered ceiling.
 token-service:
-	@uv run python scripts/mint_token.py --service --save --ttl 86400
+	@uv run python scripts/mint_token.py --agent $(or $(AGENT),agent:e2e-harness)
+
+# The kill switch, from the command line and over the owner DSN — for when the API is the
+# thing that went wrong. See services/api/src/killswitch.py.
+kill-switch-status:
+	@uv run python scripts/killswitch.py status
+
+kill-switch-engage:
+	@test -n "$(REASON)" || (echo 'usage: make kill-switch-engage REASON="..." [SCOPE=global|tenant|principal VALUE=...]' && exit 2)
+	@uv run python scripts/killswitch.py engage --scope $(or $(SCOPE),global) --value "$(VALUE)" --reason "$(REASON)"
+
+kill-switch-release:
+	@test -n "$(REASON)" || (echo 'usage: make kill-switch-release REASON="..." [SCOPE=... VALUE=...]' && exit 2)
+	@uv run python scripts/killswitch.py release --scope $(or $(SCOPE),global) --value "$(VALUE)" --reason "$(REASON)"
+
+# The adversarial evaluation suite and its scorecard (docs/ARCHITECTURE.md §24).
+security-evals:
+	uv run python scripts/run_safety_evals.py
+	uv run pytest tests/security -q
 
 pilot-seed:
 	uv run python scripts/pilot_us.py --write-payload pilot/

@@ -1,0 +1,23 @@
+# Historical gitleaks false positives, by exact fingerprint (commit:file:rule:line).
+# Listed individually rather than allowlisted by rule or path, so the rules stay at full
+# strength for every future commit. Reviewed in the v1.1.0 security pass:
+#   tests/integration/test_offboarding.py  `key: Ed25519PrivateKey` - a type annotation
+#   n8n/workflows/*.json                   `http://api:8000/...` - an internal URL
+# No finding was a credential.
+4132fc1d5fe03468a902a1ae517f4575febc9486:n8n/workflows/drawbridge-claim-pipeline.json:generic-api-key:191
+4132fc1d5fe03468a902a1ae517f4575febc9486:n8n/workflows/drawbridge-claim-pipeline.json:generic-api-key:350
+4132fc1d5fe03468a902a1ae517f4575febc9486:n8n/workflows/drawbridge-claim-pipeline.json:generic-api-key:374
+6677a8aeb922d06908521ddc82f7e083af43ea81:n8n/workflows/drawbridge-claim-pipeline.json:generic-api-key:106
+6677a8aeb922d06908521ddc82f7e083af43ea81:n8n/workflows/drawbridge-claim-pipeline.json:generic-api-key:237
+6677a8aeb922d06908521ddc82f7e083af43ea81:n8n/workflows/drawbridge-claim-pipeline.json:generic-api-key:261
+bd0d73532feb2b8563370a45578a2f04eebee12b:tests/integration/test_offboarding.py:generic-api-key:101
+bd0d73532feb2b8563370a45578a2f04eebee12b:tests/integration/test_offboarding.py:generic-api-key:115
+bd0d73532feb2b8563370a45578a2f04eebee12b:tests/integration/test_offboarding.py:generic-api-key:128
+bd0d73532feb2b8563370a45578a2f04eebee12b:tests/integration/test_offboarding.py:generic-api-key:138
+bd0d73532feb2b8563370a45578a2f04eebee12b:tests/integration/test_offboarding.py:generic-api-key:155
+bd0d73532feb2b8563370a45578a2f04eebee12b:tests/integration/test_offboarding.py:generic-api-key:161
+bd0d73532feb2b8563370a45578a2f04eebee12b:tests/integration/test_offboarding.py:generic-api-key:174
+bd0d73532feb2b8563370a45578a2f04eebee12b:tests/integration/test_offboarding.py:generic-api-key:181
+bd0d73532feb2b8563370a45578a2f04eebee12b:tests/integration/test_offboarding.py:generic-api-key:228
+bd0d73532feb2b8563370a45578a2f04eebee12b:tests/integration/test_offboarding.py:generic-api-key:264
+bd0d73532feb2b8563370a45578a2f04eebee12b:tests/integration/test_offboarding.py:generic-api-key:286

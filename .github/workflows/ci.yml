@@ -5,17 +5,51 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege for the workflow token (v1.1.0). Nothing here writes to the repository,
+# so nothing here may; the default grants write access to contents, packages and more.
+permissions:
+  contents: read
+
+# Third-party actions are pinned by commit, tag in the comment. A tag is a pointer its
+# owner can move; a SHA is the code that was reviewed. `infra/pin_images.py` makes the same
+# argument for container images.
+
 jobs:
   quality:
     runs-on: ubuntu-latest
+    # A real Postgres, so the database-backed suites — tests/integration and the security
+    # suite's kill switch, audit trail and MCP authentication — run here instead of
+    # skipping. Until v1.1.0 CI had no database, and every isolation and RLS test in the
+    # repository skipped on every push while the badge said green.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: drawbridge
+          POSTGRES_PASSWORD: drawbridge
+          POSTGRES_DB: drawbridge
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U drawbridge"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      DRAWBRIDGE_TEST_DATABASE_URL: postgresql+psycopg://drawbridge:drawbridge@localhost:5432/drawbridge
+      DRAWBRIDGE_JWT_SECRET: ci-only-signing-secret-at-least-thirty-two-characters
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
 
       - run: uv python install 3.12
+
+      # The lockfile must match pyproject.toml. Week 12 added a dependency and never
+      # re-locked; `uv sync` here resolved around it while a `--frozen` image build would
+      # have installed without it (docs/ARCHITECTURE.md §24.1 #20).
+      - name: lockfile is current
+        run: uv lock --check
+
       - run: uv sync --extra dev
 
       - name: ruff
@@ -32,13 +66,50 @@ jobs:
       - name: mypy
         run: uv run mypy services mcp_servers packages/schemas/src scripts infra
 
+      - name: database schema
+        env:
+          PGPASSWORD: drawbridge
+        run: |
+          psql -h localhost -U drawbridge -d drawbridge \
+            -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+          DRAWBRIDGE_DATABASE_URL=postgresql+asyncpg://drawbridge:drawbridge@localhost:5432/drawbridge \
+            uv run alembic upgrade head
+
       - name: pytest
         run: uv run pytest
+
+      # The measurement behind tests/security: recall per attack technique, false
+      # positives over real tariff language, steered outputs refused, the gate matrix.
+      # Exits non-zero when any of them regresses.
+      - name: safety scorecard
+        run: uv run python scripts/run_safety_evals.py > /dev/null
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+
+      # Known vulnerabilities in the locked dependency set. Through uvx, so the auditor is
+      # not itself a dependency of the project it audits.
+      - name: dependency audit
+        run: |
+          uv export --frozen --format requirements-txt --no-emit-project --all-extras > requirements.txt
+          uvx pip-audit -r requirements.txt --no-deps --disable-pip --progress-spinner off
+
+      # Credentials committed by mistake, across the whole history rather than the diff.
+      - name: secret scan
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   compose:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: validate compose
         run: docker compose config --quiet
 
@@ -47,4 +118,4 @@ jobs:
       # the other.
       - name: validate on-prem compose
         run: |
-          DRAWBRIDGE_VERSION=0.0.0-ci           DRAWBRIDGE_PUBLIC_HOST=ci.example           VAULT_ADDR=http://vault:8200           DRAWBRIDGE_VAULT_ROLE_ID=ci DRAWBRIDGE_VAULT_SECRET_ID=ci           DRAWBRIDGE_VAULT_AGENT_ROLE_ID=ci DRAWBRIDGE_VAULT_AGENT_SECRET_ID=ci           DRAWBRIDGE_OIDC_JWKS_URL=http://ci/jwks DRAWBRIDGE_JWT_ISSUER=http://ci/           DRAWBRIDGE_PREPARER_NAME=ci             docker compose -f docker-compose.onprem.yml config --quiet
+          DRAWBRIDGE_VERSION=0.0.0-ci           DRAWBRIDGE_PUBLIC_HOST=ci.example           VAULT_ADDR=http://vault:8200           DRAWBRIDGE_VAULT_ROLE_ID=ci DRAWBRIDGE_VAULT_SECRET_ID=ci           DRAWBRIDGE_VAULT_AGENT_ROLE_ID=ci DRAWBRIDGE_VAULT_AGENT_SECRET_ID=ci           DRAWBRIDGE_OIDC_JWKS_URL=http://ci/jwks DRAWBRIDGE_JWT_ISSUER=http://ci/           DRAWBRIDGE_PREPARER_NAME=ci           DRAWBRIDGE_TOKEN_URL=http://ci/token           DRAWBRIDGE_OWNER_PLATFORM=ci DRAWBRIDGE_OWNER_COMPLIANCE=ci DRAWBRIDGE_OWNER_SECURITY=ci             docker compose -f docker-compose.onprem.yml config --quiet

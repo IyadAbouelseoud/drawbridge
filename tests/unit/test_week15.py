@@ -191,18 +191,29 @@ class TestTheWorkflowsCanActuallyBeImported:
         UI; putting UI state in the artefact is what made the artefact un-importable."""
         assert [w for w in workflows if w.get("tags")] == []
 
-    def test_every_api_call_carries_the_service_token(self, workflows: list[dict]) -> None:
+    def test_every_api_call_carries_a_bearer_token(self, workflows: list[dict]) -> None:
         """Week 12 added this header to the generated JSON by hand and not to the
         generator. Regenerating would have stripped it from every call and the pipeline
-        would have started failing on 401 with a diff that read as formatting."""
+        would have started failing on 401 with a diff that read as formatting.
+
+        v1.1.0 changed what the header carries — an access token from `/auth/token`, not
+        the day-long `$env.DRAWBRIDGE_SERVICE_TOKEN` this test used to require — and so
+        this test changed deliberately: every call still carries one, except the exchange
+        itself, which is where one comes from."""
         for workflow in workflows:
             for node in workflow["nodes"]:
                 if node["type"] != "n8n-nodes-base.httpRequest":
                     continue
+                if node["name"].endswith("Access Token"):
+                    continue
                 headers = node["parameters"].get("headerParameters", {}).get("parameters", [])
                 names = {h["name"]: h["value"] for h in headers}
                 assert "Authorization" in names, f"{workflow['name']}/{node['name']}"
-                assert "$env.DRAWBRIDGE_SERVICE_TOKEN" in names["Authorization"]
+
+    def test_no_workflow_holds_a_long_lived_token(self, workflows: list[dict]) -> None:
+        """The static cross-tenant token is gone from every artefact n8n imports."""
+        for workflow in workflows:
+            assert "DRAWBRIDGE_SERVICE_TOKEN" not in json.dumps(workflow), workflow["name"]
 
     def test_no_node_reads_another_node_through_item_pairing(self, workflows: list[dict]) -> None:
         """`$('Node').item` resolves through n8n's item pairing, which this pipeline loses
@@ -301,7 +312,9 @@ class TestThePipelineCanFail:
             for node in workflow["nodes"]
             if node["type"] == "n8n-nodes-base.httpRequest"
         ]
-        assert len(http_nodes) == 15
+        # 15 at the freeze; v1.1.0 added the admit call, five token exchanges, the
+        # resolution check, and replaced the error workflow's suspend with its report.
+        assert len(http_nodes) == 22
         assert all("neverError" in json.dumps(node) for node in http_nodes)
 
     def test_no_node_continues_past_its_own_failure(self, workflows: list[dict]) -> None:

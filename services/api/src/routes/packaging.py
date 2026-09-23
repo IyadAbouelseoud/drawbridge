@@ -19,11 +19,13 @@ from datetime import date
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from drawbridge_schemas.agents import Scope
 from drawbridge_schemas.jurisdiction import Jurisdiction
-from services.api.src import packaging, profiles
+from services.api.src import gates, packaging, profiles
+from services.api.src.auth import require
 from services.api.src.models import Claim
 from services.api.src.sync_db import in_thread_for_claim
 from services.api.src.tenancy import TenantScopeError
@@ -80,7 +82,31 @@ class BuildRequest(BaseModel):
     packet is transmittable should not move megabytes of PDF to find out."""
 
 
-@router.post("/build")
+#: May print a filing identity the request supplied rather than the tenant's profile. The
+#: e2e harness exists only in development (registry `environments`) and drives tenants it
+#: has just created; nothing in production may name the claimant of someone else's claim.
+_IDENTITY_OVERRIDE_AGENTS = frozenset({"agent:e2e-harness"})
+
+
+def _authorise_identity_override(what: str) -> None:
+    """Who may print a claimant or refund account other than the tenant's own.
+
+    The IBAN on a ZATCA refund request is where the money lands, and the EIN on a 7551 is
+    who claims it. Week 13 made both a row rather than a request field (§18.1), and then
+    left the request field in place as an override — which n8n forwarded straight from the
+    webhook body. An approver may still override, and the ledger records that they did.
+    """
+    actor = gates.current_actor()
+    if actor.kind is gates.ActorKind.LOCAL or actor.agent_id in _IDENTITY_OVERRIDE_AGENTS:
+        return
+    if actor.kind is gates.ActorKind.MACHINE or not actor.can(Scope.CLAIMS_RELEASE):
+        raise gates.GateRefusedError(
+            f"overriding the {what} on a filing packet requires a human approver; "
+            "the tenant's filing profile is used otherwise"
+        )
+
+
+@router.post("/build", dependencies=[Depends(require(Scope.PACKAGING_BUILD))])
 async def build(body: BuildRequest) -> dict[str, Any]:
     """Render the filing packet for an approved claim.
 
@@ -99,16 +125,29 @@ async def build(body: BuildRequest) -> dict[str, Any]:
             raise packaging.PackagingError(msg)
         jurisdiction = Jurisdiction(claim.jurisdiction)
 
-        claimant = (
-            body.claimant.to_claimant()
-            if body.claimant is not None
-            else profiles.claimant_for(session, claim.tenant_id, jurisdiction)
-        )
-        iban = body.refund_account_iban or (
+        source = {"claimant": "profile", "refund_account": "profile"}
+        if body.claimant is not None:
+            supplied = body.claimant.to_claimant()
+            try:
+                on_file = profiles.claimant_for(session, claim.tenant_id, jurisdiction)
+            except profiles.ProfileError:
+                on_file = None
+            if supplied != on_file:
+                _authorise_identity_override("claimant")
+                source["claimant"] = "request"
+            claimant = supplied
+        else:
+            claimant = profiles.claimant_for(session, claim.tenant_id, jurisdiction)
+
+        profile_iban = (
             profiles.refund_account(session, claim.tenant_id)
             if jurisdiction is Jurisdiction.KSA
             else ""
         )
+        iban = body.refund_account_iban or profile_iban
+        if body.refund_account_iban and body.refund_account_iban != profile_iban:
+            _authorise_identity_override("refund account")
+            source["refund_account"] = "request"
 
         packet = packaging.build(
             session,
@@ -119,6 +158,7 @@ async def build(body: BuildRequest) -> dict[str, Any]:
             port_code=body.port_code,
             refund_account_iban=iban,
             notes=body.notes,
+            identity_source={**source, "by": gates.current_actor().name},
         )
         result: dict[str, Any] = {
             "claim_id": packet.claim_id,

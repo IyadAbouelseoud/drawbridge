@@ -43,6 +43,15 @@ class ReviewReason(StrEnum):
     UNKNOWN_FIELD_LABEL = "unknown_field_label"
     JURISDICTION_AMBIGUOUS = "jurisdiction_ambiguous"
     DEADLINE_IMMINENT = "deadline_imminent"
+    # v1.1.0. A refund above the auto-approve ceiling; resolved only by an approver who
+    # did not resolve the claim's other exceptions (services/api/src/gates.py).
+    HIGH_VALUE_APPROVAL = "high_value_approval"
+    # v1.1.0. Text on a source document addressed to an AI rather than to a customs
+    # officer. Raised by the drafter, which then declines to draft (agent/injection.py).
+    SUSPECTED_PROMPT_INJECTION = "suspected_prompt_injection"
+    # v1.1.0. A pipeline run that crashed. Until now these were filed as
+    # `solver_infeasible`, which is a statement about the matcher that was never true.
+    PIPELINE_FAILURE = "pipeline_failure"
 
 
 class Severity(StrEnum):
@@ -100,6 +109,9 @@ def triage(
     filing_deadline: date | None = None,
     as_of: date | None = None,
     confidence_floor: float = EXTRACTION_CONFIDENCE_FLOOR,
+    refund: tuple[Decimal, str] | None = None,
+    refund_usd: Decimal | None = None,
+    approval_ceiling_usd: Decimal | None = None,
 ) -> TriageVerdict:
     """Decide whether a matched claim may proceed without a human."""
     items: list[ReviewItem] = []
@@ -108,6 +120,7 @@ def triage(
     items.extend(_extraction_items(confidences, confidence_floor))
     items.extend(_valuation_items(result))
     items.extend(_deadline_items(filing_deadline, as_of))
+    items.extend(_approval_items(refund, refund_usd, approval_ceiling_usd))
 
     return TriageVerdict(tuple(items))
 
@@ -221,6 +234,43 @@ def _valuation_items(result: MatchResult) -> list[ReviewItem]:
         )
 
     return items
+
+
+def _approval_items(
+    refund: tuple[Decimal, str] | None,
+    refund_usd: Decimal | None,
+    ceiling_usd: Decimal | None,
+) -> list[ReviewItem]:
+    """A refund large enough that finding nothing to question is not enough on its own.
+
+    The approval gate (`services/api/src/gates.py`) refuses to let the pipeline approve a
+    claim above the ceiling without this row resolved by an approver. Raising it here, at
+    triage, is what makes the ordinary n8n path suspend for that approver instead of
+    running to the gate and failing there. A currency with no fixed conversion counts as
+    above the ceiling: the safe direction for an unknown is a person.
+    """
+    if refund is None or ceiling_usd is None:
+        return []
+    amount, currency = refund
+    if refund_usd is not None and refund_usd <= ceiling_usd:
+        return []
+    return [
+        ReviewItem(
+            reason=ReviewReason.HIGH_VALUE_APPROVAL,
+            severity=Severity.HIGH,
+            summary=(
+                f"refund of {amount} {currency} exceeds the auto-approve ceiling of USD "
+                f"{ceiling_usd}; an approver who did not resolve this claim's other "
+                "exceptions must approve it"
+            ),
+            payload={
+                "total_refund": str(amount),
+                "currency": currency,
+                "refund_usd": str(refund_usd) if refund_usd is not None else None,
+                "ceiling_usd": str(ceiling_usd),
+            },
+        )
+    ]
 
 
 def _deadline_items(filing_deadline: date | None, as_of: date | None) -> list[ReviewItem]:

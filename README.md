@@ -1,6 +1,7 @@
 # Drawbridge
 
-**v1.0.0** — feature freeze. Autonomous customs duty recovery and trade remediation
+**v1.1.0** — the security and governance release on the v1.0.0 feature freeze.
+Autonomous customs duty recovery and trade remediation
 across two jurisdictions: US CBP drawback under 19 U.S.C. §1313, and GCC/ZATCA refunds
 under Art. 16 of the Common Customs Law.
 
@@ -13,6 +14,8 @@ Where it stands, in four numbers and one property:
 | Retrieval | hybrid: pgvector over 28,899 lines narrows to 50 in ~20 ms, a multilingual cross-encoder re-scores those 50, blended 70/30 |
 | Both lanes | reproduce **to the cent** against known-answer claims in `tests/golden/` |
 | Human review | **fail-closed** — nothing reaches a filing packet unreviewed, and a failed API call halts the run instead of packaging around it |
+| Agent governance | every machine actor a **registered identity with a named owner**, tokens that live **15 minutes**, approval gates, a kill switch — [below](#agent-governance-v110) |
+| Guardrails | prompt-injection corpus **37/37** detected, **0/147** false positives on real tariff text, steered memos **8/8** refused |
 
 Two things that number does not say, and this line does: **rank-1 is 52%, not 88%**, and
 the difference between those figures is the difference between "the analyst is looking at
@@ -28,6 +31,41 @@ work is what Drawbridge automates, and it stops at the point where a licence is 
 broker under a Power of Attorney; a GCC refund is lodged by the establishment of record.
 We produce the packet and the audit trail; the client's broker files it. That constraint
 shapes the whole design — see `docs/ARCHITECTURE.md` §5.
+
+---
+
+## Agent governance (v1.1.0)
+
+v1.1.0 added no feature. It asked of everything that acts on a claim *who is acting, what may
+they do, and what happens when they should not have* — and read every artefact the answers
+depend on. It found twenty defects; `docs/ARCHITECTURE.md` §24 lists all of them. The
+controls that came out of it:
+
+- **Identity.** Nine registered agents (`packages/schemas/src/drawbridge_schemas/agents.py`),
+  each with an accountable owner role bound to a named person, a closed scope list, and a
+  token ceiling. A machine token must name one of them. People carry roles — auditor,
+  analyst, approver, operator — and five decisions are human-only.
+- **Short-lived credentials.** The verifier refuses any token living longer than fifteen
+  minutes on a machine or an hour on a person. n8n holds a client secret and exchanges it
+  per run; every token issued is recorded.
+- **Least privilege and no lateral movement.** The five MCP servers require a verified
+  bearer token and check scope and tenant on every tool. The drafter runs as the app role,
+  one tenant at a time. Development ports bind loopback only.
+- **Approval gates.** The pipeline stops at `packaged`. Above USD 100,000 an approver who did
+  not resolve the claim's exceptions must sign off. The filing identity on a packet comes
+  from the tenant's profile, and only an approver may override it.
+- **Guardrails.** Document text is neutralised and scanned before the model sees it; a hit
+  goes to a person instead. Every memo passes schema, figure, citation, policy and coherence
+  checks before it is attached.
+- **Kill switch.** Global, per tenant or per agent; through the API, a CLI over the owner DSN,
+  or an environment variable. Stops writes, leaves reads, fails closed. The drafter throws
+  it on itself after three refused memos in an hour.
+- **Audit.** Every decision in the hash-chained ledger under its verified actor; operational
+  events in an append-only table; every request and tool call in a structured access log.
+
+`make security-evals` runs the 226-test security suite and prints the scorecard
+(`docs/security-scorecard.json`); `scripts/perf_audit.py` measures what the controls cost
+(`docs/performance-audit.json`).
 
 ---
 
@@ -267,6 +305,7 @@ make pilot-run                    # both corpora end to end against the deployed
 | `n8n/workflows` | Orchestration, version-controlled as JSON |
 | `scripts/` | Ingest, embedding, token minting, offboarding, the pilot |
 | `tests/golden` | Known-answer claims that must reproduce to the cent |
+| `tests/security` | The adversarial evaluation suite and a regression pin per v1.1.0 finding |
 | `docs/` | `ARCHITECTURE.md` — design and every defect found along the way; `ROADMAP_ARCHIVE.md` — the seventeen weeks, closed |
 
 ## Invariants
@@ -281,6 +320,10 @@ make pilot-run                    # both corpora end to end against the deployed
 - No classification is auto-confirmed. `needs_analyst_confirmation` is true for every
   classification the system currently produces against the full schedule.
 - Document objects are immutable; a correction writes a new object.
+- Every machine actor is a registered identity, and no machine may hold a human-only scope.
+- No bearer token outlives its principal's ceiling: fifteen minutes for an agent, an hour for
+  a person.
+- The pipeline stops at `packaged`; a person attests to everything after it.
 - A corpus is loaded from a downloaded snapshot, never from a live endpoint — a
   classification that reached a filing must be reproducible after the publisher moves the
   URL.
@@ -291,8 +334,9 @@ Stated here rather than discovered later. The week-by-week reasoning is archived
 `docs/ROADMAP_ARCHIVE.md`; the architecture and every defect found along the way are in
 `docs/ARCHITECTURE.md`.
 
-None of the following are open work items. Development is frozen at v1.0.0 and these are
-the boundaries of what was built.
+None of the following are open work items. The feature set is frozen at v1.0.0 — v1.1.0
+added governance and security, not features — and these are the boundaries of what was
+built.
 
 - **Classify to a single line.** On the fifty labelled queries week 17 expanded the
   benchmark to, the correct subheading is in the top ten **44 times** and first **26**.
@@ -323,3 +367,12 @@ the boundaries of what was built.
   deployment. The model call itself has never run.
 - **Run on premises.** The on-prem compose file is pinned by digest and has only ever been
   `docker compose config`-ed. It has not been deployed.
+- **Stop every prompt injection.** The input detector is a heuristic; the output guard
+  checks what an injection must produce rather than how it was worded. A model persuaded to
+  write a subtly wrong judgement with no link, tool name or figure passes both, which is why
+  memos are advisory and a person resolves every exception.
+- **Authenticate agents against Authentik.** The token exchange and its lifetime ceiling are
+  exercised under the local issuer. The Authentik mapping that would issue the pipeline's
+  token on-prem is described in `docs/ARCHITECTURE.md` §24.12, not built.
+- **Rate-limit across replicas, or revoke a single token.** Buckets are per process, and
+  revocation is per principal through the kill switch, or by expiry.

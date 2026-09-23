@@ -210,7 +210,8 @@ def parties(engine: Engine) -> Iterator[dict[str, dict[str, object]]]:
             "resume_token": b_review.resume_token,
             "token": mint(settings, subject="bob@beta.example", tenant_id=b_tenant.tenant_id),
         },
-        "service": {"token": mint(settings, subject="n8n", scopes=(SERVICE_SCOPE,))},
+        # v1.1.0: the registered pipeline identity; an unregistered subject is refused.
+        "service": {"token": mint(settings, subject="agent:n8n-pipeline", scopes=(SERVICE_SCOPE,))},
     }
 
     for review in (a_review, b_review):
@@ -368,7 +369,10 @@ class TestUserAAndUserBCannotSeeEachOther:
         UPDATE then runs inside a scope the row is not in."""
         response = api.post(
             f"/review/{parties['b']['review_id']}/resolve",
-            json={"resolution": "approved", "analyst": "alice@alpha.example"},
+            json={
+                "resolution": "approved",
+                "note": "Checked the declared value against the commercial invoice.",
+            },
             headers=_auth(parties["a"]),
         )
         assert response.status_code == 404

@@ -11,12 +11,14 @@ from datetime import date
 from decimal import Decimal
 from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from drawbridge_schemas.agents import Scope
 from drawbridge_schemas.bom import BillOfMaterials
 from drawbridge_schemas.jurisdiction import Jurisdiction, profile_for
 from drawbridge_schemas.trade import EntryLine, ExportLine
+from services.api.src.auth import require
 from services.api.src.telemetry import tracer
 from services.matcher.src.base import MatchRequest, MatchResult
 from services.matcher.src.router import run_match
@@ -103,7 +105,11 @@ def _to_response(result: MatchResult) -> MatchResponse:
     )
 
 
-@router.post("/run", response_model=MatchResponse)
+@router.post(
+    "/run",
+    response_model=MatchResponse,
+    dependencies=[Depends(require(Scope.MATCHING_RUN))],
+)
 async def run_matching(body: MatchRequestBody) -> MatchResponse:
     """Match import lines to export lines under the claim's own statute.
 
@@ -153,7 +159,7 @@ async def run_matching(body: MatchRequestBody) -> MatchResponse:
     return _to_response(result)
 
 
-@router.get("/strategies")
+@router.get("/strategies", dependencies=[Depends(require(Scope.CLAIMS_READ))])
 async def list_strategies() -> dict[str, Any]:
     """What each jurisdiction's matcher does, and under which provisions."""
     return {

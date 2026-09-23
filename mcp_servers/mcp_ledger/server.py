@@ -19,26 +19,33 @@ from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 from sqlalchemy import text
 
+from drawbridge_schemas.agents import Scope
 from mcp_servers.mcp_claims.db import session_scope
+from mcp_servers.security import READ_ONLY, guarded, run, server_kwargs
 from services.api.src.analyst import claim_history, claim_summary
 from services.api.src.config import get_settings
 from services.api.src.ledger import entries_for_claim, verify_chain
 from services.api.src.telemetry import configure_tracing
 
-server = MCPServer("mcp-ledger")
+server = MCPServer(
+    "mcp-ledger",
+    **server_kwargs("agent:mcp-ledger", get_settings().mcp_ledger_url),
+)
 
 
 def _fail(exc: Exception) -> dict[str, Any]:
     return {"ok": False, "error": type(exc).__name__, "detail": str(exc)}
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(None)
 def ping() -> str:
     """Liveness probe."""
     return "mcp-ledger ok"
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(Scope.LEDGER_READ)
 def claim_audit_trail(
     claim_id: Annotated[str, Field(description="Claim UUID")],
 ) -> dict[str, Any]:
@@ -63,7 +70,8 @@ def claim_audit_trail(
         return _fail(exc)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(Scope.LEDGER_READ)
 def decision_log(
     claim_id: Annotated[str | None, Field(description="Claim UUID; omit for tenant-wide")] = None,
     tenant_id: Annotated[str | None, Field(description="Tenant UUID")] = None,
@@ -124,7 +132,8 @@ def decision_log(
         return _fail(exc)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(Scope.LEDGER_READ)
 def provenance_for_claim(
     claim_id: Annotated[str, Field(description="Claim UUID")],
 ) -> dict[str, Any]:
@@ -184,7 +193,8 @@ def provenance_for_claim(
         return _fail(exc)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(Scope.LEDGER_READ)
 def retention_status(
     tenant_id: Annotated[str, Field(description="Tenant UUID")],
 ) -> dict[str, Any]:
@@ -237,7 +247,8 @@ def retention_status(
         return _fail(exc)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(Scope.LEDGER_READ)
 def trace_figure(
     claim_id: Annotated[str, Field(description="Claim UUID")],
     field: Annotated[str, Field(description="Figure name, e.g. 'duty_paid', 'entered_value'")],
@@ -364,7 +375,8 @@ def _spans_agree(ledger: list[dict[str, Any]], live: list[dict[str, Any]]) -> bo
     return key(live) <= key(ledger)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(Scope.LEDGER_READ)
 def ledger_chain(
     tenant_id: Annotated[str, Field(description="Tenant UUID")],
 ) -> dict[str, Any]:
@@ -383,7 +395,8 @@ def ledger_chain(
         return _fail(exc)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY)
+@guarded(Scope.LEDGER_READ)
 def claim_ledger(
     claim_id: Annotated[str, Field(description="Claim UUID")],
 ) -> dict[str, Any]:
@@ -419,8 +432,7 @@ def main() -> None:
     # the same trace. Without an exporter configured the spans are created and dropped —
     # see services/api/src/telemetry.py; the server starts either way.
     configure_tracing("drawbridge-mcp-ledger", endpoint=get_settings().otel_exporter_endpoint)
-    # MCP SDK 2.x takes the bind address on run(), not on the constructor.
-    server.run(transport="streamable-http", host="0.0.0.0", port=8105)
+    run(server, name="mcp-ledger", host_alias="mcp-ledger", port=8105)
 
 
 if __name__ == "__main__":

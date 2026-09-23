@@ -107,8 +107,18 @@ GENERATED_FIELDS: frozenset[str] = frozenset(
         # left to Authentik's own default so the provider, application and property
         # mapping can be created by a script instead of by twelve screens of clicking.
         "authentik_bootstrap_token",
+        # The client credentials registered API-client agents exchange at `/auth/token`
+        # for a fifteen-minute access token. Long-lived, but only ever exchangeable:
+        # presented to any data route directly they are not a bearer token at all.
+        "pipeline_client_secret",
+        "e2e_client_secret",
     }
 )
+
+#: The shortest HS256 key accepted outside development. RFC 7518 §3.2 requires a key at
+#: least as long as the hash output; 32 bytes of URL-safe base64 is 43 characters, and a
+#: deployment below that is signing every token with something guessable.
+MIN_JWT_SECRET_CHARS = 32
 
 #: An Ed25519 seed, and therefore 32 bytes of *hex* rather than base64. Generated, but not
 #: by the same call as the rest: `tenant_offboard.py` parses this with `bytes.fromhex`, and
@@ -117,6 +127,8 @@ GENERATED_FIELDS: frozenset[str] = frozenset(
 HEX_FIELDS: frozenset[str] = frozenset({"offboard_signing_key"})
 
 #: Secrets this deployment cannot mint, and must not pretend to.
+#:
+#: (`service_token` is retired as of v1.1.0 and kept only so older files still load.)
 #:
 #: `anthropic_api_key` is issued by Anthropic. `service_token` is a JWT that
 #: `scripts/mint_token.py` signs with `jwt_secret`, so it cannot exist before that key
@@ -649,6 +661,10 @@ def check_secret_posture(settings: Any) -> None:
 
     if _dsn_carries_placeholder(getattr(settings, "database_url", "")):
         offenders.append("database_url (password inline)")
+
+    jwt_secret = getattr(settings, "jwt_secret", None)
+    if jwt_secret and len(jwt_secret) < MIN_JWT_SECRET_CHARS:
+        offenders.append(f"jwt_secret (shorter than {MIN_JWT_SECRET_CHARS} characters)")
 
     if not offenders:
         return

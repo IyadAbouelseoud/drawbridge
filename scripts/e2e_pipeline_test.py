@@ -40,6 +40,7 @@ import base64
 import json
 import os
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -280,34 +281,46 @@ class Report:
         return "\n".join(lines)
 
 
+#: Re-mint the harness token after ten minutes of its fifteen.
+TOKEN_REFRESH_SECONDS = 600.0
+
+
 class Api:
     """Thin client. Never raises on a non-2xx; the caller decides what a status means."""
 
     def __init__(self, base: str) -> None:
-        # A service token, because this script plays the part n8n plays: one run, driving
-        # a named tenant through the pipeline. Minted locally against
-        # DRAWBRIDGE_JWT_SECRET; against a real Authentik there is no secret here and the
-        # token has to be supplied in DRAWBRIDGE_SERVICE_TOKEN instead.
-        token = os.environ.get("DRAWBRIDGE_SERVICE_TOKEN", "").strip()
-        if not token:
-            token = mint(
+        # The registered e2e identity (`agent:e2e-harness`), because this script plays the
+        # part n8n plays: one run, driving a named tenant through the pipeline. Minted
+        # locally against DRAWBRIDGE_JWT_SECRET for fifteen minutes — the ceiling the
+        # verifier enforces for it — and re-minted before it lapses, so a long run does not
+        # fail half way through on a credential. Against a real Authentik there is no secret
+        # here and the token has to be supplied in DRAWBRIDGE_SERVICE_TOKEN instead.
+        self._supplied = os.environ.get("DRAWBRIDGE_SERVICE_TOKEN", "").strip()
+        self._token = ""
+        self._minted_at = 0.0
+        self._client = httpx.Client(base_url=base.rstrip("/"), timeout=TIMEOUT)
+
+    def _headers(self) -> dict[str, str]:
+        if self._supplied:
+            return {"Authorization": f"Bearer {self._supplied}"}
+        if not self._token or time.monotonic() - self._minted_at > TOKEN_REFRESH_SECONDS:
+            self._token = mint(
                 get_settings(),
-                subject="e2e-pipeline",
+                subject="agent:e2e-harness",
                 scopes=(SERVICE_SCOPE,),
-                ttl_seconds=1800,
+                ttl_seconds=900,
             )
-        self._client = httpx.Client(
-            base_url=base.rstrip("/"),
-            timeout=TIMEOUT,
-            headers={"Authorization": f"Bearer {token}"},
-        )
+            self._minted_at = time.monotonic()
+        return {"Authorization": f"Bearer {self._token}"}
 
     def post(self, path: str, body: Any = None, **params: Any) -> tuple[int, Any]:
-        response = self._client.post(path, json=body, params=params or None)
+        response = self._client.post(
+            path, json=body, params=params or None, headers=self._headers()
+        )
         return response.status_code, _json_or_text(response)
 
     def get(self, path: str, **params: Any) -> tuple[int, Any]:
-        response = self._client.get(path, params=params or None)
+        response = self._client.get(path, params=params or None, headers=self._headers())
         return response.status_code, _json_or_text(response)
 
     def close(self) -> None:

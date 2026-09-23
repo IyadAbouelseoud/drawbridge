@@ -7,6 +7,12 @@ sets of rules for the same decision.
 
 Everything here is synchronous and takes a session, because the MCP servers run their own
 short-lived connections rather than sharing the API's pool.
+
+**v1.1.0: who is deciding.** Every write here asks `gates.current_actor()` who is acting —
+the verified token subject on a network path — and records *that*, not the `analyst` or
+`actor` argument. The argument survives for in-process callers (CLI, tests) that have no
+principal. Each decision then passes the gate in `services/api/src/gates.py`, so the
+REST route, the MCP tool and the n8n node that reach the same function meet the same rule.
 """
 
 from __future__ import annotations
@@ -16,10 +22,12 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.orm import Session
 
+from drawbridge_schemas.agents import Scope
 from drawbridge_schemas.claim import ClaimState
+from services.api.src import gates
 from services.api.src.ledger import record
 from services.api.src.models import Claim, ClaimTransition, ReviewQueue
 
@@ -62,6 +70,27 @@ def _require_reasoning(reasoning: str, action: str) -> str:
     return text
 
 
+def _review_facts(session: Session, claim_id: UUID | None) -> list[gates.ReviewFact]:
+    if claim_id is None:
+        return []
+    rows = session.execute(
+        select(
+            ReviewQueue.reason,
+            ReviewQueue.state,
+            ReviewQueue.resolution,
+            ReviewQueue.assigned_to,
+        ).where(ReviewQueue.claim_id == claim_id)
+    ).all()
+    return [
+        gates.ReviewFact(reason=r[0], state=r[1], resolution=r[2], resolved_by=r[3]) for r in rows
+    ]
+
+
+def _who(actor: gates.Actor) -> dict[str, Any]:
+    """The acting principal, as a ledger payload records it."""
+    return {"actor_kind": actor.kind.value, "agent_id": actor.agent_id}
+
+
 # --------------------------------------------------------------------------------- read
 
 
@@ -87,9 +116,17 @@ def list_queue(
     if reason is not None:
         stmt = stmt.where(ReviewQueue.reason == reason)
 
-    rows = session.execute(stmt.limit(500)).scalars().all()
-    order = {"blocking": 0, "high": 1, "normal": 2, "low": 3}
-    rows = sorted(rows, key=lambda r: (order.get(r.severity, 9), r.created_at))[:limit]
+    # Ordered and limited in the database. This used to fetch up to 500 rows, sort them
+    # in Python and keep `limit` — so a queue deeper than 500 could silently omit its most
+    # urgent row, and every call paid for 500 rows to return 50.
+    rank = case(
+        (ReviewQueue.severity == "blocking", 0),
+        (ReviewQueue.severity == "high", 1),
+        (ReviewQueue.severity == "normal", 2),
+        (ReviewQueue.severity == "low", 3),
+        else_=9,
+    )
+    rows = session.execute(stmt.order_by(rank, ReviewQueue.created_at).limit(limit)).scalars()
     return [_queue_row(r) for r in rows]
 
 
@@ -149,6 +186,7 @@ def resolve_exception(
         msg = f"resolution must be one of {sorted(RESOLUTIONS)}; got {resolution!r}"
         raise AnalystError(msg)
     note = _require_reasoning(reasoning, "resolve_exception")
+    actor = gates.current_actor(analyst)
 
     row = session.get(ReviewQueue, review_id)
     if row is None:
@@ -160,6 +198,14 @@ def resolve_exception(
             f"{row.assigned_to!r}; reopen it rather than resolving twice"
         )
         raise AnalystError(msg)
+
+    siblings = [
+        fact
+        for fact in _review_facts(session, row.claim_id)
+        if not (fact.reason == row.reason and fact.state != "resolved")
+    ]
+    gates.check_resolution(actor, reason=row.reason, resolution=resolution, siblings=siblings)
+    analyst = actor.name
 
     row.state = "resolved"
     row.resolution = resolution
@@ -187,6 +233,7 @@ def resolve_exception(
             "resolution": resolution,
             "reasoning": note,
             "outstanding_after": outstanding,
+            **_who(actor),
         },
     )
 
@@ -206,16 +253,13 @@ def resolve_exception(
 def _outstanding_for_claim(session: Session, claim_id: UUID | None) -> int:
     if claim_id is None:
         return 0
-    rows = (
+    return int(
         session.execute(
-            select(ReviewQueue.review_id).where(
+            select(func.count()).where(
                 ReviewQueue.claim_id == claim_id, ReviewQueue.state != "resolved"
             )
-        )
-        .scalars()
-        .all()
+        ).scalar_one()
     )
-    return len(rows)
 
 
 def override_valuation(
@@ -241,6 +285,9 @@ def override_valuation(
     would break the provenance chain that makes the claim defensible.
     """
     note = _require_reasoning(reasoning, "override_valuation")
+    actor = gates.current_actor(analyst)
+    gates.require_human(actor, Scope.VALUATION_OVERRIDE, "overriding a declared valuation")
+    analyst = actor.name
     if corrected_value <= 0:
         msg = f"corrected value must be positive; got {corrected_value}"
         raise AnalystError(msg)
@@ -286,6 +333,7 @@ def override_valuation(
             "valuation_basis": valuation_basis,
             "reasoning": note,
             "citation": "GCC Common Customs Law Art. 28; Rules of Implementation Art. 16 §2",
+            **_who(actor),
         },
     )
     session.flush()
@@ -321,6 +369,12 @@ def approve_claim(
     claim that stopped for a human is approved by a human.
     """
     note = _require_reasoning(reasoning, "approve_claim")
+    actor = gates.current_actor(analyst)
+    if actor.kind is gates.ActorKind.MACHINE:
+        # The analyst's route specifically. The pipeline reaches APPROVED through
+        # `transition_claim` and its own gate; it does not get to call itself an analyst.
+        gates.require_human(actor, Scope.CLAIMS_APPROVE, "approving a claim for review")
+    analyst = actor.name
 
     claim = session.get(Claim, claim_id)
     if claim is None:
@@ -343,6 +397,15 @@ def approve_claim(
         )
         raise AnalystError(msg)
 
+    gates.check_transition(
+        actor,
+        current=current,
+        target=ClaimState.APPROVED,
+        amount=claim.total_refund,
+        currency=claim.currency,
+        reviews=_review_facts(session, claim_id),
+    )
+
     claim.state = ClaimState.APPROVED.value
     session.add(
         ClaimTransition(
@@ -353,6 +416,23 @@ def approve_claim(
             actor=analyst,
             reason=note,
         )
+    )
+    # Until v1.1.0 an analyst's approval reached `claim_transitions` and not the ledger,
+    # so the one transition most worth auditing was the one the hash chain did not cover.
+    record(
+        session,
+        tenant_id=claim.tenant_id,
+        claim_id=claim_id,
+        event_type="claim_transition",
+        actor=analyst,
+        subject=ClaimState.APPROVED.value,
+        payload={
+            "from_state": current.value,
+            "to_state": ClaimState.APPROVED.value,
+            "reason": note,
+            "via": "approve_claim",
+            **_who(actor),
+        },
     )
     session.flush()
 
@@ -395,6 +475,9 @@ def transition_claim(
         msg = f"{current} cannot move to {target}"
         raise AnalystError(msg)
 
+    who = gates.current_actor(actor)
+    actor = who.name
+
     # The guard that used to be the state machine's. Since week 9 a clean claim may reach
     # APPROVED straight from QUANTIFIED without a human, so "approval implies review
     # happened" is no longer structural and has to be checked here — for every caller,
@@ -407,6 +490,15 @@ def transition_claim(
                 "it cannot be approved until they are resolved"
             )
             raise AnalystError(msg)
+
+    gates.check_transition(
+        who,
+        current=current,
+        target=target,
+        amount=claim.total_refund,
+        currency=claim.currency,
+        reviews=_review_facts(session, claim_id),
+    )
 
     claim.state = target.value
     session.add(
@@ -430,7 +522,12 @@ def transition_claim(
         event_type="claim_transition",
         actor=actor,
         subject=target.value,
-        payload={"from_state": current.value, "to_state": target.value, "reason": reason},
+        payload={
+            "from_state": current.value,
+            "to_state": target.value,
+            "reason": reason,
+            **_who(who),
+        },
     )
     session.flush()
     return {"claim_id": str(claim_id), "from_state": current.value, "state": target.value}
@@ -498,6 +595,9 @@ def reopen_exception(
     from "this was always open" and an auditor will want to see which happened.
     """
     note = _require_reasoning(reasoning, "reopen_exception")
+    actor = gates.current_actor(analyst)
+    gates.require_human(actor, Scope.REVIEW_RESOLVE, "reopening an exception")
+    analyst = actor.name
     row = session.get(ReviewQueue, review_id)
     if row is None:
         msg = f"no review queue row {review_id}"
@@ -517,6 +617,22 @@ def reopen_exception(
             resolved_at=None,
             resolution_note=row.resolution_note,
         )
+    )
+    # Reopening un-decides something a claim may already have moved on. Until v1.1.0 it
+    # was recorded only by appending to a free-text column the ledger does not cover.
+    record(
+        session,
+        tenant_id=row.tenant_id,
+        claim_id=row.claim_id,
+        event_type="review_reopened",
+        actor=analyst,
+        subject=row.reason,
+        payload={
+            "review_id": str(review_id),
+            "prior_resolution": prior,
+            "reasoning": note,
+            **_who(actor),
+        },
     )
     session.flush()
     return {"review_id": str(review_id), "state": "open", "prior_resolution": prior}

@@ -11,6 +11,7 @@ as the disk, rotated by nobody, and swept up by whatever backs the host up.
 ```sh
 shred -u secrets/postgres_password secrets/minio_root_user secrets/minio_root_password \
         secrets/authentik_secret_key secrets/n8n_encryption_key secrets/service_token
+# (secrets/service_token also predates v1.1.0, which retired the credential itself)
 ```
 
 ## What replaced them
@@ -62,6 +63,7 @@ Three of the six do not survive rotation quietly:
 `python infra/vault_bootstrap.py --infra` is safe to re-run for exactly this reason: it
 generates only what is missing and never replaces a value already in force.
 
-`service_token` is not generated at all — it is a JWT the identity provider signs. Mint it
-with `scripts/mint_token.py --service` and pass it as `--service-token`, or leave it and
-Vault keeps the one it has.
+`pipeline_client_secret` replaced `service_token` in v1.1.0. The old value was a day-long
+cross-tenant JWT that had to be minted elsewhere and supplied; the new one is random bytes
+the bootstrap generates, which n8n exchanges for a fifteen-minute token on every run. A
+Vault path still carrying `service_token` has it pruned on the next `--infra` run.

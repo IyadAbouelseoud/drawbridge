@@ -16,18 +16,29 @@ from typing import Any
 
 import redis.asyncio as aioredis
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.sql import text
 
-from services.api.src.auth import AuthMiddleware, check_auth_configuration
+from services.api.src.auth import (
+    AuthMiddleware,
+    check_auth_configuration,
+    check_identity_posture,
+)
 from services.api.src.config import Settings, get_settings
+from services.api.src.gates import GateRefusedError
+from services.api.src.guard import EdgeMiddleware, PrincipalGuard
+from services.api.src.killswitch import KillSwitchEngagedError
 from services.api.src.routes import (
     claims,
     classification,
+    control,
     documents,
+    identity,
     matching,
     packaging,
+    pipeline,
     review,
     triage,
 )
@@ -48,6 +59,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # And before it, whether the keys involved are real. Outside development this raises
     # on a placeholder; inside it, it logs the field names and lets the stack come up.
     check_secret_posture(settings)
+    # And whether every registered agent has a person answering for it.
+    check_identity_posture(settings)
     app.state.engine = create_async_engine(settings.database_url, pool_pre_ping=True)
     app.state.sessionmaker = async_sessionmaker(app.state.engine, expire_on_commit=False)
     app.state.redis = aioredis.from_url(settings.redis_url, decode_responses=True)
@@ -66,18 +79,58 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("api.shutdown")
 
 
+_docs = get_settings().docs_enabled
+
 app = FastAPI(
     title="Drawbridge API",
-    version="0.1.0",
+    version="1.1.0",
     summary="Autonomous customs duty recovery",
     lifespan=lifespan,
+    # A map of every route, for someone who has not yet found one. Development only
+    # unless DRAWBRIDGE_EXPOSE_API_DOCS says otherwise.
+    docs_url="/docs" if _docs else None,
+    redoc_url="/redoc" if _docs else None,
+    openapi_url="/openapi.json" if _docs else None,
 )
 
+
+@app.exception_handler(GateRefusedError)
+async def _gate_refused(_request: Request, exc: GateRefusedError) -> JSONResponse:
+    """A decision refused because of who was making it. 403, with the rule named."""
+    return JSONResponse(
+        status_code=403, content={"detail": {"error": "gate_refused", "message": str(exc)}}
+    )
+
+
+@app.exception_handler(KillSwitchEngagedError)
+async def _halted(_request: Request, exc: KillSwitchEngagedError) -> JSONResponse:
+    """A mutation stopped by the kill switch below the middleware — a tenant-scoped halt,
+    found when the transaction was scoped. 503: the request was fine, the system is not
+    accepting it."""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": {
+                "error": "kill_switch_engaged",
+                "scope_kind": exc.scope[0],
+                "scope_value": exc.scope[1],
+                "message": str(exc),
+            }
+        },
+    )
+
+
+# Added innermost first. Starlette wraps each new middleware around the previous ones, so
+# the request meets them in the reverse of this order: the edge (body cap, access log),
+# then identity, then the per-principal guard (rate limit, kill switch), then the routes.
+# `services/api/src/guard.py` draws the stack.
+app.add_middleware(PrincipalGuard, settings=get_settings())
 
 # Every request carries a verified tenant before it reaches a router, and that tenant is
 # what the row-level policies compare against — `services/api/src/auth.py` explains why the
 # `SET LOCAL` itself stays down in the session helpers rather than happening here.
 app.add_middleware(AuthMiddleware, settings=get_settings())
+app.add_middleware(EdgeMiddleware, settings=get_settings())
 
 # Instrumented here rather than in the lifespan, and that placement is the whole of it:
 # Starlette builds its middleware stack once, so a middleware added at startup is added to
@@ -91,6 +144,8 @@ instrument_fastapi(app)
 # Registered in pipeline order rather than alphabetically: the list is the closed loop
 # — ingest, extract, classify, match, triage, suspend, persist, package — and reading it
 # in that order is how someone new finds out what the pipeline actually does.
+app.include_router(identity.router)
+app.include_router(pipeline.router)
 app.include_router(documents.router)
 app.include_router(classification.router)
 app.include_router(matching.router)
@@ -98,6 +153,7 @@ app.include_router(triage.router)
 app.include_router(review.router)
 app.include_router(claims.router)
 app.include_router(packaging.router)
+app.include_router(control.router)
 
 
 @app.get("/health")

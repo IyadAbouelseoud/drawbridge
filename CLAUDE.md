@@ -15,8 +15,9 @@ Architecture lives in `docs/ARCHITECTURE.md`. The week-by-week roadmap is closed
 archived at `docs/ROADMAP_ARCHIVE.md` — a record, not a plan. Read both at the start of
 any session before making structural decisions.
 
-**The repository is feature-frozen at v1.0.0.** Do not open new work against the archive's
-closed items without being asked to.
+**The repository is feature-frozen at v1.0.0**, and v1.1.0 is the security and governance
+release on that freeze (`docs/ARCHITECTURE.md` §24). Do not open new work against the
+archive's closed items without being asked to.
 
 ## Conventions
 
@@ -27,3 +28,10 @@ closed items without being asked to.
 - n8n holds no business state. Claim state is a Postgres state machine.
 - `mypy --strict` and `ruff` are gating. `pytest` fixtures in `tests/golden/` are
   known-answer claims and must reproduce to the cent.
+- Every machine actor is registered in `packages/schemas/src/drawbridge_schemas/agents.py`
+  with an owner and a closed scope list; no machine may hold a human-only scope. Actors are
+  recorded from the verified principal, never from a request body.
+- State changes go through `services/api/src/analyst.py`, where `gates.py` decides who may
+  make each move. Every decision writes an `audit_ledger` event.
+- `tests/security/` and `scripts/run_safety_evals.py` are gating. A finding that is fixed
+  gets a named regression test that reads the artefact in use, not the code that generates it.

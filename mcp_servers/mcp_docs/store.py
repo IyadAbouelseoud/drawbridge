@@ -16,6 +16,7 @@ Retention: 19 CFR §163 (US) and GCC Art. 175 / ZATCA five-year originals (KSA).
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -54,9 +55,30 @@ def content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def document_id_for(sha256: str) -> UUID:
-    """Deterministic id derived from content. Same bytes, same id, always."""
-    return uuid5(_DOCUMENT_NAMESPACE, sha256)
+def document_id_for(sha256: str, tenant_id: UUID) -> UUID:
+    """Deterministic id derived from the tenant and the content.
+
+    Same bytes in the same tenant, same id, always — which is the dedupe the week-2 design
+    wanted. Until v1.1.0 the tenant was not an input, so identical bytes in two tenants had
+    one id; `documents.document_id` is the primary key, and the second tenant's upload
+    failed on a key it could not see. That failure was an oracle: a 500 on upload meant
+    *some other customer holds this exact file*. Rows registered under the old derivation
+    keep their ids; `/documents/batch` dedupes on (tenant, sha256), not on the id.
+    """
+    return uuid5(_DOCUMENT_NAMESPACE, f"{tenant_id}:{sha256}")
+
+
+_SUFFIX = re.compile(r"^\.[A-Za-z0-9]{1,8}$")
+
+
+def safe_suffix(suffix: str) -> str:
+    """A file extension fit to end an object key, or `.bin`.
+
+    The suffix is the one caller-supplied fragment of a key. Anything but a short
+    alphanumeric extension — a slash, a `..`, a control character — is replaced rather
+    than escaped, because the key it would produce is not one anybody meant to write.
+    """
+    return suffix.lower() if _SUFFIX.match(suffix or "") else ".bin"
 
 
 def object_key_for(tenant_id: UUID, kind: DocumentKind, sha256: str, suffix: str) -> str:
@@ -65,7 +87,21 @@ def object_key_for(tenant_id: UUID, kind: DocumentKind, sha256: str, suffix: str
     Tenant prefix first so bucket policies and lifecycle rules can be written per tenant
     without touching the application.
     """
-    return f"tenants/{tenant_id}/{kind.value}/{sha256}{suffix}"
+    return f"tenants/{tenant_id}/{kind.value}/{sha256}{safe_suffix(suffix)}"
+
+
+def tenant_owns(tenant_id: UUID, object_key: str) -> bool:
+    """Whether an object key lies under the tenant's prefix, and nowhere else.
+
+    The prefix is the only tenancy an object store has. A key presented by a caller —
+    `object_key` on `/documents/batch`, a `DocumentRef` handed to an MCP tool — was, until
+    v1.1.0, used as given, so a caller naming another tenant's key could register it
+    against their own tenant and read it back through extraction. Checked on the string
+    rather than resolved, and `..` refused outright: S3 does not normalise paths, but a
+    proxy or a future filesystem backend might.
+    """
+    prefix = f"tenants/{tenant_id}/"
+    return object_key.startswith(prefix) and ".." not in object_key.split("/")
 
 
 class DocumentStore:
@@ -117,7 +153,7 @@ class DocumentStore:
             )
 
         return DocumentRef(
-            document_id=document_id_for(sha256),
+            document_id=document_id_for(sha256, tenant_id),
             kind=kind,
             sha256=sha256,
             object_key=key,

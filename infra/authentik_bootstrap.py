@@ -76,6 +76,11 @@ if tenant_id:
 scopes = request.user.attributes.get("drawbridge_scopes")
 if scopes:
     claims["scopes"] = list(scopes)
+# v1.1.0: what the holder may do. Without it the API applies the environment's default
+# role, which outside development is read-only (services/api/src/auth.py::_default_roles).
+roles = request.user.attributes.get("drawbridge_roles")
+if roles:
+    claims["roles"] = list(roles)
 return claims
 """
 
