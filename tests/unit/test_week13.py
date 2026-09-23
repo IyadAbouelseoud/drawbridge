@@ -242,6 +242,9 @@ class TestTheStartupPostureCheck:
                 environment="production",
                 jwt_secret="Xk9" + "q" * 40,
                 database_url="postgresql+asyncpg://drawbridge_app:Zt4qq@h:5432/d",
+                # Explicit, so the test does not pass only on a machine whose .secrets.json
+                # happens to supply a real one — it failed the first CI run that reached it.
+                s3_secret_key="Rk7" + "w" * 30,
             )
         )
 

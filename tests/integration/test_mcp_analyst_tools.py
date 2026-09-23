@@ -340,6 +340,11 @@ class TestHtsTools:
         from mcp_servers.mcp_hts import server as hts
 
         result = hts.classify(description="portable data processing machines")
+        if not result["candidates"]:
+            # No candidate by either path means no corpus, not a broken index — a loaded
+            # corpus whose trigram index answers nothing still returns vector hits and
+            # fails below. Skipped rather than passed, so the gap stays visible.
+            pytest.skip("tariff corpus not loaded (scripts/ingest_tariff.py)")
         lexical = [c for c in result["candidates"] if c["matched_by"] == "lexical"]
         assert lexical, "no lexical candidate at all; the trigram index is not answering"
         assert any(not c["needs_analyst_confirmation"] for c in lexical), (
