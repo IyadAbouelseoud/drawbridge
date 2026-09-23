@@ -50,7 +50,10 @@ jobs:
       - name: lockfile is current
         run: uv lock --check
 
-      - run: uv sync --extra dev
+      # `embed` as well as `dev`: classification imports fastembed, and without it mypy
+      # failed on this step and pytest never ran in CI at all — every run from v1.0.0
+      # back stopped here.
+      - run: uv sync --extra dev --extra embed
 
       - name: ruff
         run: uv run ruff check .
@@ -110,8 +113,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      # The development file reads `.env`, which is never committed. The example is what
+      # a developer copies, so it is what this validates against.
       - name: validate compose
-        run: docker compose config --quiet
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
 
       # The deployment file, with placeholders. It has required variables and YAML merge
       # anchors that the development file does not, so `config` on one says nothing about
