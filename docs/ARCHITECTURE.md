@@ -2670,8 +2670,8 @@ regresses:
 | Registry | 9 agents, 9 owned, 0 holding a human-only scope, bearer ceiling 900 s, one holder of the owner DSN |
 
 The first run missed one attack — ChatML's `<|im_start|>`, whose `|` fell outside the tag
-pattern — and the pattern was widened. The full suite is **1,096 passed**; the one failure,
-unchanged from v1.0.0, needs the full tariff corpus loaded and the scratch database had none.
+pattern — and the pattern was widened. The full suite is **1,096 passed, 1 skipped** — the
+skip needs the full tariff corpus loaded — locally and in CI.
 mypy `--strict` is clean over 143 files. `pip-audit` over the 133 locked packages finds no
 known vulnerabilities.
 
@@ -2717,6 +2717,14 @@ fails a build whose lockfile has drifted from `pyproject.toml` (#20). A Postgres
 runs the database-backed suites — every isolation, RLS and security test used to skip on
 every push while the badge said green. A security job runs `pip-audit` and a gitleaks scan of
 the full history. The safety scorecard is a gate.
+
+**And CI had not been green since before v1.0.0**, found on the first push of this release.
+`mypy` failed every run because CI installed the `dev` extra and not `embed`, so `fastembed`
+was missing — which meant **pytest had never run in CI at all**. The compose job failed on a
+`.env` CI never had. With both fixed, the first run to reach pytest found two tests that
+passed only on the machine that wrote them: one leaned on a local `.secrets.json`, one on a
+loaded tariff corpus. Both now state what they need. The first fully green run: 1,096 passed,
+1 skipped.
 
 ### 24.12 What this does not do
 
